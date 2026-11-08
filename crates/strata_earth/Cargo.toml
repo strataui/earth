@@ -1,0 +1,13 @@
+[package]
+name = "strata_earth"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Earth scene plugin: f64 geodesy, tile resolution, and scene assembly over strata_render"
+
+[dependencies]
+strata_primitives = { workspace = true }
+strata_style = { workspace = true }
+strata_layout = { workspace = true }
+strata_render = { workspace = true }

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/strata_earth",
+    "examples/strata_earth_golden",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Strata Contributors"]
+license = "MIT"
+repository = "https://github.com/strataui/earth"
+
+[workspace.dependencies]
+strata_earth = { path = "crates/strata_earth" }
+strata_primitives = { path = "../strata/crates/core/strata_primitives" }
+strata_style = { path = "../strata/crates/core/strata_style" }
+strata_layout = { path = "../strata/crates/core/strata_layout" }
+strata_render = { path = "../strata/crates/render/strata_render" }
