@@ -1,0 +1,13 @@
+[package]
+name = "strata_earth_golden"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Golden-image capture for the strata_earth camera regimes"
+
+[dependencies]
+strata_earth = { workspace = true }
+strata_render = { workspace = true }
+strata_layout = { workspace = true }
+strata_style = { workspace = true }
