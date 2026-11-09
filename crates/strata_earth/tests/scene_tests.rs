@@ -856,3 +856,151 @@ fn directory_tile_source_round_trips_images_and_elevation() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_earth_scene_build_quadtree_lod_mode() {
+    let mut input = viewpoint(2_000_000.0);
+    input.surface_mode = strata_earth::SurfaceMode::QuadtreeLod;
+    input.sse_threshold = 4.0;
+    input.max_tile_level = 16;
+
+    let mut source = MemoryTileSource::new();
+    let mut scene = EarthScene::new();
+
+    scene.build(&input, &mut source);
+
+    let stats = scene.stats();
+    assert!(
+        stats.tiles_requested > 0,
+        "quadtree LOD mode must request tiles"
+    );
+    assert!(
+        !scene.patches().is_empty(),
+        "quadtree LOD mode must populate patches in the scene"
+    );
+
+    // Verify patches are loaded and rendered
+    let levels: std::collections::BTreeSet<u8> = scene.patches().iter().map(|p| p.key.level).collect();
+    assert!(
+        !levels.is_empty(),
+        "hierarchical quadtree LOD should have resolved tiles, got {:?}",
+        levels
+    );
+
+    // Verify batched mesh has terrain triangles
+    assert!(stats.terrain_triangles > 0);
+}
+
+#[test]
+fn test_compute_adaptive_skirt_depth_scaling() {
+    // 1. Sub-meter / street level tile: 0.001 deg span (~111 m)
+    let street_bounds = strata_earth::PatchBounds {
+        lon0: -122.420,
+        lon1: -122.419,
+        lat0: 37.774,
+        lat1: 37.775,
+    };
+    let street_skirt = strata_earth::compute_adaptive_skirt_depth(street_bounds, 0.0);
+    assert_eq!(
+        street_skirt, 20.0,
+        "street level tile must clamp to minimum 20m skirt depth"
+    );
+
+    // 2. Mountain relief tile: relief range = 3,000 m
+    let mountain_skirt = strata_earth::compute_adaptive_skirt_depth(street_bounds, 3_000.0);
+    assert!(
+        mountain_skirt >= 1500.0,
+        "mountain skirt must be at least half the elevation range, got {mountain_skirt}"
+    );
+
+    // 3. Continental tile: 20 deg span (~2,200 km)
+    let continental_bounds = strata_earth::PatchBounds {
+        lon0: -120.0,
+        lon1: -100.0,
+        lat0: 20.0,
+        lat1: 40.0,
+    };
+    let continental_skirt = strata_earth::compute_adaptive_skirt_depth(continental_bounds, 500.0);
+    assert!(
+        continental_skirt > 50_000.0,
+        "continental skirt must scale with 5% of tile span, got {continental_skirt}"
+    );
+}
+
+#[test]
+fn test_terrain_skirt_triangle_counting() {
+    // For grid = 5: 4 cells per axis -> 4 * 4 * 2 = 32 grid triangles
+    // Skirt: 4 borders * 4 segments * 2 triangles = 32 skirt triangles
+    assert_eq!(strata_earth::terrain_skirt_triangle_count(5), 32);
+    assert_eq!(strata_earth::terrain_triangle_count(1, 5), 32);
+    assert_eq!(strata_earth::terrain_triangle_count_with_skirts(1, 5), 64);
+    assert_eq!(strata_earth::terrain_triangle_count_with_skirts(9, 5), 9 * 64);
+
+    // For grid = 9: 8 cells per axis -> 8 * 8 * 2 = 128 grid triangles
+    // Skirt: 4 borders * 8 segments * 2 triangles = 64 skirt triangles
+    assert_eq!(strata_earth::terrain_skirt_triangle_count(9), 64);
+    assert_eq!(strata_earth::terrain_triangle_count(1, 9), 128);
+    assert_eq!(strata_earth::terrain_triangle_count_with_skirts(1, 9), 192);
+}
+
+#[test]
+fn test_adaptive_terrain_skirts_in_scene_build() {
+    let mut input_no_skirts = viewpoint(2_500.0);
+    input_no_skirts.tile_grid = 9;
+    input_no_skirts.terrain_skirts = Some(false);
+
+    let span = strata_earth::tile_patch_span_deg(&input_no_skirts.camera, input_no_skirts.patch_scale);
+    let keys: Vec<TileKey> = strata_earth::surrounding_patches(input_no_skirts.camera.focus, span)
+        .iter()
+        .map(strata_earth::requested_tile)
+        .collect();
+    let mut source = source_for(&keys, &solid_tile(60, 120, 70));
+
+    let mut scene_no_skirts = EarthScene::new();
+    scene_no_skirts.build(&input_no_skirts, &mut source);
+
+    let expected_grid_only = strata_earth::terrain_triangle_count(keys.len(), 9);
+    assert_eq!(scene_no_skirts.stats().terrain_triangles, expected_grid_only);
+
+    // Now build with skirts enabled
+    let mut input_with_skirts = input_no_skirts.clone();
+    input_with_skirts.terrain_skirts = Some(true);
+
+    let mut scene_with_skirts = EarthScene::new();
+    scene_with_skirts.build(&input_with_skirts, &mut source);
+
+    let expected_with_skirts = strata_earth::terrain_triangle_count_with_skirts(keys.len(), 9);
+    assert_eq!(
+        scene_with_skirts.stats().terrain_triangles,
+        expected_with_skirts,
+        "terrain triangles with skirts must include 64 skirt triangles per patch"
+    );
+    assert_eq!(
+        scene_with_skirts.stats().terrain_triangles - scene_no_skirts.stats().terrain_triangles,
+        keys.len() * strata_earth::terrain_skirt_triangle_count(9),
+        "difference must equal the total skirt triangle count"
+    );
+
+    // Now test QuadtreeLod mode auto-enables skirts when terrain_skirts is None
+    let mut input_lod = viewpoint(2_000_000.0);
+    input_lod.surface_mode = strata_earth::SurfaceMode::QuadtreeLod;
+    input_lod.sse_threshold = 4.0;
+    input_lod.max_tile_level = 16;
+    input_lod.terrain_skirts = None; // Should auto-enable for QuadtreeLod
+
+    let mut scene_lod_auto = EarthScene::new();
+    scene_lod_auto.build(&input_lod, &mut source);
+
+    let mut input_lod_disabled = input_lod.clone();
+    input_lod_disabled.terrain_skirts = Some(false); // Explicitly disable skirts
+
+    let mut scene_lod_disabled = EarthScene::new();
+    scene_lod_disabled.build(&input_lod_disabled, &mut source);
+
+    assert!(
+        scene_lod_auto.stats().terrain_triangles > scene_lod_disabled.stats().terrain_triangles,
+        "Quadtree LOD with auto-skirts must have more triangles than with skirts disabled"
+    );
+}
+
+

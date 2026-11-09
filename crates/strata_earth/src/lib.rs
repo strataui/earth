@@ -31,18 +31,24 @@ pub use descriptor::{
     TileSupply, DESCRIPTOR_FORMAT, DESCRIPTOR_VERSION, DESCRIPTOR_VERSION_V1,
 };
 pub use geodesy::{
-    clamp_latitude, depth_range, ecef_to_geodetic, geodetic_to_ecef, horizon_distance_m,
-    level_for_altitude, pick_geodetic, raycast_ellipsoid, resolve_tile_imagery, screen_to_ray,
-    wrap_longitude, CameraPlacement, EarthCamera, Geodetic, LocalFrame, TileKey,
-    TileTextureResolution, GLOBE_ALTITUDE_M,
+    clamp_latitude, compute_tile_sse, depth_range, ecef_to_geodetic, geodetic_to_ecef,
+    horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum, level_for_altitude,
+    pick_geodetic, raycast_ellipsoid, resolve_tile_imagery, rte_gpu_relative_position,
+    rte_relative_position_f32, screen_to_ray, split_dvec3_to_high_low, split_f64_to_high_low,
+    tile_bounding_sphere, tile_bounds, traverse_quadtree_lod, wrap_longitude, CameraPlacement,
+    EarthCamera, Geodetic, LocalFrame, RteEyeUniforms, TileKey, TileTextureResolution,
+    GLOBE_ALTITUDE_M,
 };
 pub use scene::{
-    building_triangle_count, celestial_bodies, requested_tile, sky_gradient, surrounding_patches,
-    surrounding_tiles, terrain_triangle_count, tile_patch_span_deg, EarthInput, EarthScene,
-    EntityMarker, FrameStats, LayerToggles, PatchBounds, PatchFrame, SurfaceMode,
+    building_triangle_count, celestial_bodies, compute_adaptive_skirt_depth, requested_tile,
+    sky_gradient, surrounding_patches, surrounding_tiles, terrain_skirt_triangle_count,
+    terrain_triangle_count, terrain_triangle_count_with_skirts, tile_patch_span_deg, EarthInput,
+    EarthScene, EntityMarker, FrameStats, LayerToggles, PatchBounds, PatchFrame, SurfaceMode,
 };
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{
-    tile_sampler, DirectoryTileSource, MemoryTileSource, TextureSlot, TileElevation, TileError,
-    TileImage, TileRegistry, TileSource,
+    decode_png_to_rgba, decode_terrain_rgb, format_slippy_url, tile_sampler, DirectoryTileSource,
+    HttpTransport, LruTileCache, LruTileCacheSource, MemoryTileSource, MockHttpTransport,
+    NetworkTileSource, NetworkTileStats, StandardHttpTransport, TextureSlot, TileElevation,
+    TileError, TileImage, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
 };

@@ -521,6 +521,8 @@ impl FrameDescriptor {
             } else {
                 crate::scene::SurfaceMode::FlatPatches
             },
+            sse_threshold: 4.0,
+            terrain_skirts: None,
         }
     }
 

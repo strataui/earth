@@ -11,3 +11,4 @@ strata_primitives = { workspace = true }
 strata_style = { workspace = true }
 strata_layout = { workspace = true }
 strata_render = { workspace = true }
+flate2 = "1.0"
