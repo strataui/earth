@@ -296,3 +296,196 @@ fn screen_to_ray_and_pick_geodetic_center_accuracy() {
     let corner_pick = strata_earth::pick_geodetic(0.0, 0.0, w, h, &space_camera);
     assert!(corner_pick.is_none(), "far corner of wide FOV must miss the globe");
 }
+
+#[test]
+fn test_wgs84_ellipsoid_horizon_culling() {
+    use strata_render::camera64::DVec3;
+
+    // Eye high above the North Pole (altitude ~20,000 km)
+    let eye = DVec3::new(0.0, 0.0, 26_378_137.0);
+
+    // North pole tile at level 2: in clear line of sight
+    let north_tile = TileKey::new(2, 0, 0); // Northernmost quadrant
+    let (north_center, north_radius) = strata_earth::tile_bounding_sphere(north_tile);
+    assert!(
+        !strata_earth::is_tile_horizon_culled(north_center, north_radius, eye),
+        "north hemisphere tile must be visible from above north pole"
+    );
+
+    // South pole tile at level 2: completely on the far side of the planet
+    let south_tile = TileKey::new(2, 0, 3); // Southernmost quadrant
+    let (south_center, south_radius) = strata_earth::tile_bounding_sphere(south_tile);
+    assert!(
+        strata_earth::is_tile_horizon_culled(south_center, south_radius, eye),
+        "south pole tile must be horizon-culled from above north pole"
+    );
+
+    // Low altitude eye: 2,000 metres above equator (lat 0, lon 0)
+    let eye_local = strata_earth::geodetic_to_ecef(Geodetic::new(0.0, 0.0, 2_000.0));
+
+    // Local tile directly below the eye
+    let local_tile = TileKey::new(10, 512, 512);
+    let (local_center, local_radius) = strata_earth::tile_bounding_sphere(local_tile);
+    assert!(
+        !strata_earth::is_tile_horizon_culled(local_center, local_radius, eye_local),
+        "nadir tile directly beneath eye must not be culled"
+    );
+
+    // Opposite side of the planet (lat 0, lon 180)
+    let antipode_tile = TileKey::new(10, 0, 512);
+    let (antipode_center, antipode_radius) = strata_earth::tile_bounding_sphere(antipode_tile);
+    assert!(
+        strata_earth::is_tile_horizon_culled(antipode_center, antipode_radius, eye_local),
+        "antipodal tile must be horizon-culled"
+    );
+}
+
+#[test]
+fn test_quadtree_lod_sse_hierarchical_subdivision() {
+    use strata_render::camera64::DVec3;
+
+    // 1. Orbital Camera at 20,000 km altitude looking at center of the Earth
+    let eye_orbital = DVec3::new(0.0, 0.0, 26_378_137.0);
+    let aim = DVec3::ZERO;
+    let mut orbital_tiles = Vec::new();
+
+    strata_earth::traverse_quadtree_lod(
+        eye_orbital,
+        aim,
+        45.0,
+        1440.0 / 900.0,
+        900.0,
+        4.0,
+        18,
+        5,
+        |key, _| {
+            orbital_tiles.push(key);
+        },
+    );
+
+    assert!(
+        !orbital_tiles.is_empty(),
+        "orbital quadtree traversal must yield visible tiles"
+    );
+    // In orbit, coarse tiles (level <= 6) must dominate, no sub-meter tiles
+    for tile in &orbital_tiles {
+        assert!(
+            tile.level <= 8,
+            "orbital distance should produce coarse tiles, got level {}",
+            tile.level
+        );
+    }
+
+    // 2. Low-altitude camera at 1,000 m over San Francisco looking down
+    let eye_low = strata_earth::geodetic_to_ecef(Geodetic::new(37.7749, -122.4194, 1_000.0));
+    let aim_low = strata_earth::geodetic_to_ecef(Geodetic::new(37.7749, -122.4194, 0.0));
+    let mut low_tiles = Vec::new();
+
+    strata_earth::traverse_quadtree_lod(
+        eye_low,
+        aim_low,
+        45.0,
+        1440.0 / 900.0,
+        900.0,
+        4.0,
+        18,
+        5,
+        |key, _| {
+            low_tiles.push(key);
+        },
+    );
+
+    assert!(
+        !low_tiles.is_empty(),
+        "low-altitude traversal must yield visible tiles"
+    );
+    let max_subdiv_level = low_tiles.iter().map(|t| t.level).max().unwrap_or(0);
+    assert!(
+        max_subdiv_level >= 12,
+        "1,000m altitude directly over focus must subdivide to high LOD (level >= 12), reached {}",
+        max_subdiv_level
+    );
+}
+
+#[test]
+fn test_f64_double_single_split_accuracy() {
+    let base = R; // 6,378,137.0 m
+    let sub_meter_offsets = [0.25, 0.05, 0.005, 0.001];
+
+    for &offset in &sub_meter_offsets {
+        let original = base + offset;
+
+        // Naive f32 cast completely collapses sub-meter details
+        let f32_base = base as f32;
+        let f32_orig = original as f32;
+        if offset < 0.5 {
+            assert_eq!(
+                f32_base, f32_orig,
+                "naive f32 at Earth radius must quantise away sub-half-meter offset {offset}"
+            );
+        }
+
+        // Double-single split preserves sub-millimeter precision
+        let (high, low) = strata_earth::split_f64_to_high_low(original);
+        let reconstructed = high as f64 + low as f64;
+        let err = (reconstructed - original).abs();
+        assert!(
+            err < 1e-6,
+            "double-single split reconstruction error {} exceeds 1 micrometer for offset {}",
+            err,
+            offset
+        );
+    }
+}
+
+#[test]
+fn test_gpu_rte_relative_position_sub_millimeter_fidelity() {
+    let eye = strata_render::camera64::DVec3::new(R + 5000.0, 100.0, 50.0);
+    let pos = strata_render::camera64::DVec3::new(R + 5000.25, 100.10, 50.05);
+
+    // Exact f64 relative position
+    let exact_rel = pos.sub(eye);
+
+    // Naive f32 relative subtraction
+    let eye_f32 = eye.as_f32();
+    let pos_f32 = pos.as_f32();
+    let naive_rel_x = pos_f32[0] - eye_f32[0];
+    let naive_err = (naive_rel_x as f64 - exact_rel.x).abs();
+    assert!(
+        naive_err > 0.1,
+        "naive f32 subtraction at Earth scale should have noticeable error, got {}",
+        naive_err
+    );
+
+    // GPU RTE split subtraction: (pos_high - eye_high) + (pos_low - eye_low)
+    let (pos_h, pos_l) = strata_earth::split_dvec3_to_high_low(pos);
+    let (eye_h, eye_l) = strata_earth::split_dvec3_to_high_low(eye);
+    let gpu_rel = strata_earth::rte_gpu_relative_position(pos_h, pos_l, eye_h, eye_l);
+
+    let err_x = (gpu_rel[0] as f64 - exact_rel.x).abs();
+    let err_y = (gpu_rel[1] as f64 - exact_rel.y).abs();
+    let err_z = (gpu_rel[2] as f64 - exact_rel.z).abs();
+
+    assert!(err_x < 1e-6, "GPU RTE X error {} exceeds sub-millimeter tolerance", err_x);
+    assert!(err_y < 1e-6, "GPU RTE Y error {} exceeds sub-millimeter tolerance", err_y);
+    assert!(err_z < 1e-6, "GPU RTE Z error {} exceeds sub-millimeter tolerance", err_z);
+}
+
+#[test]
+fn test_rte_eye_uniforms_projection_identity() {
+    let camera = EarthCamera {
+        focus: Geodetic::new(0.0, 0.0, 0.0),
+        eye_offset_m: [0.0, 0.0, 10_000.0],
+        ..EarthCamera::default()
+    };
+
+    let uniforms = strata_earth::RteEyeUniforms::from_camera(&camera, 1440.0, 900.0);
+    let ground = strata_earth::geodetic_to_ecef(camera.focus);
+    let (pos_h, pos_l) = strata_earth::split_dvec3_to_high_low(ground);
+
+    let clip = uniforms.transform_point_clip(pos_h, pos_l);
+    assert!(clip[3] > 0.0, "w must be positive in front of camera, got {}", clip[3]);
+    let ndc_z = clip[2] / clip[3];
+    assert!((0.0..=1.0).contains(&ndc_z), "NDC depth must be inside [0, 1], got {}", ndc_z);
+}
+

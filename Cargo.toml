@@ -14,7 +14,7 @@ repository = "https://github.com/strataui/earth"
 
 [workspace.dependencies]
 strata_earth = { path = "crates/strata_earth" }
-strata_primitives = { path = "../strata/crates/core/strata_primitives" }
-strata_style = { path = "../strata/crates/core/strata_style" }
-strata_layout = { path = "../strata/crates/core/strata_layout" }
-strata_render = { path = "../strata/crates/render/strata_render" }
+strata_primitives = { git = "https://github.com/strataui/strata.git" }
+strata_style = { git = "https://github.com/strataui/strata.git" }
+strata_layout = { git = "https://github.com/strataui/strata.git" }
+strata_render = { git = "https://github.com/strataui/strata.git" }

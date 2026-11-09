@@ -3,7 +3,7 @@
 //! Coordinates are WGS84-ish ECEF metres in f64. Nothing here narrows to f32;
 //! the render hand-off is [`crate::EarthScene::build`].
 
-use strata_render::camera64::{DVec3, EARTH_RADIUS_M};
+use strata_render::camera64::{DMat4, DVec3, EARTH_RADIUS_M};
 
 /// WGS84 ellipsoid constants.
 pub mod wgs84 {
@@ -502,3 +502,339 @@ pub fn wrap_longitude(lon_deg: f64) -> f64 {
 pub fn clamp_latitude(lat_deg: f64) -> f64 {
     lat_deg.clamp(-90.0, 90.0)
 }
+
+/// Geographic bounds of one terrain patch or tile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PatchBounds {
+    /// West edge longitude in degrees.
+    pub lon0: f64,
+    /// East edge longitude in degrees.
+    pub lon1: f64,
+    /// South edge latitude in degrees.
+    pub lat0: f64,
+    /// North edge latitude in degrees.
+    pub lat1: f64,
+}
+
+/// Geographic bounds of a tile at its own level.
+pub fn tile_bounds(key: TileKey) -> PatchBounds {
+    let per_axis = key.tiles_per_axis() as f64;
+    let lon_span = 360.0 / per_axis;
+    let lat_span = 180.0 / per_axis;
+    let lon0 = key.x as f64 * lon_span - 180.0;
+    let lat1 = 90.0 - key.y as f64 * lat_span;
+    PatchBounds {
+        lon0,
+        lon1: lon0 + lon_span,
+        lat0: lat1 - lat_span,
+        lat1,
+    }
+}
+
+/// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)
+/// for a `TileKey` on the WGS84 ellipsoid.
+pub fn tile_bounding_sphere(key: TileKey) -> (DVec3, f64) {
+    if key.level == 0 {
+        return (DVec3::new(0.0, 0.0, 0.0), wgs84::A * 1.08);
+    }
+    let bounds = tile_bounds(key);
+    let mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
+    let mid_lat = (bounds.lat0 + bounds.lat1) * 0.5;
+    let center = geodetic_to_ecef(Geodetic::new(mid_lat, mid_lon, 0.0));
+
+    let sample_points = [
+        Geodetic::new(bounds.lat0, bounds.lon0, 0.0),
+        Geodetic::new(bounds.lat0, bounds.lon1, 0.0),
+        Geodetic::new(bounds.lat1, bounds.lon0, 0.0),
+        Geodetic::new(bounds.lat1, bounds.lon1, 0.0),
+        Geodetic::new(bounds.lat0, mid_lon, 0.0),
+        Geodetic::new(bounds.lat1, mid_lon, 0.0),
+        Geodetic::new(mid_lat, bounds.lon0, 0.0),
+        Geodetic::new(mid_lat, bounds.lon1, 0.0),
+    ];
+
+    let mut max_dist_sq = 0.0f64;
+    for pt in &sample_points {
+        let ecef = geodetic_to_ecef(*pt);
+        let diff = ecef.sub(center);
+        let dist_sq = diff.dot(diff);
+        if dist_sq > max_dist_sq {
+            max_dist_sq = dist_sq;
+        }
+    }
+
+    // Include 5000 metres margin for topography relief and curvature
+    let radius = max_dist_sq.sqrt() + 5000.0;
+    (center, radius)
+}
+
+/// Tests whether a tile bounding sphere is occluded behind the WGS84 ellipsoid horizon.
+pub fn is_tile_horizon_culled(center: DVec3, radius: f64, eye: DVec3) -> bool {
+    let eye_dist = eye.length();
+    let b = wgs84::B;
+    if eye_dist <= b {
+        return false;
+    }
+    let eye_dir = eye.scale(1.0 / eye_dist);
+    let horizon_plane_dist = (b * b) / eye_dist;
+    let proj = center.dot(eye_dir);
+    (proj + radius) < horizon_plane_dist
+}
+
+/// Tests whether a tile bounding sphere intersects the camera view frustum cone.
+pub fn is_tile_in_frustum(
+    center: DVec3,
+    radius: f64,
+    eye: DVec3,
+    aim: DVec3,
+    fov_y_deg: f64,
+    aspect: f64,
+) -> bool {
+    let to_aim = aim.sub(eye);
+    if to_aim.length() < 1e-6 {
+        return true;
+    }
+    let forward = to_aim.normalize();
+    let to_center = center.sub(eye);
+    let center_dist = to_center.length();
+
+    if center_dist <= radius {
+        return true;
+    }
+
+    let forward_dist = to_center.dot(forward);
+    if forward_dist + radius < 0.0 {
+        return false;
+    }
+
+    let half_fov_y = (fov_y_deg.to_radians() * 0.5).tan();
+    let half_fov_x = half_fov_y * aspect.max(1e-6);
+    let frustum_half_angle = (half_fov_x * half_fov_x + half_fov_y * half_fov_y).sqrt().atan();
+    let max_angle = frustum_half_angle * 1.35;
+
+    let center_dir = to_center.scale(1.0 / center_dist);
+    let cos_angle = center_dir.dot(forward).clamp(-1.0, 1.0);
+    let angle = cos_angle.acos();
+    let angular_radius = (radius / center_dist).min(1.0).asin();
+
+    angle - angular_radius <= max_angle
+}
+
+/// Computes the Screen-Space Error (SSE) in pixels for a tile viewed from distance `dist_to_eye`.
+pub fn compute_tile_sse(
+    tile_span_m: f64,
+    grid_resolution: u32,
+    dist_to_eye: f64,
+    viewport_height: f64,
+    fov_y_deg: f64,
+) -> f64 {
+    let grid = grid_resolution.max(2) as f64;
+    let geometric_error_m = tile_span_m / (grid - 1.0);
+    let fov_rad = fov_y_deg.to_radians();
+    let tan_half_fov = (fov_rad * 0.5).tan().max(1e-6);
+    let dist = dist_to_eye.max(1.0);
+
+    (geometric_error_m * viewport_height) / (2.0 * dist * tan_half_fov)
+}
+
+/// Hierarchical quadtree LOD traversal over the WGS84 planetary ellipsoid.
+///
+/// Subdivides nodes from Level 0 down to `max_level` based on horizon culling,
+/// frustum culling, and Screen-Space Error (SSE) thresholds. Emits all visible
+/// leaf tiles to `on_leaf_tile`.
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod(
+    eye: DVec3,
+    aim: DVec3,
+    fov_y_deg: f64,
+    aspect: f64,
+    viewport_height: f64,
+    sse_threshold: f64,
+    max_level: u8,
+    tile_grid: u32,
+    mut on_leaf_tile: impl FnMut(TileKey, PatchBounds),
+) {
+    let mut stack = Vec::with_capacity(64);
+    stack.push(TileKey::new(0, 0, 0));
+
+    while let Some(key) = stack.pop() {
+        let (center, radius) = tile_bounding_sphere(key);
+
+        // 1. Horizon culling
+        if is_tile_horizon_culled(center, radius, eye) {
+            continue;
+        }
+
+        // 2. Frustum culling
+        if !is_tile_in_frustum(center, radius, eye, aim, fov_y_deg, aspect) {
+            continue;
+        }
+
+        // 3. Screen-Space Error calculation
+        let bounds = tile_bounds(key);
+        let dist_to_eye = (center.sub(eye).length() - radius).max(1.0);
+        let per_axis = key.tiles_per_axis() as f64;
+        let ground_span_m = (2.0 * std::f64::consts::PI * wgs84::A) / per_axis;
+        let sse = compute_tile_sse(
+            ground_span_m,
+            tile_grid,
+            dist_to_eye,
+            viewport_height,
+            fov_y_deg,
+        );
+
+        // 4. Subdivide if SSE > threshold and not at leaf limit
+        if sse > sse_threshold && key.level < max_level {
+            for q in 0..4 {
+                if let Some(child) = key.child(q) {
+                    stack.push(child);
+                }
+            }
+        } else {
+            on_leaf_tile(key, bounds);
+        }
+    }
+}
+
+// =========================================================================
+// Double-Precision (f64) Double-Single / Float-Float RTE GPU Math
+// =========================================================================
+
+/// Splits a double-precision (f64) value into high and low single-precision (f32) floats.
+///
+/// This provides 48 bits of effective significand precision (24 bits high + 24 bits low),
+/// preserving sub-millimeter geometric accuracy across the entire planetary scale
+/// (~6.378e6 m) on standard GPU hardware without requiring native f64 shaders.
+#[inline(always)]
+pub fn split_f64_to_high_low(val: f64) -> (f32, f32) {
+    let high = val as f32;
+    let low = (val - high as f64) as f32;
+    (high, low)
+}
+
+/// Splits a double-precision 3D vector (ECEF coordinate) into high and low `[f32; 3]` components.
+#[inline(always)]
+pub fn split_dvec3_to_high_low(val: DVec3) -> ([f32; 3], [f32; 3]) {
+    val.split_high_low()
+}
+
+/// Computes Relative-To-Eye (RTE) relative position in f32 from f64 inputs directly.
+#[inline(always)]
+pub fn rte_relative_position_f32(pos: DVec3, eye: DVec3) -> [f32; 3] {
+    let rel = pos.sub(eye);
+    [rel.x as f32, rel.y as f32, rel.z as f32]
+}
+
+/// Evaluates the GPU vertex shader Relative-To-Eye (RTE) formula using split high and low floats:
+/// `(pos_high - eye_high) + (pos_low - eye_low)`.
+///
+/// This yields sub-millimeter precision agreement with true f64 difference at planetary scale.
+#[inline(always)]
+pub fn rte_gpu_relative_position(
+    pos_high: [f32; 3],
+    pos_low: [f32; 3],
+    eye_high: [f32; 3],
+    eye_low: [f32; 3],
+) -> [f32; 3] {
+    [
+        (pos_high[0] - eye_high[0]) + (pos_low[0] - eye_low[0]),
+        (pos_high[1] - eye_high[1]) + (pos_low[1] - eye_low[1]),
+        (pos_high[2] - eye_high[2]) + (pos_low[2] - eye_low[2]),
+    ]
+}
+
+/// Uniforms for Relative-To-Eye (RTE) GPU rendering.
+///
+/// Encapsulates the split camera eye position and the translation-free view-projection matrix.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RteEyeUniforms {
+    /// High 32 bits of camera eye in ECEF.
+    pub eye_high: [f32; 3],
+    pub _pad0: f32,
+    /// Low 32 bits of camera eye in ECEF.
+    pub eye_low: [f32; 3],
+    pub _pad1: f32,
+    /// Combined view-projection matrix with camera translation removed (column-major).
+    pub view_proj_relative: [[f32; 4]; 4],
+}
+
+impl RteEyeUniforms {
+    pub fn new(
+        eye: DVec3,
+        aim: DVec3,
+        up: DVec3,
+        fov_y_deg: f64,
+        aspect: f64,
+        near: f64,
+        far: f64,
+    ) -> Self {
+        let (eye_high, eye_low) = eye.split_high_low();
+        let view_rel = DMat4::view_rotation_only(eye, aim, up);
+        let f = 1.0 / (fov_y_deg.to_radians() * 0.5).tan();
+        let range_inv = 1.0 / (near - far);
+        let proj = DMat4 {
+            m: [
+                f / aspect,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                far * range_inv,
+                -1.0,
+                0.0,
+                0.0,
+                near * far * range_inv,
+                0.0,
+            ],
+        };
+        let vp = proj.multiply(&view_rel);
+
+        let mut vp_cols = [[0.0f32; 4]; 4];
+        for (col, col_slice) in vp_cols.iter_mut().enumerate() {
+            for (row, cell) in col_slice.iter_mut().enumerate() {
+                *cell = vp.m[col * 4 + row] as f32;
+            }
+        }
+
+        Self {
+            eye_high,
+            _pad0: 0.0,
+            eye_low,
+            _pad1: 0.0,
+            view_proj_relative: vp_cols,
+        }
+    }
+
+    pub fn from_camera(camera: &EarthCamera, viewport_width: f64, viewport_height: f64) -> Self {
+        let placement = camera.placement();
+        let aspect = (viewport_width / viewport_height.max(1.0)).max(0.01);
+        Self::new(
+            placement.eye,
+            placement.aim,
+            placement.up,
+            placement.fov_y_deg,
+            aspect,
+            placement.near_m,
+            placement.far_m,
+        )
+    }
+
+    /// Transforms a split RTE vertex position to clip-space coordinates `[x, y, z, w]`.
+    pub fn transform_point_clip(&self, pos_high: [f32; 3], pos_low: [f32; 3]) -> [f32; 4] {
+        let rel = rte_gpu_relative_position(pos_high, pos_low, self.eye_high, self.eye_low);
+        let m = &self.view_proj_relative;
+        [
+            m[0][0] * rel[0] + m[1][0] * rel[1] + m[2][0] * rel[2] + m[3][0],
+            m[0][1] * rel[0] + m[1][1] * rel[1] + m[2][1] * rel[2] + m[3][1],
+            m[0][2] * rel[0] + m[1][2] * rel[1] + m[2][2] * rel[2] + m[3][2],
+            m[0][3] * rel[0] + m[1][3] * rel[1] + m[2][3] * rel[2] + m[3][3],
+        ]
+    }
+}
+

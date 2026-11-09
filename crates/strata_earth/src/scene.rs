@@ -1,18 +1,23 @@
 //! Frame assembly: turn an [`EarthInput`] into a renderer-ready scene.
 
+pub use crate::geodesy::{tile_bounds, PatchBounds};
 use crate::geodesy::{
-    geodetic_to_ecef, resolve_tile_imagery, EarthCamera, Geodetic, TileKey, TileTextureResolution,
+    geodetic_to_ecef, resolve_tile_imagery, traverse_quadtree_lod, EarthCamera, Geodetic, TileKey,
+    TileTextureResolution,
 };
 use crate::tiles::{TextureSlot, TileRegistry, TileSource};
 use strata_layout::Rect;
 use strata_render::camera64::{Camera64, DVec3, RenderFrame64};
+use strata_render::compositor::{DisplayList, DrawCommand};
 use strata_render::overlay3d::{
     LabelAnchor, MarkerKind, Overlay3D, OverlayPrimitive, OverlayTextStyle,
 };
+use strata_render::rasterizer::FrameBuffer;
 use strata_render::scene3d::{
     Background3D, Camera3D, CelestialBody3D, CloudShell3D, Material3D, Mesh3D, Scene3D,
     TexturedBatchMaterial3D, TexturedDraw3D, TexturedMaterial3D, Transform3D, UvTransform,
 };
+use strata_render::swapchain::{PresentError, SurfacePresenter};
 use strata_render::terrain3d::MeshBuilder;
 use strata_style::types::Color;
 
@@ -56,6 +61,8 @@ pub enum SurfaceMode {
     FlatPatches,
     /// True spherical Earth globe geometry at WGS84 radius.
     SphericalGlobe,
+    /// Continuous hierarchical WGS84 ellipsoid quadtree tile LOD pyramid with horizon culling and SSE subdivision.
+    QuadtreeLod,
 }
 
 /// Everything a frame needs.
@@ -81,6 +88,14 @@ pub struct EarthInput {
     pub markers: Vec<EntityMarker>,
     /// Geometry mode for surface rendering.
     pub surface_mode: SurfaceMode,
+    /// Target Screen-Space Error threshold in pixels for quadtree subdivision.
+    pub sse_threshold: f64,
+    /// Whether to generate adaptive terrain skirts around tile borders to eliminate LOD cracks.
+    ///
+    /// When `None` (the default), skirts are automatically generated for multi-resolution
+    /// LOD modes such as [`SurfaceMode::QuadtreeLod`]. When `Some(true)` or `Some(false)`,
+    /// skirt generation is explicitly forced on or off for all surface modes.
+    pub terrain_skirts: Option<bool>,
 }
 
 impl Default for EarthInput {
@@ -98,6 +113,8 @@ impl Default for EarthInput {
             patch_scale: 0.25,
             markers: Vec::new(),
             surface_mode: SurfaceMode::default(),
+            sse_threshold: 4.0,
+            terrain_skirts: None,
         }
     }
 }
@@ -279,6 +296,10 @@ impl EarthScene {
         self.buildings.set_origin(origin);
 
         if input.layers.terrain {
+            let with_skirts = input
+                .terrain_skirts
+                .unwrap_or(input.surface_mode == SurfaceMode::QuadtreeLod);
+
             match input.surface_mode {
                 SurfaceMode::FlatPatches => {
                     let span_deg = tile_patch_span_deg(&input.camera, input.patch_scale);
@@ -304,6 +325,7 @@ impl EarthScene {
                             input.tile_grid.max(2),
                             elevation.as_ref(),
                             requested,
+                            with_skirts,
                         );
                         patch.resolution = resolution;
                         patch.index_start = index_start;
@@ -359,6 +381,7 @@ impl EarthScene {
                                 input.tile_grid.max(2),
                                 elevation.as_ref(),
                                 requested,
+                                with_skirts,
                             );
                             self.patches.push(PatchFrame {
                                 key,
@@ -369,6 +392,66 @@ impl EarthScene {
                                 index_count,
                             });
                         }
+                    }
+                }
+                SurfaceMode::QuadtreeLod => {
+                    let mut leaves = Vec::new();
+                    traverse_quadtree_lod(
+                        placement.eye,
+                        placement.aim,
+                        placement.fov_y_deg,
+                        aspect as f64,
+                        input.viewport.height as f64,
+                        input.sse_threshold.max(0.5),
+                        input.max_tile_level,
+                        input.tile_grid,
+                        |key, bounds| {
+                            leaves.push((key, bounds));
+                        },
+                    );
+
+                    for (key, bounds) in leaves {
+                        stats.tiles_requested += 1;
+                        let requested = key;
+                        let resolution = resolve_tile_imagery(requested, |candidate| {
+                            matches!(source.imagery(candidate), Ok(Some(_)))
+                        });
+                        if let Some(res) = resolution {
+                            if res.exact {
+                                stats.tiles_exact += 1;
+                            } else {
+                                stats.tiles_from_ancestor += 1;
+                            }
+                        }
+
+                        let elevation = source.elevation(requested).ok().flatten();
+                        let (index_start, index_count) = push_tile_patch(
+                            &mut self.terrain,
+                            bounds,
+                            input.tile_grid.max(2),
+                            elevation.as_ref(),
+                            requested,
+                            with_skirts,
+                        );
+
+                        if input.layers.buildings {
+                            push_placeholder_buildings(
+                                &mut self.buildings,
+                                origin,
+                                bounds,
+                                elevation.as_ref(),
+                                requested,
+                            );
+                        }
+
+                        self.patches.push(PatchFrame {
+                            key,
+                            requested,
+                            bounds,
+                            resolution,
+                            index_start,
+                            index_count,
+                        });
                     }
                 }
             }
@@ -510,12 +593,87 @@ impl EarthScene {
             _ => false,
         })
     }
+
+    /// Converts the current 3D scene into a compositor `DrawViewport3D` command.
+    pub fn to_draw_command(&self, bounds: Rect) -> DrawCommand {
+        DrawCommand::DrawViewport3D {
+            bounds,
+            scene: self.scene.clone(),
+        }
+    }
+
+    /// Appends the viewport draw command for the current scene to a display list.
+    pub fn append_to_display_list(&self, list: &mut DisplayList, bounds: Rect) {
+        list.push(self.to_draw_command(bounds));
+    }
+
+    /// Software-rasterizes the current 3D scene into an offscreen RGBA framebuffer.
+    pub fn render_to_framebuffer(&self, width: u32, height: u32) -> FrameBuffer {
+        let width = width.max(1);
+        let height = height.max(1);
+        let mut fb = FrameBuffer::new(width as usize, height as usize);
+        let mut dl = DisplayList::new();
+        self.append_to_display_list(&mut dl, Rect::new(0.0, 0.0, width as f32, height as f32));
+        fb.execute_display_list(&dl);
+        fb
+    }
+
+    /// Presents the rendered scene to an abstract surface presenter.
+    pub fn present_to_surface(
+        &self,
+        presenter: &mut dyn SurfacePresenter,
+    ) -> Result<(), PresentError> {
+        self.present_to_surface_with_damage(presenter, None)
+    }
+
+    /// Presents the rendered scene to an abstract surface presenter with optional damage clipping.
+    pub fn present_to_surface_with_damage(
+        &self,
+        presenter: &mut dyn SurfacePresenter,
+        damage: Option<Rect>,
+    ) -> Result<(), PresentError> {
+        let (width, height) = presenter.surface_size();
+        let width = width.max(1);
+        let height = height.max(1);
+        let fb = self.render_to_framebuffer(width, height);
+        presenter.present(&fb, damage)
+    }
 }
 
 /// Shared terrain triangles: one patch per tile, two triangles per grid cell.
 pub fn terrain_triangle_count(tile_count: usize, grid: u32) -> usize {
     let cells = (grid.max(2) as usize - 1).pow(2);
     tile_count * cells * 2
+}
+
+/// Number of skirt triangles generated along the perimeter of one tile patch.
+pub fn terrain_skirt_triangle_count(grid: u32) -> usize {
+    let cells = grid.max(2) as usize - 1;
+    // 4 edges * (grid - 1) segments * 2 triangles per quad
+    cells * 8
+}
+
+/// Shared terrain triangles with skirts enabled: one patch per tile plus 4 boundary skirts.
+pub fn terrain_triangle_count_with_skirts(tile_count: usize, grid: u32) -> usize {
+    tile_count * (terrain_triangle_count(1, grid) + terrain_skirt_triangle_count(grid))
+}
+
+/// Computes the adaptive skirt depth in metres for a terrain tile patch.
+///
+/// Skirt depth scales with tile ground footprint span and topographic relief variance,
+/// guaranteeing that crack seams between adjacent tiles of differing LOD levels are
+/// occluded under oblique camera viewing angles without protruding into space.
+pub fn compute_adaptive_skirt_depth(bounds: PatchBounds, elevation_relief_range: f64) -> f64 {
+    let lat_mid_rad = ((bounds.lat0 + bounds.lat1) * 0.5).to_radians();
+    let lon_span_deg = (bounds.lon1 - bounds.lon0).abs();
+    let lat_span_deg = (bounds.lat1 - bounds.lat0).abs();
+    let span_x_m = lon_span_deg * 111_319.5 * lat_mid_rad.cos().abs();
+    let span_y_m = lat_span_deg * 111_132.9;
+    let tile_span_m = span_x_m.max(span_y_m);
+
+    (tile_span_m * 0.05)
+        .max(elevation_relief_range * 0.5)
+        .clamp(20.0, 500_000.0)
 }
 
 /// Shared building triangles: four walls plus the roof cap per footprint.
@@ -681,21 +839,6 @@ pub fn requested_tile(patch: &PatchFrame) -> TileKey {
     patch.requested
 }
 
-/// Geographic bounds of a tile at its own level.
-pub fn tile_bounds(key: TileKey) -> PatchBounds {
-    let per_axis = key.tiles_per_axis() as f64;
-    let lon_span = 360.0 / per_axis;
-    let lat_span = 180.0 / per_axis;
-    let lon0 = key.x as f64 * lon_span - 180.0;
-    let lat1 = 90.0 - key.y as f64 * lat_span;
-    PatchBounds {
-        lon0,
-        lon1: lon0 + lon_span,
-        lat0: lat1 - lat_span,
-        lat1,
-    }
-}
-
 /// Maps a geographic point into a tile's normalized `(u, v)` space.
 ///
 /// `u` runs west to east and `v` north to south, matching imagery and
@@ -728,19 +871,6 @@ pub fn surrounding_tiles(focus: Geodetic, level: u8) -> Vec<TileKey> {
     out
 }
 
-/// Geographic bounds of one terrain patch.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PatchBounds {
-    /// West edge longitude in degrees.
-    pub lon0: f64,
-    /// East edge longitude in degrees.
-    pub lon1: f64,
-    /// South edge latitude in degrees.
-    pub lat0: f64,
-    /// North edge latitude in degrees.
-    pub lat1: f64,
-}
-
 /// Appends one relief patch and returns its index range in the shared mesh.
 fn push_tile_patch(
     builder: &mut MeshBuilder,
@@ -748,11 +878,13 @@ fn push_tile_patch(
     grid: u32,
     elevation: Option<&crate::tiles::TileElevation>,
     elevation_tile: TileKey,
+    generate_skirts: bool,
 ) -> (u32, u32) {
     let index_start = builder.index_count() as u32;
     let cols = grid.max(2) as usize;
     let rows = cols;
     let mut positions = Vec::with_capacity(cols * rows);
+    let mut geodetics = Vec::with_capacity(cols * rows);
     for row in 0..rows {
         let v = row as f64 / (rows - 1) as f64;
         for col in 0..cols {
@@ -765,7 +897,9 @@ fn push_tile_patch(
                     grid.sample_bilinear(tu, tv) as f64
                 })
                 .unwrap_or(0.0);
-            positions.push(geodetic_to_ecef(Geodetic::new(lat, lon, height)));
+            let geo = Geodetic::new(lat, lon, height);
+            positions.push(geodetic_to_ecef(geo));
+            geodetics.push(geo);
         }
     }
 
@@ -796,6 +930,102 @@ fn push_tile_patch(
     }
 
     builder.push_grid_with_normals(&positions, &normals, cols, rows, (0.0, 0.0, 1.0, 1.0));
+
+    if generate_skirts {
+        let elev_range = elevation
+            .map(|grid| {
+                let mut min_h = f32::MAX;
+                let mut max_h = f32::MIN;
+                for &h in &grid.heights_m {
+                    if h < min_h {
+                        min_h = h;
+                    }
+                    if h > max_h {
+                        max_h = h;
+                    }
+                }
+                if max_h >= min_h {
+                    (max_h - min_h) as f64
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let skirt_depth = compute_adaptive_skirt_depth(bounds, elev_range);
+
+        // 1. South edge: row = 0, col from 0 to cols - 1 (West to East)
+        let mut south_top = Vec::with_capacity(cols);
+        let mut south_bot = Vec::with_capacity(cols);
+        let mut south_uvs = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let idx = col;
+            let geo = geodetics[idx];
+            let u = col as f32 / (cols - 1) as f32;
+            south_top.push(positions[idx]);
+            south_bot.push(geodetic_to_ecef(Geodetic::new(
+                geo.lat_deg,
+                geo.lon_deg,
+                geo.height_m - skirt_depth,
+            )));
+            south_uvs.push((u, 0.0));
+        }
+        builder.push_skirt(&south_top, &south_bot, &south_uvs);
+
+        // 2. East edge: col = cols - 1, row from 0 to rows - 1 (South to North)
+        let mut east_top = Vec::with_capacity(rows);
+        let mut east_bot = Vec::with_capacity(rows);
+        let mut east_uvs = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let idx = row * cols + (cols - 1);
+            let geo = geodetics[idx];
+            let v = row as f32 / (rows - 1) as f32;
+            east_top.push(positions[idx]);
+            east_bot.push(geodetic_to_ecef(Geodetic::new(
+                geo.lat_deg,
+                geo.lon_deg,
+                geo.height_m - skirt_depth,
+            )));
+            east_uvs.push((1.0, v));
+        }
+        builder.push_skirt(&east_top, &east_bot, &east_uvs);
+
+        // 3. North edge: row = rows - 1, col from cols - 1 down to 0 (East to West)
+        let mut north_top = Vec::with_capacity(cols);
+        let mut north_bot = Vec::with_capacity(cols);
+        let mut north_uvs = Vec::with_capacity(cols);
+        for col in (0..cols).rev() {
+            let idx = (rows - 1) * cols + col;
+            let geo = geodetics[idx];
+            let u = col as f32 / (cols - 1) as f32;
+            north_top.push(positions[idx]);
+            north_bot.push(geodetic_to_ecef(Geodetic::new(
+                geo.lat_deg,
+                geo.lon_deg,
+                geo.height_m - skirt_depth,
+            )));
+            north_uvs.push((u, 1.0));
+        }
+        builder.push_skirt(&north_top, &north_bot, &north_uvs);
+
+        // 4. West edge: col = 0, row from rows - 1 down to 0 (North to South)
+        let mut west_top = Vec::with_capacity(rows);
+        let mut west_bot = Vec::with_capacity(rows);
+        let mut west_uvs = Vec::with_capacity(rows);
+        for row in (0..rows).rev() {
+            let idx = row * cols;
+            let geo = geodetics[idx];
+            let v = row as f32 / (rows - 1) as f32;
+            west_top.push(positions[idx]);
+            west_bot.push(geodetic_to_ecef(Geodetic::new(
+                geo.lat_deg,
+                geo.lon_deg,
+                geo.height_m - skirt_depth,
+            )));
+            west_uvs.push((0.0, v));
+        }
+        builder.push_skirt(&west_top, &west_bot, &west_uvs);
+    }
+
     let index_count = builder.index_count() as u32 - index_start;
     (index_start, index_count)
 }
