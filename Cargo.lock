@@ -386,6 +386,7 @@ dependencies = [
  "brotli",
  "flate2",
  "getrandom",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",
