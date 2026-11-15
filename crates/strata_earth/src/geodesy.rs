@@ -837,3 +837,335 @@ impl RteEyeUniforms {
         ]
     }
 }
+
+/// Six normalized view-frustum clip planes in RTE `(point - eye)` coordinates (`f64`).
+///
+/// Each plane satisfies `a * rel.x + b * rel.y + c * rel.z + d >= 0` inside the frustum.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Frustum6 {
+    pub planes: [[f64; 4]; 6],
+    pub eye: DVec3,
+}
+
+impl Frustum6 {
+    /// Extracts the 6 exact clip planes from `camera` and viewport size in `f64`.
+    pub fn from_camera(camera: &EarthCamera, viewport_w: f64, viewport_h: f64) -> Self {
+        let placement = camera.placement();
+        let aspect = (viewport_w.max(1.0) / viewport_h.max(1.0)).max(0.01);
+        Self::new(
+            placement.eye,
+            placement.aim,
+            placement.up,
+            placement.fov_y_deg,
+            aspect,
+            placement.near_m,
+            placement.far_m,
+        )
+    }
+
+    pub fn new(
+        eye: DVec3,
+        aim: DVec3,
+        up: DVec3,
+        fov_y_deg: f64,
+        aspect: f64,
+        near: f64,
+        far: f64,
+    ) -> Self {
+        let view_rel = DMat4::view_rotation_only(eye, aim, up);
+        let f = 1.0 / (fov_y_deg.to_radians() * 0.5).tan();
+        let range_inv = 1.0 / (near - far);
+        let proj = DMat4 {
+            m: [
+                f / aspect,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                f,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                far * range_inv,
+                -1.0,
+                0.0,
+                0.0,
+                near * far * range_inv,
+                0.0,
+            ],
+        };
+        let vp = proj.multiply(&view_rel);
+        let m = &vp.m;
+        let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
+        let r0 = row(0);
+        let r1 = row(1);
+        let r2 = row(2);
+        let r3 = row(3);
+        let norm = |p: [f64; 4]| -> [f64; 4] {
+            let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-12);
+            [p[0] / len, p[1] / len, p[2] / len, p[3] / len]
+        };
+        let add = |a: [f64; 4], b: [f64; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+        let sub = |a: [f64; 4], b: [f64; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+        Self {
+            planes: [
+                norm(add(r3, r0)), // Left
+                norm(sub(r3, r0)), // Right
+                norm(add(r3, r1)), // Bottom
+                norm(sub(r3, r1)), // Top
+                norm(r2),          // Near
+                norm(sub(r3, r2)), // Far
+            ],
+            eye,
+        }
+    }
+
+    #[inline]
+    pub fn intersects_sphere(&self, center: DVec3, radius: f64) -> bool {
+        let rx = center.x - self.eye.x;
+        let ry = center.y - self.eye.y;
+        let rz = center.z - self.eye.z;
+        for p in &self.planes {
+            if p[0] * rx + p[1] * ry + p[2] * rz + p[3] < -radius {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Traverses the planetary quadtree using exact 6-plane frustum culling, horizon occlusion,
+/// and SSE threshold subdivision.
+pub fn traverse_quadtree_lod_frustum6(
+    camera: &EarthCamera,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+) -> Vec<TileKey> {
+    let placement = camera.placement();
+    let frustum = Frustum6::from_camera(camera, viewport_width_px, viewport_height_px);
+    let mut leaves = Vec::new();
+    let mut stack = vec![TileKey::new(0, 0, 0)];
+    let threshold = sse_threshold_px.max(0.5);
+
+    while let Some(key) = stack.pop() {
+        let (center, radius) = tile_bounding_sphere(key);
+        if is_tile_horizon_culled(center, radius, placement.eye) {
+            continue;
+        }
+        if !frustum.intersects_sphere(center, radius * 1.15) {
+            continue;
+        }
+        if key.level < max_level {
+            let dist_to_eye = (center.sub(placement.eye).length() - radius).max(1.0);
+            let per_axis = key.tiles_per_axis() as f64;
+            let ground_span_m = (2.0 * std::f64::consts::PI * wgs84::A) / per_axis;
+            let sse = compute_tile_sse(
+                ground_span_m,
+                tile_grid,
+                dist_to_eye,
+                viewport_height_px,
+                placement.fov_y_deg,
+            );
+            if sse > threshold {
+                for q in 0..4 {
+                    if let Some(child) = key.child(q) {
+                        stack.push(child);
+                    }
+                }
+                continue;
+            }
+        }
+        leaves.push(key);
+    }
+
+    leaves.sort_by(|a, b| {
+        a.level
+            .cmp(&b.level)
+            .then_with(|| a.x.cmp(&b.x))
+            .then_with(|| a.y.cmp(&b.y))
+    });
+    leaves
+}
+
+/// Builds a [`strata_render::scene3d::RetainedCameraUniforms`] packet from an [`EarthCamera`].
+pub fn retained_camera_uniforms(
+    camera: &EarthCamera,
+    viewport_w: f64,
+    viewport_h: f64,
+    sun_dir: [f32; 3],
+    sun_color: [f32; 3],
+    ambient_color: [f32; 3],
+    background: strata_render::scene3d::Background3D,
+) -> strata_render::scene3d::RetainedCameraUniforms {
+    let placement = camera.placement();
+    let aspect = (viewport_w.max(1.0) / viewport_h.max(1.0)).max(0.01);
+    let view_rel = DMat4::view_rotation_only(placement.eye, placement.aim, placement.up);
+    let f = 1.0 / (placement.fov_y_deg.to_radians() * 0.5).tan();
+    let range_inv = 1.0 / (placement.near_m - placement.far_m);
+    let proj_d = DMat4 {
+        m: [
+            f / aspect,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            f,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            placement.far_m * range_inv,
+            -1.0,
+            0.0,
+            0.0,
+            placement.near_m * placement.far_m * range_inv,
+            0.0,
+        ],
+    };
+    let vp_d = proj_d.multiply(&view_rel);
+    let to_cols = |d: &DMat4| -> [[f32; 4]; 4] {
+        let mut out = [[0.0f32; 4]; 4];
+        for (c, col) in out.iter_mut().enumerate() {
+            for (r, cell) in col.iter_mut().enumerate() {
+                *cell = d.m[c * 4 + r] as f32;
+            }
+        }
+        out
+    };
+    strata_render::scene3d::RetainedCameraUniforms {
+        proj: to_cols(&proj_d),
+        view_rot: to_cols(&view_rel),
+        view_proj_rte: to_cols(&vp_d),
+        eye_ecef: [placement.eye.x, placement.eye.y, placement.eye.z],
+        sun_dir,
+        sun_color,
+        ambient_color,
+        background,
+        near: placement.near_m as f32,
+        far: placement.far_m as f32,
+    }
+}
+
+/// Builds a tile-local RTC [`strata_render::scene3d::RetainedTileMesh`] relative to the tile's
+/// `center_ecef` once per `(TileKey, dem_revision)`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tile_local_rtc_mesh(
+    key: TileKey,
+    bounds: PatchBounds,
+    grid: u32,
+    elevation: Option<&crate::tiles::TileElevation>,
+    elevation_tile: TileKey,
+    generate_skirts: bool,
+    skirt_depth_m: f64,
+    revision: u64,
+    face: u8,
+) -> strata_render::scene3d::RetainedTileMesh {
+    let n = grid.max(2) as usize;
+    let mid_lat = (bounds.lat0 + bounds.lat1) * 0.5;
+    let mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
+    let center_dvec = geodetic_to_ecef(Geodetic::new(mid_lat.clamp(-89.9, 89.9), mid_lon, 0.0));
+
+    let mut positions = Vec::with_capacity(n * n);
+    let mut radials = Vec::with_capacity(n * n);
+    let mut uvs = Vec::with_capacity(n * n);
+
+    for row in 0..n {
+        let v = row as f64 / (n - 1) as f64;
+        for col in 0..n {
+            let u = col as f64 / (n - 1) as f64;
+            let lon = bounds.lon0 + (bounds.lon1 - bounds.lon0) * u;
+            let lat = (bounds.lat0 + (bounds.lat1 - bounds.lat0) * v).clamp(-89.9, 89.9);
+            let height = elevation
+                .map(|grid| {
+                    let (tu, tv) = crate::scene::uv_in_tile(elevation_tile, lat, lon);
+                    grid.sample_bilinear(tu, tv) as f64
+                })
+                .unwrap_or(0.0);
+            let p = geodetic_to_ecef(Geodetic::new(lat, lon, height));
+            positions.push(p);
+            radials.push(p.normalize());
+            uvs.push([u as f32, v as f32]);
+        }
+    }
+
+    let mut normals = Vec::with_capacity(n * n);
+    for row in 0..n {
+        for col in 0..n {
+            let idx = row * n + col;
+            let radial = radials[idx];
+            let east = positions[row * n + (col + 1).min(n - 1)]
+                .sub(positions[row * n + col.saturating_sub(1)]);
+            let north = positions[(row + 1).min(n - 1) * n + col]
+                .sub(positions[row.saturating_sub(1) * n + col]);
+            let cross = east.cross(north);
+            let normal = if cross.length() < 1e-9 {
+                radial
+            } else {
+                let nrm = cross.normalize();
+                if nrm.dot(radial) < 0.0 {
+                    nrm.scale(-1.0)
+                } else {
+                    nrm
+                }
+            };
+            normals.push(normal.as_f32());
+        }
+    }
+
+    let skirt_verts = if generate_skirts { 4 * n } else { 0 };
+    let mut vertices = Vec::with_capacity(n * n + skirt_verts);
+    let mut max_r2 = 0.0f64;
+
+    for i in 0..(n * n) {
+        let rel = positions[i].sub(center_dvec);
+        max_r2 = max_r2.max(rel.x * rel.x + rel.y * rel.y + rel.z * rel.z);
+        vertices.push(strata_render::scene3d::RteTileVertex::new(
+            rel.as_f32(),
+            normals[i],
+            uvs[i],
+        ));
+    }
+
+    if generate_skirts {
+        let push_skirt_pt = |vertices: &mut Vec<strata_render::scene3d::RteTileVertex>,
+                             idx: usize| {
+            let dropped = positions[idx].sub(radials[idx].scale(skirt_depth_m));
+            let rel = dropped.sub(center_dvec);
+            vertices.push(strata_render::scene3d::RteTileVertex::new(
+                rel.as_f32(),
+                normals[idx],
+                uvs[idx],
+            ));
+        };
+        // South (row = 0, col = 0..n)
+        for col in 0..n {
+            push_skirt_pt(&mut vertices, col);
+        }
+        // East (col = n-1, row = 0..n)
+        for row in 0..n {
+            push_skirt_pt(&mut vertices, row * n + (n - 1));
+        }
+        // North (row = n-1, col = 0..n)
+        for col in 0..n {
+            push_skirt_pt(&mut vertices, (n - 1) * n + col);
+        }
+        // West (col = 0, row = 0..n)
+        for row in 0..n {
+            push_skirt_pt(&mut vertices, row * n);
+        }
+    }
+
+    strata_render::scene3d::RetainedTileMesh {
+        key: strata_render::scene3d::TileKeyId::new(key.level, key.x, key.y, face),
+        revision,
+        center_ecef: [center_dvec.x, center_dvec.y, center_dvec.z],
+        grid_res: n as u32,
+        has_skirts: generate_skirts,
+        vertices: std::sync::Arc::new(vertices),
+        bounding_radius: max_r2.sqrt() as f32,
+    }
+}
