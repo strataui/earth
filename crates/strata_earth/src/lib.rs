@@ -20,6 +20,7 @@ pub mod geodesy;
 pub mod json;
 pub mod scene;
 pub mod tiles;
+pub mod worker;
 
 pub use acceptance::{
     evaluate as evaluate_acceptance, AcceptanceCriteria, AcceptanceReport, PixelDelta,
@@ -31,12 +32,13 @@ pub use descriptor::{
     TileSupply, DESCRIPTOR_FORMAT, DESCRIPTOR_VERSION, DESCRIPTOR_VERSION_V1,
 };
 pub use geodesy::{
-    clamp_latitude, compute_tile_sse, depth_range, ecef_to_geodetic, geodetic_to_ecef,
-    horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum, level_for_altitude,
-    pick_geodetic, raycast_ellipsoid, resolve_tile_imagery, rte_gpu_relative_position,
-    rte_relative_position_f32, screen_to_ray, split_dvec3_to_high_low, split_f64_to_high_low,
-    tile_bounding_sphere, tile_bounds, traverse_quadtree_lod, wrap_longitude, CameraPlacement,
-    EarthCamera, Geodetic, LocalFrame, RteEyeUniforms, TileKey, TileTextureResolution,
+    build_tile_local_rtc_mesh, clamp_latitude, compute_tile_sse, depth_range, ecef_to_geodetic,
+    geodetic_to_ecef, horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum,
+    level_for_altitude, pick_geodetic, raycast_ellipsoid, resolve_tile_imagery,
+    retained_camera_uniforms, rte_gpu_relative_position, rte_relative_position_f32, screen_to_ray,
+    split_dvec3_to_high_low, split_f64_to_high_low, tile_bounding_sphere, tile_bounds,
+    traverse_quadtree_lod, traverse_quadtree_lod_frustum6, wrap_longitude, CameraPlacement,
+    EarthCamera, Frustum6, Geodetic, LocalFrame, RteEyeUniforms, TileKey, TileTextureResolution,
     GLOBE_ALTITUDE_M,
 };
 pub use scene::{
@@ -52,4 +54,7 @@ pub use tiles::{
     HttpTransport, LruTileCache, LruTileCacheSource, MemoryTileSource, MockHttpTransport,
     NetworkTileSource, NetworkTileStats, StandardHttpTransport, TextureSlot, TileElevation,
     TileError, TileImage, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
+};
+pub use worker::{
+    EarthTileWorker, EarthViewport, EarthViewportStats, RetainedBuildStats, RetainedTerrainBuilder,
 };

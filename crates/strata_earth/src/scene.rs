@@ -153,6 +153,11 @@ pub struct EarthScene {
     frame_height: f32,
     rtc_origin: DVec3,
     building_source: Option<Box<dyn BuildingSource>>,
+    retained_builder: crate::worker::RetainedTerrainBuilder,
+    retained_handle: strata_render::scene3d::RetainedScene3D,
+    retained_geom_rev: u64,
+    last_retained_stats: crate::worker::RetainedBuildStats,
+    last_retained_leaves: Option<(SurfaceMode, u32, u8, f64, bool, Vec<TileKey>)>,
 }
 
 impl Default for EarthScene {
@@ -174,6 +179,13 @@ impl EarthScene {
             frame_height: 900.0,
             rtc_origin: geodetic_to_ecef(Geodetic::default()),
             building_source: None,
+            retained_builder: crate::worker::RetainedTerrainBuilder::new(),
+            retained_handle: strata_render::scene3d::RetainedScene3D::new(
+                strata_render::scene3d::RetainedCameraUniforms::default(),
+            ),
+            retained_geom_rev: 0,
+            last_retained_stats: crate::worker::RetainedBuildStats::default(),
+            last_retained_leaves: None,
         }
     }
 
@@ -572,12 +584,102 @@ impl EarthScene {
             scene = scene.with_overlay(overlay);
         }
 
+        self.retained_geom_rev += 1;
+        let (retained_frame, r_stats) =
+            self.retained_builder
+                .build_frame(input, source, self.retained_geom_rev, false);
+        self.last_retained_stats = r_stats;
+        self.retained_handle
+            .update_terrain(std::sync::Arc::clone(&retained_frame));
+        scene.set_retained_terrain(Some(retained_frame));
+        scene.set_retained_handle(Some(self.retained_handle.clone()));
+
         self.frame_width = input.viewport.width;
         self.frame_height = input.viewport.height;
         scene.set_textures(Some(self.tiles.store_arc()));
         self.rtc_origin = origin;
         self.scene = scene;
         self.stats = stats;
+    }
+
+    /// Returns the persistent [`strata_render::scene3d::RetainedScene3D`] handle owned by this scene.
+    pub fn retained_scene(&self) -> strata_render::scene3d::RetainedScene3D {
+        self.retained_handle.clone()
+    }
+
+    /// Returns cache hit/miss statistics from the latest retained terrain frame build.
+    pub fn retained_stats(&self) -> crate::worker::RetainedBuildStats {
+        self.last_retained_stats
+    }
+
+    /// GPU-first retained build that updates camera uniforms in O(1) when visible LOD leaves
+    /// remain identical, and skips CPU [`MeshBuilder`] construction altogether.
+    pub fn build_retained(&mut self, input: &EarthInput, source: &mut dyn TileSource) {
+        let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
+        if input.layers.terrain && input.surface_mode == SurfaceMode::QuadtreeLod {
+            let leaves = crate::geodesy::traverse_quadtree_lod_frustum6(
+                &input.camera,
+                input.viewport.width.max(1.0) as f64,
+                input.viewport.height.max(1.0) as f64,
+                input.sse_threshold,
+                input.max_tile_level,
+                input.tile_grid.max(2),
+            );
+            let with_skirts = input.terrain_skirts.unwrap_or(true);
+            let sig = (
+                input.surface_mode,
+                input.tile_grid.max(2),
+                input.max_tile_level,
+                input.sse_threshold,
+                with_skirts,
+                leaves,
+            );
+            if self.last_retained_leaves.as_ref() == Some(&sig)
+                && self.retained_handle.snapshot_terrain().is_some()
+            {
+                self.retained_handle.update_camera(cam_u);
+                self.last_retained_stats = crate::worker::RetainedBuildStats {
+                    visible_tiles: sig.5.len(),
+                    mesh_cache_hits: sig.5.len(),
+                    mesh_cache_misses: 0,
+                    texture_cache_hits: sig.5.len(),
+                    texture_cache_misses: 0,
+                    ancestor_fallbacks: 0,
+                };
+                self.scene
+                    .set_retained_handle(Some(self.retained_handle.clone()));
+                return;
+            }
+            self.last_retained_leaves = Some(sig);
+        } else {
+            self.last_retained_leaves = None;
+        }
+
+        self.retained_geom_rev += 1;
+        let (frame, r_stats) =
+            self.retained_builder
+                .build_frame(input, source, self.retained_geom_rev, true);
+        self.last_retained_stats = r_stats;
+        self.retained_handle
+            .update_terrain(std::sync::Arc::clone(&frame));
+        let mut scene = Scene3D::new()
+            .with_background(sky_gradient(input.daylight))
+            .with_retained_terrain(frame)
+            .with_retained_handle(self.retained_handle.clone());
+        let placement = input.camera.placement();
+        let origin = geodetic_to_ecef(input.camera.focus);
+        let aspect = (input.viewport.width / input.viewport.height.max(1.0)).max(0.01);
+        scene.camera = Camera3D::Perspective {
+            fov_horizontal_deg: horizontal_fov_deg(placement.fov_y_deg, aspect as f64) as f32,
+            near: placement.near_m as f32,
+            far: placement.far_m as f32,
+            position: placement.eye.sub(origin).as_f32(),
+            target: placement.aim.sub(origin).as_f32(),
+        };
+        self.frame_width = input.viewport.width;
+        self.frame_height = input.viewport.height;
+        self.rtc_origin = origin;
+        self.scene = scene;
     }
 
     /// Terrain patches built during the most recent frame, in draw order.
