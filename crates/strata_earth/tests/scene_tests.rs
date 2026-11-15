@@ -35,6 +35,27 @@ fn source_for(keys: &[TileKey], image: &TileImage) -> MemoryTileSource {
     source
 }
 
+/// Four footprints per patch in a 2x2 grid, matching the old placeholder layout.
+fn grid_buildings(patches: &[strata_earth::PatchFrame]) -> strata_earth::MemoryBuildingSource {
+    let mut source = strata_earth::MemoryBuildingSource::new();
+    for patch in patches {
+        let b = patch.bounds;
+        for iy in 0..2 {
+            for ix in 0..2 {
+                let lat = b.lat0 + (b.lat1 - b.lat0) * (0.25 + 0.5 * iy as f64);
+                let lon = b.lon0 + (b.lon1 - b.lon0) * (0.25 + 0.5 * ix as f64);
+                source.push(strata_earth::BuildingFootprint::new(
+                    lat,
+                    lon,
+                    (40.0, 25.0),
+                    60.0,
+                ));
+            }
+        }
+    }
+    source
+}
+
 fn viewpoint(altitude_m: f64) -> EarthInput {
     EarthInput {
         camera: strata_earth::EarthCamera {
@@ -154,6 +175,10 @@ fn terrain_regime_uses_terrain_grid_and_relief() {
         },
     );
     let mut scene = EarthScene::new();
+    input.layers.buildings = true;
+    scene.set_building_source(Some(Box::new(grid_buildings(
+        &strata_earth::surrounding_patches(input.camera.focus, span),
+    ))));
     scene.build(&input, &mut source);
 
     let expected = strata_earth::scene::terrain_triangle_count(keys.len(), 9);
@@ -303,9 +328,15 @@ fn populated_input() -> EarthInput {
 }
 
 fn measure_frame_budget(input: &EarthInput) -> (f64, strata_earth::FrameStats) {
+    let mut input = input.clone();
+    input.layers.buildings = true;
+    let input = &input;
     let keys = surrounding_tiles(input.camera.focus, 18);
     let mut source = source_for(&keys, &solid_tile(40, 90, 60));
     let mut scene = EarthScene::new();
+    let span = strata_earth::tile_patch_span_deg(&input.camera, input.patch_scale);
+    let patches = strata_earth::surrounding_patches(input.camera.focus, span);
+    scene.set_building_source(Some(Box::new(grid_buildings(&patches))));
 
     // Warm-up: buffers, textures, and the rasterizer caches.
     scene.build(input, &mut source);
@@ -381,13 +412,7 @@ fn plugin_has_no_widget_or_shell_dependency() {
     // Structural check of the dependency surface. The plugin may only depend on
     // engine crates; no egui, widget, or process-spawning crate is allowed.
     let manifest = include_str!("../Cargo.toml");
-    for banned in [
-        "egui",
-        "strata-egui",
-        "strata_egui",
-        "git2",
-        "reqwest",
-    ] {
+    for banned in ["egui", "strata-egui", "strata_egui", "git2", "reqwest"] {
         assert!(
             !manifest.to_lowercase().contains(&banned.to_lowercase()),
             "the plugin manifest must not depend on {banned}"
@@ -481,7 +506,9 @@ fn relief_sampling_raises_the_terrain_surface() {
         panic!("terrain must be custom textured geometry");
     };
     let radii: Vec<f64> = vertices
-        .as_chunks::<8>().0.iter()
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|v| {
             let absolute = origin.add(strata_render::camera64::DVec3::new(
                 v[0] as f64,
@@ -529,11 +556,16 @@ fn elevation_gradient_matches_the_reference_sampling() {
 
 #[test]
 fn terrain_is_one_batched_mesh_and_buildings_are_one_mesh() {
-    let input = viewpoint(4_000.0);
+    let input = {
+        let mut input = viewpoint(4_000.0);
+        input.layers.buildings = true;
+        input
+    };
     let span = strata_earth::tile_patch_span_deg(&input.camera, input.patch_scale);
     let patches = strata_earth::surrounding_patches(input.camera.focus, span);
     let mut source = MemoryTileSource::new();
     let mut scene = EarthScene::new();
+    scene.set_building_source(Some(Box::new(grid_buildings(&patches))));
     scene.build(&input, &mut source);
 
     let batches: Vec<&strata_render::scene3d::TexturedBatchMaterial3D> = scene
@@ -638,7 +670,9 @@ fn local_depth_policy_lets_a_twenty_kilometre_quad_paint() {
     );
     let painted = fb
         .pixels
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[3] > 0 && p[0] > 100 && p[1] > 150 && p[2] < 200)
         .count();
     assert!(
@@ -790,14 +824,27 @@ fn spherical_globe_mode_builds_closed_sphere_and_surface_descriptor() {
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
 
-    assert!(!scene.patches().is_empty(), "must build sphere tile patches");
-    assert!(scene.stats().terrain_triangles > 0, "must emit sphere triangles");
+    assert!(
+        !scene.patches().is_empty(),
+        "must build sphere tile patches"
+    );
+    assert!(
+        scene.stats().terrain_triangles > 0,
+        "must emit sphere triangles"
+    );
 
     let descriptor = FrameDescriptor::capture(&scene, &input);
-    assert!(descriptor.surface.is_some(), "must declare a surface sphere in descriptor");
+    assert!(
+        descriptor.surface.is_some(),
+        "must declare a surface sphere in descriptor"
+    );
     let sphere = descriptor.surface.as_ref().unwrap();
     assert!((sphere.radius_m - 6_378_137.0).abs() < 1e-3);
-    assert_eq!(descriptor.patches.len(), 0, "sphere frame omits planar patches");
+    assert_eq!(
+        descriptor.patches.len(),
+        0,
+        "sphere frame omits planar patches"
+    );
     assert!(!descriptor.rings.is_empty(), "must declare tile rings");
     assert_eq!(descriptor.rings[0].tiles.len(), descriptor.tiles.len());
 
@@ -807,7 +854,10 @@ fn spherical_globe_mode_builds_closed_sphere_and_surface_descriptor() {
     assert!(!json_str.contains("\"patches\""));
 
     let restored = descriptor.earth_input();
-    assert_eq!(restored.surface_mode, strata_earth::SurfaceMode::SphericalGlobe);
+    assert_eq!(
+        restored.surface_mode,
+        strata_earth::SurfaceMode::SphericalGlobe
+    );
 }
 
 #[test]
@@ -845,7 +895,10 @@ fn directory_tile_source_round_trips_images_and_elevation() {
     assert_eq!(loaded_img.height, 64);
     assert_eq!(&loaded_img.pixels[..], &test_image_bytes[8..]);
 
-    let loaded_elev = source.elevation(key).expect("read ok").expect("elev exists");
+    let loaded_elev = source
+        .elevation(key)
+        .expect("read ok")
+        .expect("elev exists");
     assert_eq!(loaded_elev.width, 16);
     assert_eq!(loaded_elev.height, 16);
     assert_eq!(loaded_elev.sample_bilinear(0.0, 0.0), 0.0);
@@ -880,7 +933,8 @@ fn test_earth_scene_build_quadtree_lod_mode() {
     );
 
     // Verify patches are loaded and rendered
-    let levels: std::collections::BTreeSet<u8> = scene.patches().iter().map(|p| p.key.level).collect();
+    let levels: std::collections::BTreeSet<u8> =
+        scene.patches().iter().map(|p| p.key.level).collect();
     assert!(
         !levels.is_empty(),
         "hierarchical quadtree LOD should have resolved tiles, got {:?}",
@@ -934,7 +988,10 @@ fn test_terrain_skirt_triangle_counting() {
     assert_eq!(strata_earth::terrain_skirt_triangle_count(5), 32);
     assert_eq!(strata_earth::terrain_triangle_count(1, 5), 32);
     assert_eq!(strata_earth::terrain_triangle_count_with_skirts(1, 5), 64);
-    assert_eq!(strata_earth::terrain_triangle_count_with_skirts(9, 5), 9 * 64);
+    assert_eq!(
+        strata_earth::terrain_triangle_count_with_skirts(9, 5),
+        9 * 64
+    );
 
     // For grid = 9: 8 cells per axis -> 8 * 8 * 2 = 128 grid triangles
     // Skirt: 4 borders * 8 segments * 2 triangles = 64 skirt triangles
@@ -949,7 +1006,8 @@ fn test_adaptive_terrain_skirts_in_scene_build() {
     input_no_skirts.tile_grid = 9;
     input_no_skirts.terrain_skirts = Some(false);
 
-    let span = strata_earth::tile_patch_span_deg(&input_no_skirts.camera, input_no_skirts.patch_scale);
+    let span =
+        strata_earth::tile_patch_span_deg(&input_no_skirts.camera, input_no_skirts.patch_scale);
     let keys: Vec<TileKey> = strata_earth::surrounding_patches(input_no_skirts.camera.focus, span)
         .iter()
         .map(strata_earth::requested_tile)
@@ -960,7 +1018,10 @@ fn test_adaptive_terrain_skirts_in_scene_build() {
     scene_no_skirts.build(&input_no_skirts, &mut source);
 
     let expected_grid_only = strata_earth::terrain_triangle_count(keys.len(), 9);
-    assert_eq!(scene_no_skirts.stats().terrain_triangles, expected_grid_only);
+    assert_eq!(
+        scene_no_skirts.stats().terrain_triangles,
+        expected_grid_only
+    );
 
     // Now build with skirts enabled
     let mut input_with_skirts = input_no_skirts.clone();
@@ -1002,5 +1063,3 @@ fn test_adaptive_terrain_skirts_in_scene_build() {
         "Quadtree LOD with auto-skirts must have more triangles than with skirts disabled"
     );
 }
-
-

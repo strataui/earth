@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 use strata_earth::{
-    decode_png_to_rgba, decode_terrain_rgb, format_slippy_url,
-    MockHttpTransport, NetworkTileSource, TileKey, TileSource,
+    decode_png_to_rgba, decode_terrain_rgb, format_slippy_url, MockHttpTransport,
+    NetworkTileSource, TileKey, TileSource,
 };
 
 fn crc32_simple(data: &[u8]) -> u32 {
@@ -87,10 +87,14 @@ fn test_format_slippy_url_interpolation() {
     assert_eq!(url3, "https://c.tile.openstreetmap.org/14/2621/6332.png");
 
     // Standard WMTS query parameters template
-    let wmts_template = "https://server.com/wmts?TileMatrix={TileMatrix}&TileCol={TileCol}&TileRow={TileRow}";
+    let wmts_template =
+        "https://server.com/wmts?TileMatrix={TileMatrix}&TileCol={TileCol}&TileRow={TileRow}";
     let mut wmts_counter = 0;
     let wmts_url = format_slippy_url(wmts_template, key, &subdomains, &mut wmts_counter);
-    assert_eq!(wmts_url, "https://server.com/wmts?TileMatrix=14&TileCol=2621&TileRow=6332");
+    assert_eq!(
+        wmts_url,
+        "https://server.com/wmts?TileMatrix=14&TileCol=2621&TileRow=6332"
+    );
 }
 
 #[test]
@@ -98,14 +102,15 @@ fn test_decode_png_to_rgba_round_trip() {
     let width = 2;
     let height = 2;
     let expected_pixels = vec![
-        255, 0, 0, 255,   // Red
-        0, 255, 0, 255,   // Green
-        0, 0, 255, 255,   // Blue
+        255, 0, 0, 255, // Red
+        0, 255, 0, 255, // Green
+        0, 0, 255, 255, // Blue
         255, 255, 0, 255, // Yellow
     ];
 
     let png_bytes = encode_test_png(width, height, &expected_pixels);
-    let (decoded_w, decoded_h, decoded_rgba) = decode_png_to_rgba(&png_bytes).expect("PNG decoding must succeed");
+    let (decoded_w, decoded_h, decoded_rgba) =
+        decode_png_to_rgba(&png_bytes).expect("PNG decoding must succeed");
 
     assert_eq!(decoded_w, width);
     assert_eq!(decoded_h, height);
@@ -128,8 +133,16 @@ fn test_decode_terrain_rgb_elevation() {
     let elevation = decode_terrain_rgb(2, 1, &pixels);
     assert_eq!(elevation.width, 2);
     assert_eq!(elevation.height, 1);
-    assert!((elevation.heights_m[0] - 0.0).abs() < 0.1, "expected 0m, got {}", elevation.heights_m[0]);
-    assert!((elevation.heights_m[1] - 1000.0).abs() < 0.1, "expected 1000m, got {}", elevation.heights_m[1]);
+    assert!(
+        (elevation.heights_m[0] - 0.0).abs() < 0.1,
+        "expected 0m, got {}",
+        elevation.heights_m[0]
+    );
+    assert!(
+        (elevation.heights_m[1] - 1000.0).abs() < 0.1,
+        "expected 1000m, got {}",
+        elevation.heights_m[1]
+    );
 }
 
 #[test]
@@ -138,10 +151,7 @@ fn test_network_tile_source_non_blocking_streaming() {
     let width = 2;
     let height = 2;
     let test_pixels = vec![
-        40, 90, 60, 255,
-        50, 100, 70, 255,
-        60, 110, 80, 255,
-        70, 120, 90, 255,
+        40, 90, 60, 255, 50, 100, 70, 255, 60, 110, 80, 255, 70, 120, 90, 255,
     ];
     let png_bytes = encode_test_png(width, height, &test_pixels);
 
@@ -152,8 +162,13 @@ fn test_network_tile_source_non_blocking_streaming() {
     let mut source = NetworkTileSource::osm().with_transport(mock_transport.clone());
 
     // 1. First call: cache miss, enqueues background worker, returns Ok(None) non-blockingly
-    let first_result = source.imagery(key).expect("call must succeed without blocking");
-    assert!(first_result.is_none(), "first call must return None immediately for smooth fallback");
+    let first_result = source
+        .imagery(key)
+        .expect("call must succeed without blocking");
+    assert!(
+        first_result.is_none(),
+        "first call must return None immediately for smooth fallback"
+    );
     assert_eq!(source.stats().network_requests, 1);
     assert_eq!(source.stats().cache_misses, 1);
     assert_eq!(source.stats().cache_hits, 0);
@@ -163,7 +178,10 @@ fn test_network_tile_source_non_blocking_streaming() {
 
     // 3. Second call: poll_completed drains response into LRU cache, returns Ok(Some(image))
     let second_result = source.imagery(key).expect("call must succeed");
-    assert!(second_result.is_some(), "second call must return the downloaded tile from cache");
+    assert!(
+        second_result.is_some(),
+        "second call must return the downloaded tile from cache"
+    );
     let image = second_result.unwrap();
     assert_eq!(image.width, width);
     assert_eq!(image.height, height);
@@ -174,7 +192,11 @@ fn test_network_tile_source_non_blocking_streaming() {
     let third_result = source.imagery(key).expect("call must succeed");
     assert!(third_result.is_some());
     assert_eq!(source.stats().cache_hits, 2);
-    assert_eq!(source.stats().network_requests, 1, "no extra network requests should be issued");
+    assert_eq!(
+        source.stats().network_requests,
+        1,
+        "no extra network requests should be issued"
+    );
 }
 
 #[test]
@@ -183,7 +205,8 @@ fn test_network_tile_source_sync_fetch_and_disk_caching() {
     let test_pixels = [100, 150, 200, 255].repeat(4);
     let png_bytes = encode_test_png(2, 2, &test_pixels);
 
-    let temp_dir = std::env::temp_dir().join(format!("strata_tile_disk_cache_{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("strata_tile_disk_cache_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     let mock_transport = MockHttpTransport::new();
@@ -195,14 +218,21 @@ fn test_network_tile_source_sync_fetch_and_disk_caching() {
         .with_disk_cache(&temp_dir);
 
     // Synchronous fetch
-    let sync_img = source.fetch_sync(key).expect("fetch_sync must succeed").expect("image exists");
+    let sync_img = source
+        .fetch_sync(key)
+        .expect("fetch_sync must succeed")
+        .expect("image exists");
     assert_eq!(sync_img.width, 2);
     assert_eq!(sync_img.height, 2);
     assert_eq!(sync_img.pixels, test_pixels);
 
     // Verify written to disk cache
     let cached_file = temp_dir.join("7/20/30.png");
-    assert!(cached_file.is_file(), "disk cache file must exist at {}", cached_file.display());
+    assert!(
+        cached_file.is_file(),
+        "disk cache file must exist at {}",
+        cached_file.display()
+    );
 
     // Create a new source pointing at the same disk cache
     let empty_mock = MockHttpTransport::new(); // has no responses configured
@@ -211,7 +241,10 @@ fn test_network_tile_source_sync_fetch_and_disk_caching() {
         .with_disk_cache(&temp_dir);
 
     // Should hit disk cache immediately without network
-    let disk_img = disk_source.imagery(key).expect("call must succeed").expect("hit from disk cache");
+    let disk_img = disk_source
+        .imagery(key)
+        .expect("call must succeed")
+        .expect("hit from disk cache");
     assert_eq!(disk_img.width, 2);
     assert_eq!(disk_img.height, 2);
     assert_eq!(disk_source.stats().disk_cache_hits, 1);

@@ -102,7 +102,11 @@ pub fn raycast_ellipsoid(ray_origin: DVec3, ray_dir: DVec3) -> Option<DVec3> {
     let inv_a = 1.0 / wgs84::A;
     let inv_b = 1.0 / wgs84::B;
 
-    let p0 = DVec3::new(ray_origin.x * inv_a, ray_origin.y * inv_a, ray_origin.z * inv_b);
+    let p0 = DVec3::new(
+        ray_origin.x * inv_a,
+        ray_origin.y * inv_a,
+        ray_origin.z * inv_b,
+    );
     let d = DVec3::new(dir.x * inv_a, dir.y * inv_a, dir.z * inv_b);
 
     let a_coeff = d.x * d.x + d.y * d.y + d.z * d.z;
@@ -362,13 +366,8 @@ pub fn pick_geodetic(
     viewport_height: f64,
     camera: &EarthCamera,
 ) -> Option<Geodetic> {
-    let (ray_origin, ray_dir) = screen_to_ray(
-        screen_x,
-        screen_y,
-        viewport_width,
-        viewport_height,
-        camera,
-    );
+    let (ray_origin, ray_dir) =
+        screen_to_ray(screen_x, screen_y, viewport_width, viewport_height, camera);
     let hit_ecef = raycast_ellipsoid(ray_origin, ray_dir)?;
     Some(ecef_to_geodetic(hit_ecef))
 }
@@ -494,7 +493,6 @@ pub fn level_for_altitude(altitude_m: f64, max_level: u8) -> u8 {
 
 /// Wraps a longitude into `-180..180`.
 pub fn wrap_longitude(lon_deg: f64) -> f64 {
-    
     (lon_deg + 180.0).rem_euclid(360.0) - 180.0
 }
 
@@ -609,7 +607,9 @@ pub fn is_tile_in_frustum(
 
     let half_fov_y = (fov_y_deg.to_radians() * 0.5).tan();
     let half_fov_x = half_fov_y * aspect.max(1e-6);
-    let frustum_half_angle = (half_fov_x * half_fov_x + half_fov_y * half_fov_y).sqrt().atan();
+    let frustum_half_angle = (half_fov_x * half_fov_x + half_fov_y * half_fov_y)
+        .sqrt()
+        .atan();
     let max_angle = frustum_half_angle * 1.35;
 
     let center_dir = to_center.scale(1.0 / center_dist);
@@ -837,4 +837,3 @@ impl RteEyeUniforms {
         ]
     }
 }
-

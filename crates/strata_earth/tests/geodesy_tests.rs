@@ -239,9 +239,18 @@ fn ecef_geodetic_round_trip_accuracy() {
         };
         let height_err = (inverted.height_m - point.height_m).abs();
 
-        assert!(lat_err < 1e-7, "latitude error {lat_err} for point {point:?}");
-        assert!(lon_err < 1e-7, "longitude error {lon_err} for point {point:?}");
-        assert!(height_err < 1e-3, "height error {height_err} m for point {point:?}");
+        assert!(
+            lat_err < 1e-7,
+            "latitude error {lat_err} for point {point:?}"
+        );
+        assert!(
+            lon_err < 1e-7,
+            "longitude error {lon_err} for point {point:?}"
+        );
+        assert!(
+            height_err < 1e-3,
+            "height error {height_err} m for point {point:?}"
+        );
     }
 }
 
@@ -294,7 +303,10 @@ fn screen_to_ray_and_pick_geodetic_center_accuracy() {
     };
     // Ray at top-left corner (0, 0) misses the planet
     let corner_pick = strata_earth::pick_geodetic(0.0, 0.0, w, h, &space_camera);
-    assert!(corner_pick.is_none(), "far corner of wide FOV must miss the globe");
+    assert!(
+        corner_pick.is_none(),
+        "far corner of wide FOV must miss the globe"
+    );
 }
 
 #[test]
@@ -466,9 +478,21 @@ fn test_gpu_rte_relative_position_sub_millimeter_fidelity() {
     let err_y = (gpu_rel[1] as f64 - exact_rel.y).abs();
     let err_z = (gpu_rel[2] as f64 - exact_rel.z).abs();
 
-    assert!(err_x < 1e-6, "GPU RTE X error {} exceeds sub-millimeter tolerance", err_x);
-    assert!(err_y < 1e-6, "GPU RTE Y error {} exceeds sub-millimeter tolerance", err_y);
-    assert!(err_z < 1e-6, "GPU RTE Z error {} exceeds sub-millimeter tolerance", err_z);
+    assert!(
+        err_x < 1e-6,
+        "GPU RTE X error {} exceeds sub-millimeter tolerance",
+        err_x
+    );
+    assert!(
+        err_y < 1e-6,
+        "GPU RTE Y error {} exceeds sub-millimeter tolerance",
+        err_y
+    );
+    assert!(
+        err_z < 1e-6,
+        "GPU RTE Z error {} exceeds sub-millimeter tolerance",
+        err_z
+    );
 }
 
 #[test]
@@ -484,8 +508,15 @@ fn test_rte_eye_uniforms_projection_identity() {
     let (pos_h, pos_l) = strata_earth::split_dvec3_to_high_low(ground);
 
     let clip = uniforms.transform_point_clip(pos_h, pos_l);
-    assert!(clip[3] > 0.0, "w must be positive in front of camera, got {}", clip[3]);
+    assert!(
+        clip[3] > 0.0,
+        "w must be positive in front of camera, got {}",
+        clip[3]
+    );
     let ndc_z = clip[2] / clip[3];
-    assert!((0.0..=1.0).contains(&ndc_z), "NDC depth must be inside [0, 1], got {}", ndc_z);
+    assert!(
+        (0.0..=1.0).contains(&ndc_z),
+        "NDC depth must be inside [0, 1], got {}",
+        ndc_z
+    );
 }
-

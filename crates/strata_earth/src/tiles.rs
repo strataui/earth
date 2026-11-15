@@ -182,7 +182,7 @@ pub fn tile_sampler() -> SamplerDesc {
 /// Owns uploaded tile textures and hands out stable handles.
 #[derive(Debug)]
 pub struct TileRegistry {
-    store: TextureStore,
+    store: std::sync::Arc<TextureStore>,
     slots: std::collections::HashMap<TextureSlot, TextureId>,
     /// One-texel neutral texture drawn when a patch has no imagery.
     fallback: TextureId,
@@ -201,7 +201,7 @@ impl TileRegistry {
             .insert_rgba8(1, 1, vec![255u8, 255, 255, 255])
             .expect("a one-texel texture is always valid");
         Self {
-            store,
+            store: std::sync::Arc::new(store),
             slots: std::collections::HashMap::new(),
             fallback,
         }
@@ -217,13 +217,20 @@ impl TileRegistry {
         &self.store
     }
 
+    /// Returns a shared handle to the store. Cloning is an atomic refcount bump;
+    /// attach it to a scene with `Scene3D::set_textures` so every rasterizer
+    /// resolves the same imagery.
+    pub fn store_arc(&self) -> std::sync::Arc<TextureStore> {
+        std::sync::Arc::clone(&self.store)
+    }
+
     /// Uploads an image for a slot if it is not present yet.
     pub fn ensure(&mut self, slot: TextureSlot, image: &TileImage) -> Option<TextureId> {
         if let Some(existing) = self.slots.get(&slot) {
             return Some(*existing);
         }
         let data = image.to_texture_data()?;
-        let id = self.store.insert(data, tile_sampler())?;
+        let id = std::sync::Arc::make_mut(&mut self.store).insert(data, tile_sampler())?;
         self.slots.insert(slot, id);
         Some(id)
     }
@@ -246,7 +253,7 @@ impl TileRegistry {
             .collect();
         for slot in &evicted {
             if let Some(id) = self.slots.remove(slot) {
-                self.store.remove(id);
+                std::sync::Arc::make_mut(&mut self.store).remove(id);
             }
         }
         before - self.slots.len()
@@ -579,7 +586,9 @@ impl TileSource for DirectoryTileSource {
         };
 
         let heights_m: Vec<f32> = data_bytes
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
 
@@ -748,7 +757,10 @@ impl LruTileCache {
 
     /// Inserts elevation for `key`, evicting older entries if exceeding the byte budget.
     pub fn insert_elevation(&mut self, key: TileKey, elevation: TileElevation) {
-        self.insert(TileDataKey::Elevation(key), CachedTileData::Elevation(elevation));
+        self.insert(
+            TileDataKey::Elevation(key),
+            CachedTileData::Elevation(elevation),
+        );
     }
 
     /// Removes imagery for `key` if present.
@@ -1006,7 +1018,8 @@ pub fn decode_png_to_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TileError
 
     while pos + 8 <= bytes.len() {
         let chunk_len =
-            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
         let chunk_type = &bytes[pos + 4..pos + 8];
         pos += 8;
         if pos + chunk_len > bytes.len() {
@@ -1045,7 +1058,9 @@ pub fn decode_png_to_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TileError
     }
 
     if width == 0 || height == 0 || idat_data.is_empty() {
-        return Err(TileError::Decode("missing IHDR or IDAT in PNG data".to_string()));
+        return Err(TileError::Decode(
+            "missing IHDR or IDAT in PNG data".to_string(),
+        ));
     }
 
     if bit_depth != 8 {
@@ -1060,7 +1075,11 @@ pub fn decode_png_to_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TileError
         3 => 1, // Indexed
         4 => 2, // Grayscale + Alpha
         6 => 4, // RGBA
-        _ => return Err(TileError::Decode(format!("unsupported PNG color type {color_type}"))),
+        _ => {
+            return Err(TileError::Decode(format!(
+                "unsupported PNG color type {color_type}"
+            )))
+        }
     };
 
     use std::io::Read;
@@ -1121,7 +1140,11 @@ pub fn decode_png_to_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), TileError
                     };
                     filtered.wrapping_add(pr)
                 }
-                _ => return Err(TileError::Decode(format!("unknown PNG filter {filter_type}"))),
+                _ => {
+                    return Err(TileError::Decode(format!(
+                        "unknown PNG filter {filter_type}"
+                    )))
+                }
             };
             raw_scanlines[dst_row_start + x] = reconstructed;
         }
@@ -1220,7 +1243,8 @@ pub struct StandardHttpTransport {
 impl Default for StandardHttpTransport {
     fn default() -> Self {
         Self {
-            user_agent: "StrataEarth/0.1 (SlippyTileStreaming; https://github.com/strataui)".to_string(),
+            user_agent: "StrataEarth/0.1 (SlippyTileStreaming; https://github.com/strataui)"
+                .to_string(),
             timeout_ms: 10_000,
         }
     }
@@ -1244,7 +1268,6 @@ impl StandardHttpTransport {
 
 impl HttpTransport for StandardHttpTransport {
     fn fetch(&self, url: &str) -> Result<Vec<u8>, TileError> {
-
         // 2. Direct socket fallback for HTTP URLs
         if let Some(stripped) = url.strip_prefix("http://") {
             let (host_port, path) = match stripped.split_once('/') {
@@ -1261,8 +1284,9 @@ impl HttpTransport for StandardHttpTransport {
             use std::net::TcpStream;
             use std::time::Duration;
 
-            let mut stream = TcpStream::connect(&addr)
-                .map_err(|e| TileError::Transport(format!("HTTP connection failed to {addr}: {e}")))?;
+            let mut stream = TcpStream::connect(&addr).map_err(|e| {
+                TileError::Transport(format!("HTTP connection failed to {addr}: {e}"))
+            })?;
             let _ = stream.set_read_timeout(Some(Duration::from_millis(self.timeout_ms)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(self.timeout_ms)));
 
@@ -1283,13 +1307,17 @@ impl HttpTransport for StandardHttpTransport {
                 let headers = String::from_utf8_lossy(&resp[..header_end]);
                 let status_line = headers.lines().next().unwrap_or("");
                 if !status_line.contains("200") {
-                    return Err(TileError::Transport(format!("HTTP status not 200: {status_line}")));
+                    return Err(TileError::Transport(format!(
+                        "HTTP status not 200: {status_line}"
+                    )));
                 }
                 return Ok(resp[header_end + 4..].to_vec());
             }
         }
 
-        Err(TileError::Transport(format!("failed to fetch tile from {url}")))
+        Err(TileError::Transport(format!(
+            "failed to fetch tile from {url}"
+        )))
     }
 }
 
@@ -1311,7 +1339,10 @@ impl MockHttpTransport {
     }
 
     pub fn set_error(&self, url: impl Into<String>, error: impl Into<String>) {
-        self.responses.lock().unwrap().insert(url.into(), Err(error.into()));
+        self.responses
+            .lock()
+            .unwrap()
+            .insert(url.into(), Err(error.into()));
     }
 
     pub fn requested_urls(&self) -> Vec<String> {
@@ -1545,12 +1576,20 @@ impl NetworkTileSource {
     }
 
     /// Synchronously fetches and caches an elevation tile, blocking until complete.
-    pub fn fetch_elevation_sync(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
+    pub fn fetch_elevation_sync(
+        &mut self,
+        key: TileKey,
+    ) -> Result<Option<TileElevation>, TileError> {
         let template = match &self.elevation_url_template {
             Some(t) => t.clone(),
             None => return Ok(None),
         };
-        let url = format_slippy_url(&template, key, &self.subdomains, &mut self.subdomain_counter);
+        let url = format_slippy_url(
+            &template,
+            key,
+            &self.subdomains,
+            &mut self.subdomain_counter,
+        );
         let bytes = self.transport.fetch(&url)?;
         if let Some(dir) = &self.disk_cache_dir {
             let path = dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y));
@@ -1622,10 +1661,16 @@ impl NetworkTileSource {
                 });
             }
         }
-        Err(TileError::Decode(format!("unrecognized image data length {}", bytes.len())))
+        Err(TileError::Decode(format!(
+            "unrecognized image data length {}",
+            bytes.len()
+        )))
     }
 
-    fn decode_elevation_bytes(bytes: &[u8], is_terrain_rgb: bool) -> Result<TileElevation, TileError> {
+    fn decode_elevation_bytes(
+        bytes: &[u8],
+        is_terrain_rgb: bool,
+    ) -> Result<TileElevation, TileError> {
         if is_terrain_rgb || bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             let (w, h, rgba) = decode_png_to_rgba(bytes)?;
             return Ok(decode_terrain_rgb(w, h, &rgba));
@@ -1647,7 +1692,10 @@ impl NetworkTileSource {
                 });
             }
         }
-        Err(TileError::Decode(format!("unrecognized elevation data length {}", bytes.len())))
+        Err(TileError::Decode(format!(
+            "unrecognized elevation data length {}",
+            bytes.len()
+        )))
     }
 }
 
@@ -1694,9 +1742,10 @@ impl TileSource for NetworkTileSource {
                 &self.subdomains,
                 &mut self.subdomain_counter,
             );
-            let disk_cache_path = self.disk_cache_dir.as_ref().map(|dir| {
-                dir.join(format!("{}/{}/{}.png", key.level, key.x, key.y))
-            });
+            let disk_cache_path = self
+                .disk_cache_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("{}/{}/{}.png", key.level, key.x, key.y)));
             let _ = self.task_tx.send(FetchTask {
                 key: data_key,
                 url,
@@ -1728,7 +1777,9 @@ impl TileSource for NetworkTileSource {
             let path = dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y));
             if path.is_file() {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(elev) = Self::decode_elevation_bytes(&bytes, self.elevation_is_terrain_rgb) {
+                    if let Ok(elev) =
+                        Self::decode_elevation_bytes(&bytes, self.elevation_is_terrain_rgb)
+                    {
                         self.cache.insert_elevation(key, elev.clone());
                         self.stats.disk_cache_hits += 1;
                         return Ok(Some(elev));
@@ -1749,10 +1800,16 @@ impl TileSource for NetworkTileSource {
         }
 
         if is_new {
-            let url = format_slippy_url(&template, key, &self.subdomains, &mut self.subdomain_counter);
-            let disk_cache_path = self.disk_cache_dir.as_ref().map(|dir| {
-                dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y))
-            });
+            let url = format_slippy_url(
+                &template,
+                key,
+                &self.subdomains,
+                &mut self.subdomain_counter,
+            );
+            let disk_cache_path = self
+                .disk_cache_dir
+                .as_ref()
+                .map(|dir| dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y)));
             let _ = self.task_tx.send(FetchTask {
                 key: data_key,
                 url,
@@ -1766,4 +1823,3 @@ impl TileSource for NetworkTileSource {
         Ok(None)
     }
 }
-

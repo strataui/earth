@@ -89,8 +89,7 @@ fn test_earth_scene_present_to_software_surface() {
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
 
-    let mut presenter =
-        SoftwareSurfacePresenter::new(128, 128, SwapchainFormat::Rgba8Unorm);
+    let mut presenter = SoftwareSurfacePresenter::new(128, 128, SwapchainFormat::Rgba8Unorm);
     assert_eq!(presenter.surface_size(), (128, 128));
     assert_eq!(presenter.presented_frames, 0);
 
@@ -105,7 +104,10 @@ fn test_earth_scene_present_to_software_surface() {
         .iter()
         .filter(|&&byte| byte > 0)
         .count();
-    assert!(non_zero > 0, "software presenter backing buffer must contain frame pixels");
+    assert!(
+        non_zero > 0,
+        "software presenter backing buffer must contain frame pixels"
+    );
 }
 
 #[test]
@@ -118,8 +120,7 @@ fn test_earth_scene_present_to_software_surface_with_damage() {
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
 
-    let mut presenter =
-        SoftwareSurfacePresenter::new(100, 100, SwapchainFormat::Rgba8Unorm);
+    let mut presenter = SoftwareSurfacePresenter::new(100, 100, SwapchainFormat::Rgba8Unorm);
     let damage = Some(Rect::new(10.0, 10.0, 40.0, 40.0));
 
     let res = scene.present_to_surface_with_damage(&mut presenter, damage);
@@ -140,8 +141,7 @@ fn test_earth_scene_present_to_gpu_surface_presenter() {
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
 
-    let mut presenter =
-        GpuSurfacePresenter::new(120, 90, SwapchainFormat::Rgba8Unorm);
+    let mut presenter = GpuSurfacePresenter::new(120, 90, SwapchainFormat::Rgba8Unorm);
     let res = scene.present_to_surface(&mut presenter);
     assert!(res.is_ok(), "gpu surface presentation must succeed");
     assert_eq!(presenter.presented_frames, 1);
@@ -208,9 +208,18 @@ fn test_lru_tile_cache_access_refreshes_order() {
     // Now insert key3; since key1 was accessed, key2 is now the LRU and must be evicted
     cache.insert_imagery(key3, tile_img);
 
-    assert!(cache.contains_imagery(key1), "recently accessed key1 must be retained");
-    assert!(!cache.contains_imagery(key2), "untouched key2 must be evicted");
-    assert!(cache.contains_imagery(key3), "newly inserted key3 must be present");
+    assert!(
+        cache.contains_imagery(key1),
+        "recently accessed key1 must be retained"
+    );
+    assert!(
+        !cache.contains_imagery(key2),
+        "untouched key2 must be evicted"
+    );
+    assert!(
+        cache.contains_imagery(key3),
+        "newly inserted key3 must be present"
+    );
 }
 
 #[test]
@@ -253,24 +262,36 @@ fn test_lru_tile_cache_source_decorator() {
     assert_eq!(cached_source.misses(), 0);
 
     // 1. First fetch: cache miss, delegate to inner
-    let img1 = cached_source.imagery(key1).expect("read ok").expect("found");
+    let img1 = cached_source
+        .imagery(key1)
+        .expect("read ok")
+        .expect("found");
     assert_eq!(img1.width, 16);
     assert_eq!(cached_source.hits(), 0);
     assert_eq!(cached_source.misses(), 1);
 
     // 2. Second fetch: cache hit
-    let img2 = cached_source.imagery(key1).expect("read ok").expect("found");
+    let img2 = cached_source
+        .imagery(key1)
+        .expect("read ok")
+        .expect("found");
     assert_eq!(img2.width, 16);
     assert_eq!(cached_source.hits(), 1);
     assert_eq!(cached_source.misses(), 1);
 
     // 3. Elevation fetch: cache miss then hit
-    let elev1 = cached_source.elevation(key1).expect("read ok").expect("found");
+    let elev1 = cached_source
+        .elevation(key1)
+        .expect("read ok")
+        .expect("found");
     assert_eq!(elev1.width, 8);
     assert_eq!(cached_source.hits(), 1);
     assert_eq!(cached_source.misses(), 2);
 
-    let elev2 = cached_source.elevation(key1).expect("read ok").expect("found");
+    let elev2 = cached_source
+        .elevation(key1)
+        .expect("read ok")
+        .expect("found");
     assert_eq!(elev2.width, 8);
     assert_eq!(cached_source.hits(), 2);
     assert_eq!(cached_source.misses(), 2);
@@ -319,7 +340,10 @@ fn test_directory_tile_source_disk_ceiling_and_eviction() {
         usage_after <= 9000,
         "disk usage must remain <= 9000 bytes, got {usage_after}"
     );
-    assert!(!path1.exists(), "oldest file path1 must have been evicted from disk");
+    assert!(
+        !path1.exists(),
+        "oldest file path1 must have been evicted from disk"
+    );
     assert!(path2.exists(), "newer file path2 must be retained");
     assert!(path3.exists(), "newest file path3 must be retained");
 
