@@ -96,6 +96,9 @@ pub struct EarthInput {
     /// LOD modes such as [`SurfaceMode::QuadtreeLod`]. When `Some(true)` or `Some(false)`,
     /// skirt generation is explicitly forced on or off for all surface modes.
     pub terrain_skirts: Option<bool>,
+    /// Tint applied to terrain patches that have no imagery loaded. Neutral
+    /// mid-gray by default so hosts can theme it.
+    pub fallback_tint: Color,
 }
 
 impl Default for EarthInput {
@@ -115,6 +118,7 @@ impl Default for EarthInput {
             surface_mode: SurfaceMode::default(),
             sse_threshold: 4.0,
             terrain_skirts: None,
+            fallback_tint: Color::rgba(128, 128, 128, 255),
         }
     }
 }
@@ -486,7 +490,7 @@ impl EarthScene {
                     };
                     let (texture, tint) = match texture {
                         Some(id) => (id, Color::WHITE),
-                        None => (fallback, Color::rgba(70, 110, 80, 255)),
+                        None => (fallback, input.fallback_tint),
                     };
                     let (u0, v0, u1, v1) = resolution.uv_rect;
                     batch.push(TexturedDraw3D::new(
@@ -500,7 +504,7 @@ impl EarthScene {
                     ));
                 } else {
                     batch.push(TexturedDraw3D::new(
-                        TexturedMaterial3D::new(fallback).with_tint(Color::rgba(70, 110, 80, 255)),
+                        TexturedMaterial3D::new(fallback).with_tint(input.fallback_tint),
                         patch.index_start,
                         patch.index_count,
                     ));

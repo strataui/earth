@@ -1,5 +1,0 @@
-[patch."https://github.com/strataui/strata.git"]
-strata_primitives = { path = "../strata/crates/core/strata_primitives" }
-strata_style = { path = "../strata/crates/core/strata_style" }
-strata_layout = { path = "../strata/crates/core/strata_layout" }
-strata_render = { path = "../strata/crates/render/strata_render" }
