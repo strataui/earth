@@ -714,7 +714,7 @@ impl EarthScene {
     pub fn to_draw_command(&self, bounds: Rect) -> DrawCommand {
         DrawCommand::DrawViewport3D {
             bounds,
-            scene: self.scene.clone(),
+            scene: std::sync::Arc::new(self.scene.clone()),
         }
     }
 
