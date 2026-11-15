@@ -300,14 +300,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
-name = "strata_dom"
-version = "0.1.0"
-dependencies = [
- "strata_primitives",
-]
-
-[[package]]
-name = "strata_earth"
+name = "strata-earth"
 version = "0.1.0"
 dependencies = [
  "flate2",
@@ -318,10 +311,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata_dom"
+version = "0.1.0"
+dependencies = [
+ "strata_primitives",
+]
+
+[[package]]
 name = "strata_earth_golden"
 version = "0.1.0"
 dependencies = [
- "strata_earth",
+ "strata-earth",
  "strata_layout",
  "strata_render",
  "strata_style",
