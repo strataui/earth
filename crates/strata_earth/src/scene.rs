@@ -1,10 +1,10 @@
 //! Frame assembly: turn an [`EarthInput`] into a renderer-ready scene.
 
-pub use crate::geodesy::{tile_bounds, PatchBounds};
 use crate::geodesy::{
     geodetic_to_ecef, resolve_tile_imagery, traverse_quadtree_lod, EarthCamera, Geodetic, TileKey,
     TileTextureResolution,
 };
+pub use crate::geodesy::{tile_bounds, PatchBounds};
 use crate::tiles::{TextureSlot, TileRegistry, TileSource};
 use strata_layout::Rect;
 use strata_render::camera64::{Camera64, DVec3, RenderFrame64};
@@ -36,7 +36,7 @@ impl Default for LayerToggles {
     fn default() -> Self {
         Self {
             terrain: true,
-            buildings: true,
+            buildings: false,
             graticule: true,
             labels: true,
             clouds: true,
@@ -147,6 +147,8 @@ pub struct EarthScene {
     patches: Vec<PatchFrame>,
     frame_width: f32,
     frame_height: f32,
+    rtc_origin: DVec3,
+    building_source: Option<Box<dyn BuildingSource>>,
 }
 
 impl Default for EarthScene {
@@ -166,6 +168,8 @@ impl EarthScene {
             patches: Vec::new(),
             frame_width: 1440.0,
             frame_height: 900.0,
+            rtc_origin: geodetic_to_ecef(Geodetic::default()),
+            building_source: None,
         }
     }
 
@@ -228,6 +232,9 @@ impl EarthScene {
     /// Tile resolution is pure and can be inspected through [`FrameStats`] and
     /// [`EarthScene::tile_resolutions`] without any GPU work.
     pub fn build(&mut self, input: &EarthInput, source: &mut dyn TileSource) {
+        // Release the previous scene's shared texture handle so uploads below
+        // mutate the registry in place instead of cloning the whole store.
+        self.scene.set_textures(None);
         let placement = input.camera.placement();
         let mut stats = FrameStats::default();
         // The whole scene is authored relative to the focus point, so the
@@ -332,8 +339,9 @@ impl EarthScene {
                         patch.index_count = index_count;
 
                         if input.layers.buildings {
-                            push_placeholder_buildings(
+                            push_footprints(
                                 &mut self.buildings,
+                                self.building_source.as_mut(),
                                 origin,
                                 patch.bounds,
                                 elevation.as_ref(),
@@ -435,8 +443,9 @@ impl EarthScene {
                         );
 
                         if input.layers.buildings {
-                            push_placeholder_buildings(
+                            push_footprints(
                                 &mut self.buildings,
+                                self.building_source.as_mut(),
                                 origin,
                                 bounds,
                                 elevation.as_ref(),
@@ -561,6 +570,8 @@ impl EarthScene {
 
         self.frame_width = input.viewport.width;
         self.frame_height = input.viewport.height;
+        scene.set_textures(Some(self.tiles.store_arc()));
+        self.rtc_origin = origin;
         self.scene = scene;
         self.stats = stats;
     }
@@ -592,6 +603,107 @@ impl EarthScene {
                 .any(|draw| draw.material.texture != fallback),
             _ => false,
         })
+    }
+
+    /// Mutable access to the built scene so callers can append custom meshes,
+    /// lights, or overlay primitives without cloning terrain buffers.
+    pub fn scene_mut(&mut self) -> &mut Scene3D {
+        &mut self.scene
+    }
+
+    /// Mutable access to the scene overlay (creating it when absent).
+    pub fn overlay_mut(&mut self) -> &mut Overlay3D {
+        self.scene.overlay_mut()
+    }
+
+    /// Moves the built scene out, leaving an empty one. Zero-copy handoff to
+    /// `<SceneViewport scene={...}>`; the next `build` repopulates the scene.
+    pub fn take_scene(&mut self) -> Scene3D {
+        std::mem::take(&mut self.scene)
+    }
+
+    /// Like [`EarthScene::take_scene`], wrapped in an `Arc` for viewport props.
+    pub fn take_scene_arc(&mut self) -> std::sync::Arc<Scene3D> {
+        std::sync::Arc::new(self.take_scene())
+    }
+
+    /// Registers the building footprint provider. Without one, no buildings are
+    /// generated even when `layers.buildings` is on.
+    pub fn set_building_source(&mut self, source: Option<Box<dyn BuildingSource>>) {
+        self.building_source = source;
+    }
+
+    /// The ECEF origin the last build's scene coordinates are relative to.
+    pub fn rtc_origin(&self) -> DVec3 {
+        self.rtc_origin
+    }
+
+    /// Scene-space (relative-to-centre) position of a geodetic point. The
+    /// subtraction happens in f64 before narrowing to f32.
+    pub fn rtc_position(&self, pos: Geodetic) -> [f32; 3] {
+        geodetic_to_ecef(pos).sub(self.rtc_origin).as_f32()
+    }
+
+    /// Transform placing a mesh at `pos` oriented in the local east-north-up
+    /// tangent frame. Model axes are +X east, +Y up, -Z north.
+    ///
+    /// `yaw_pitch_roll_deg` are intrinsic navigation angles: yaw is a compass
+    /// heading clockwise from north, pitch is nose-up positive, roll is
+    /// right-wing-down positive.
+    pub fn rtc_transform(
+        &self,
+        pos: Geodetic,
+        yaw_pitch_roll_deg: [f64; 3],
+        scale: [f32; 3],
+    ) -> Transform3D {
+        let frame = crate::geodesy::LocalFrame::at(pos.lat_deg, pos.lon_deg);
+        let neg_north = frame.north.scale(-1.0);
+        // Columns of the model-to-ECEF basis.
+        let basis = [
+            [frame.east.x, frame.up.x, neg_north.x],
+            [frame.east.y, frame.up.y, neg_north.y],
+            [frame.east.z, frame.up.z, neg_north.z],
+        ];
+        let [yaw, pitch, roll] = yaw_pitch_roll_deg.map(f64::to_radians);
+        let (sy, cy) = (-yaw).sin_cos();
+        let (sx, cx) = pitch.sin_cos();
+        let (sz, cz) = (-roll).sin_cos();
+        let ry = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
+        let rx = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]];
+        let rz = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]];
+        let r = mat3_mul(&basis, &mat3_mul(&ry, &mat3_mul(&rx, &rz)));
+
+        // Decompose into the engine's YZX Euler order: R = Ry * Rz * Rx.
+        let sin_z = r[1][0].clamp(-1.0, 1.0);
+        let (rot_x, rot_y, rot_z) = if sin_z.abs() < 1.0 - 1e-9 {
+            (
+                (-r[1][2]).atan2(r[1][1]),
+                (-r[2][0]).atan2(r[0][0]),
+                sin_z.asin(),
+            )
+        } else {
+            (
+                0.0,
+                r[0][2].atan2(r[2][2]),
+                std::f64::consts::FRAC_PI_2.copysign(sin_z),
+            )
+        };
+
+        Transform3D {
+            position: self.rtc_position(pos),
+            rotation: [rot_x as f32, rot_y as f32, rot_z as f32],
+            scale,
+        }
+    }
+
+    /// Alias of [`EarthScene::rtc_transform`].
+    pub fn local_transform(
+        &self,
+        pos: Geodetic,
+        yaw_pitch_roll_deg: [f64; 3],
+        scale: [f32; 3],
+    ) -> Transform3D {
+        self.rtc_transform(pos, yaw_pitch_roll_deg, scale)
     }
 
     /// Converts the current 3D scene into a compositor `DrawViewport3D` command.
@@ -638,6 +750,16 @@ impl EarthScene {
         let fb = self.render_to_framebuffer(width, height);
         presenter.present(&fb, damage)
     }
+}
+
+fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for (i, row) in out.iter_mut().enumerate() {
+        for (j, cell) in row.iter_mut().enumerate() {
+            *cell = (0..3).map(|k| a[i][k] * b[k][j]).sum();
+        }
+    }
+    out
 }
 
 /// Shared terrain triangles: one patch per tile, two triangles per grid cell.
@@ -1030,37 +1152,104 @@ fn push_tile_patch(
     (index_start, index_count)
 }
 
-fn push_placeholder_buildings(
+/// One real-world building footprint, anchored at its centre.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BuildingFootprint {
+    pub lat: f64,
+    pub lon: f64,
+    /// Footprint extent in metres as `(east-west, north-south)`.
+    pub size_m: (f32, f32),
+    /// Roof height above the terrain in metres.
+    pub height_m: f32,
+}
+
+impl BuildingFootprint {
+    pub fn new(lat: f64, lon: f64, size_m: (f32, f32), height_m: f32) -> Self {
+        Self {
+            lat,
+            lon,
+            size_m,
+            height_m,
+        }
+    }
+}
+
+/// Supplies building footprints for a terrain patch.
+///
+/// The scene never invents buildings: with no source registered, or with
+/// `layers.buildings` off, no building geometry is produced.
+pub trait BuildingSource: std::fmt::Debug {
+    fn buildings(&mut self, key: TileKey, bounds: PatchBounds) -> Vec<BuildingFootprint>;
+}
+
+/// In-memory [`BuildingSource`] that returns every stored footprint whose
+/// centre lies inside the requested patch.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryBuildingSource {
+    footprints: Vec<BuildingFootprint>,
+}
+
+impl MemoryBuildingSource {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, footprint: BuildingFootprint) -> &mut Self {
+        self.footprints.push(footprint);
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.footprints.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.footprints.is_empty()
+    }
+}
+
+impl BuildingSource for MemoryBuildingSource {
+    fn buildings(&mut self, _key: TileKey, bounds: PatchBounds) -> Vec<BuildingFootprint> {
+        let (lat_lo, lat_hi) = (bounds.lat0.min(bounds.lat1), bounds.lat0.max(bounds.lat1));
+        let (lon_lo, lon_hi) = (bounds.lon0.min(bounds.lon1), bounds.lon0.max(bounds.lon1));
+        self.footprints
+            .iter()
+            .copied()
+            .filter(|f| f.lat >= lat_lo && f.lat < lat_hi && f.lon >= lon_lo && f.lon < lon_hi)
+            .collect()
+    }
+}
+
+fn push_footprints(
     builder: &mut MeshBuilder,
+    source: Option<&mut Box<dyn BuildingSource>>,
     origin: DVec3,
     bounds: PatchBounds,
     elevation: Option<&crate::tiles::TileElevation>,
     elevation_tile: TileKey,
 ) {
-    // Deterministic footprints inside the patch; real footprints arrive with
-    // the building source. Reporting them keeps the budget honest.
-    let samples = 2;
-    for row in 0..samples {
-        for col in 0..samples {
-            let u = (col as f64 + 0.5) / samples as f64;
-            let v = (row as f64 + 0.5) / samples as f64;
-            let lon = bounds.lon0 + (bounds.lon1 - bounds.lon0) * u;
-            let lat = bounds.lat0 + (bounds.lat1 - bounds.lat0) * v;
-            let height = elevation
-                .map(|grid| {
-                    let (tu, tv) = uv_in_tile(elevation_tile, lat, lon);
-                    grid.sample_bilinear(tu, tv) as f64
-                })
-                .unwrap_or(0.0);
-            let base = geodetic_to_ecef(Geodetic::new(lat, lon, height)).sub(origin);
-            builder.push_building(
-                base,
-                (40.0, 25.0),
-                60.0,
-                (0.0, 0.0, 0.5, 0.5),
-                (0.5, 0.0, 1.0, 1.0),
-            );
-        }
+    let Some(source) = source else {
+        return;
+    };
+    for footprint in source.buildings(elevation_tile, bounds) {
+        let ground = elevation
+            .map(|grid| {
+                let (tu, tv) = uv_in_tile(elevation_tile, footprint.lat, footprint.lon);
+                grid.sample_bilinear(tu, tv) as f64
+            })
+            .unwrap_or(0.0);
+        let base =
+            geodetic_to_ecef(Geodetic::new(footprint.lat, footprint.lon, ground)).sub(origin);
+        builder.push_building(
+            base,
+            (
+                footprint.size_m.0 as f64 * 0.5,
+                footprint.size_m.1 as f64 * 0.5,
+            ),
+            footprint.height_m as f64,
+            (0.0, 0.0, 0.5, 0.5),
+            (0.5, 0.0, 1.0, 1.0),
+        );
     }
 }
 

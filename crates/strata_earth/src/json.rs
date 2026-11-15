@@ -114,7 +114,6 @@ impl std::fmt::Display for Json {
 }
 
 impl Json {
-
     fn write(&self, out: &mut String) {
         match self {
             Self::Null => out.push_str("null"),

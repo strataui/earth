@@ -42,8 +42,9 @@ pub use geodesy::{
 pub use scene::{
     building_triangle_count, celestial_bodies, compute_adaptive_skirt_depth, requested_tile,
     sky_gradient, surrounding_patches, surrounding_tiles, terrain_skirt_triangle_count,
-    terrain_triangle_count, terrain_triangle_count_with_skirts, tile_patch_span_deg, EarthInput,
-    EarthScene, EntityMarker, FrameStats, LayerToggles, PatchBounds, PatchFrame, SurfaceMode,
+    terrain_triangle_count, terrain_triangle_count_with_skirts, tile_patch_span_deg,
+    BuildingFootprint, BuildingSource, EarthInput, EarthScene, EntityMarker, FrameStats,
+    LayerToggles, MemoryBuildingSource, PatchBounds, PatchFrame, SurfaceMode,
 };
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{

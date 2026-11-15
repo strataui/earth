@@ -210,7 +210,9 @@ fn capture(
     );
     let cover = fb
         .pixels
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .zip(bare.pixels.chunks_exact(4))
         .filter(|(a, b)| a != b)
         .count();

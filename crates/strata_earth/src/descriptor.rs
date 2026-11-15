@@ -951,14 +951,18 @@ impl FrameDescriptor {
             if actual.key != expected.key || actual.requested != expected.requested {
                 return false;
             }
-            let actual_uv = resolved
-                .iter()
-                .find(|(key, _)| *key == actual.key).map(|(_, resolution)| [
-                        resolution.uv_rect.0,
-                        resolution.uv_rect.1,
-                        resolution.uv_rect.2,
-                        resolution.uv_rect.3,
-                    ]);
+            let actual_uv =
+                resolved
+                    .iter()
+                    .find(|(key, _)| *key == actual.key)
+                    .map(|(_, resolution)| {
+                        [
+                            resolution.uv_rect.0,
+                            resolution.uv_rect.1,
+                            resolution.uv_rect.2,
+                            resolution.uv_rect.3,
+                        ]
+                    });
             match (actual_uv, expected.uv_rect) {
                 (None, None) => {}
                 (Some(a), Some(b)) => {
