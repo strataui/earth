@@ -523,6 +523,7 @@ impl FrameDescriptor {
             },
             sse_threshold: 4.0,
             terrain_skirts: None,
+            fallback_tint: Color::rgba(128, 128, 128, 255),
         }
     }
 

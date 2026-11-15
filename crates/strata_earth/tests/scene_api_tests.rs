@@ -209,3 +209,30 @@ fn rtc_transform_applies_yaw_pitch_roll() {
     assert!(dot(lock.transform_vector(wing), frame.up) < -0.99);
     assert!(dot(lock.transform_vector(nose), frame.north) > 0.99);
 }
+
+#[test]
+fn fallback_tint_is_configurable_and_neutral_by_default() {
+    let default = EarthInput::default();
+    assert_eq!(default.fallback_tint.r(), default.fallback_tint.g());
+    assert_eq!(default.fallback_tint.g(), default.fallback_tint.b());
+
+    let mut input = input(2_500.0);
+    input.fallback_tint = strata_style::types::Color::rgba(10, 20, 200, 255);
+    let mut scene = EarthScene::new();
+    scene.build(&input, &mut MemoryTileSource::new());
+    let tinted = scene
+        .scene()
+        .meshes
+        .iter()
+        .any(|mesh| match &mesh.material {
+            Material3D::TexturedBatch(batch) => batch
+                .draws
+                .iter()
+                .all(|d| d.material.tint == input.fallback_tint),
+            _ => false,
+        });
+    assert!(
+        tinted,
+        "patches without imagery must use the configured tint"
+    );
+}
