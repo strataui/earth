@@ -5,7 +5,16 @@ publish = false
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Interactive GPU preview window rendering only the strata_earth Canvas3D component"
+default-run = "earth"
+description = "Interactive Earth preview example opening a window with pan/orbit/zoom and floating programmatic top-right controls"
+
+[[bin]]
+name = "earth"
+path = "src/main.rs"
+
+[[bin]]
+name = "earth_preview"
+path = "src/bin/earth_preview.rs"
 
 [dependencies]
 strata_earth = { workspace = true }

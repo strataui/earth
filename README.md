@@ -19,11 +19,13 @@ Traditional 32-bit floating point graphics pipelines suffer catastrophic jitter 
 ## Repository Workspace
 
 - `crates/strata_earth`: Core geodesy engine, terrain generation, slippy map tile pipeline, and camera models.
+- `examples/earth_preview`: Main interactive desktop window example (`cargo run -p earth_preview` / `cargo run --bin earth`) featuring mouse pan/orbit/zoom and floating top-right programmatic controls.
 - `examples/strata_earth_golden`: Deterministic image and frame capture harness for all Earth camera regimes.
 
 ## Verification & Testing
 
 ```bash
+cargo run --release --bin earth
 cargo check --workspace --all-targets
 cargo test --workspace
 ```
