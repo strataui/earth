@@ -16,6 +16,7 @@ pub const DEFAULT_CLOUD_MAP_URL: &str =
 
 const BSC5_STARS_BIN: &[u8] = include_bytes!("../assets/bsc5_stars.bin");
 const LAND_MASK_PNG: &[u8] = include_bytes!("../assets/land_mask.png");
+const NIGHT_LIGHTS_JPG: &[u8] = include_bytes!("../assets/night_lights.jpg");
 const MOON_ALBEDO_JPG: &[u8] = include_bytes!("../assets/moon_albedo.jpg");
 const CLOUDS_FALLBACK_JPG: &[u8] = include_bytes!("../assets/clouds_fallback.jpg");
 
@@ -253,10 +254,11 @@ fn decode_image_to_retained_tex(
     })
 }
 
-/// Embedded Natural Earth public-domain global landmass mask (`land=255`, `ocean=0`).
+/// Embedded Natural Earth public-domain global landmass mask (`.r`: `land=255`, `ocean=0`)
+/// packed with NASA VIIRS Black Marble city lights luminance (`.g`).
 pub fn embedded_land_mask() -> Arc<RetainedTileTexture> {
     Arc::clone(PARSED_LAND_MASK.get_or_init(|| {
-        let tex =
+        let mut tex =
             decode_image_to_retained_tex(0xE47A_0001, 1, LAND_MASK_PNG).unwrap_or_else(|| {
                 RetainedTileTexture {
                     id: 0xE47A_0001,
@@ -266,6 +268,18 @@ pub fn embedded_land_mask() -> Arc<RetainedTileTexture> {
                     rgba8: Arc::new(vec![255, 255, 255, 255]),
                 }
             });
+        if let Ok(night_img) = image::load_from_memory(NIGHT_LIGHTS_JPG) {
+            let luma = night_img.to_luma8();
+            if luma.width() == tex.width && luma.height() == tex.height {
+                let raw = Arc::make_mut(&mut tex.rgba8);
+                let (chunks, _) = raw.as_chunks_mut::<4>();
+                for (px, &lum) in chunks.iter_mut().zip(luma.as_raw().iter()) {
+                    let is_land = px[0] > 100;
+                    px[1] = if is_land { lum } else { 0 };
+                    px[2] = if is_land { lum } else { 0 };
+                }
+            }
+        }
         Arc::new(tex)
     }))
 }

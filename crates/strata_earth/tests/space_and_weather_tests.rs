@@ -579,3 +579,84 @@ fn panning_in_25d_reuses_tile_meshes_and_ancestor_elevation_prevents_cliff_drops
     let (frame_flat, _) = builder.build_frame(&input, &mut src, 3, true);
     assert!(!frame_flat.meshes.is_empty());
 }
+
+#[test]
+fn embedded_black_marble_lights_europe_and_keeps_oceans_dark() {
+    let mask = embedded_land_mask();
+    // Sample central Europe/Paris-Brussels corridor (~48.8N, 2.35E) and Pacific Ocean (0N, -140W)
+    let sample_g = |lat_deg: f64, lon_deg: f64| -> u8 {
+        let u = ((lon_deg + 180.0) / 360.0).clamp(0.0, 0.9999);
+        let v = ((90.0 - lat_deg) / 180.0).clamp(0.0, 0.9999);
+        let x = (u * mask.width as f64) as usize;
+        let y = (v * mask.height as f64) as usize;
+        mask.rgba8[(y * mask.width as usize + x) * 4 + 1]
+    };
+    let paris_lum = sample_g(48.85, 2.35);
+    let pacific_lum = sample_g(0.0, -140.0);
+    assert!(
+        paris_lum > 40,
+        "Paris should show bright NASA Black Marble night luminance, got {paris_lum}"
+    );
+    assert_eq!(
+        pacific_lum, 0,
+        "Open Pacific Ocean must have zero night lights"
+    );
+}
+
+#[test]
+fn google_earth_labels_project_fade_and_parse_highways_and_mountains() {
+    let all = strata_earth::builtin_world_labels();
+    assert!(all
+        .iter()
+        .any(|l| l.text == "CT05" && l.kind == strata_earth::EarthLabelKind::Highway));
+    assert!(all
+        .iter()
+        .any(|l| l.text == "Mount Tamalpais" && l.kind == strata_earth::EarthLabelKind::Mountain));
+
+    // Verify light green color + MountainRight icon for mountains
+    let (m_rgb, m_icon, _) = strata_earth::label_style(strata_earth::EarthLabelKind::Mountain);
+    assert!(m_rgb[1] > m_rgb[0] && m_rgb[1] > m_rgb[2]);
+    assert_eq!(m_icon, strata_earth::EarthLabelIcon::MountainRight);
+
+    // Space altitude shows continents/oceans/countries
+    let mut input = EarthInput {
+        camera: EarthCamera {
+            focus: Geodetic::new(37.7749, -122.4194, 0.0),
+            aim_offset_m: [0.0, 0.0, 0.0],
+            eye_offset_m: [0.0, -10.0, 11_000_000.0],
+            fov_y_deg: 55.0,
+            near_m: 1_000.0,
+        },
+        layers: strata_earth::LayerToggles {
+            labels: true,
+            ..Default::default()
+        },
+        ..EarthInput::default()
+    };
+    let space_vis = strata_earth::project_earth_labels(&input, &all, 32);
+    assert!(space_vis.iter().any(|l| {
+        matches!(
+            l.kind,
+            strata_earth::EarthLabelKind::Continent
+                | strata_earth::EarthLabelKind::Country
+                | strata_earth::EarthLabelKind::Ocean
+        )
+    }));
+
+    // Zoomed local view shows peaks and highway shields with smooth alpha
+    input.camera.eye_offset_m = [0.0, -8_000.0, 22_000.0];
+    let local_vis = strata_earth::project_earth_labels(&input, &all, 32);
+    assert!(local_vis
+        .iter()
+        .any(|l| l.kind == strata_earth::EarthLabelKind::Highway
+            || l.kind == strata_earth::EarthLabelKind::Mountain));
+
+    // Live Overpass JSON parser extracts CT05 / peaks / places
+    let overpass = r#"{"elements":[{"type":"way","center":{"lat":41.3,"lon":-72.9},"tags":{"highway":"motorway","ref":"CT05"}},{"type":"node","lat":37.9,"lon":-122.59,"tags":{"natural":"peak","name":"East Peak","ele":"784"}}]}"#;
+    let parsed = strata_earth::parse_overpass_labels_json(overpass);
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].text, "CT05");
+    assert_eq!(parsed[0].kind, strata_earth::EarthLabelKind::Highway);
+    assert_eq!(parsed[1].text, "East Peak");
+    assert_eq!(parsed[1].kind, strata_earth::EarthLabelKind::Mountain);
+}

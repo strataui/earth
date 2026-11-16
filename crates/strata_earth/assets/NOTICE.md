@@ -4,6 +4,7 @@ All bundled assets in `crates/strata_earth/assets/` are Public Domain (US Govern
 
 - `base_world_map.pack`: NASA GIBS Blue Marble Next Generation (`EPSG:3857`, `z=0..=4`, `4096x4096` world resolution), NASA Public Domain (17 U.S.C. § 105).
 - `land_mask.png`: Rasterized from Natural Earth `ne_110m_land.geojson`, Public Domain (1.0).
+- `night_lights.jpg`: Derived from NASA GIBS `VIIRS_CityLights_2012` Earth at Night (`Black Marble`), NASA Public Domain (17 U.S.C. § 105).
 - `moon_albedo.jpg`: Derived from NASA Scientific Visualization Studio CGI Moon Kit (`lroc_color_poles_1k.jpg`, SVS #4720), NASA Public Domain.
 - `bsc5_stars.bin`: Compiled from Yale Bright Star Catalog 5th Edition (`brettonw/YaleBrightStarCatalog`, 8,404 naked-eye stars `V <= 6.5` in J2000 ICRF), Public Domain / MIT data.
 - `clouds_fallback.jpg`: Derived from EUMETSAT/NOAA global cloud composite (`matteason/live-cloud-maps`), MIT License.
