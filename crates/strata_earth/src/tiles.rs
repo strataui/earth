@@ -166,6 +166,12 @@ pub trait TileSource {
 
     /// Returns the elevation for a tile, if available right now.
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError>;
+
+    /// Non-mutating lookup of elevation already resident in memory (must never initiate network I/O).
+    /// Used when resolving smooth ancestor elevation fallbacks while finer DEM tiles stream in.
+    fn peek_cached_elevation(&self, _key: TileKey) -> Option<TileElevation> {
+        None
+    }
 }
 
 /// Identifies an uploaded tile image so repeated frames reuse one handle.
@@ -320,6 +326,10 @@ impl TileSource for MemoryTileSource {
 
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
         Ok(self.elevation.get(&key).cloned())
+    }
+
+    fn peek_cached_elevation(&self, key: TileKey) -> Option<TileElevation> {
+        self.elevation.get(&key).cloned()
     }
 }
 
@@ -774,6 +784,15 @@ impl LruTileCache {
         }
     }
 
+    /// Peeks cached elevation without updating LRU order or needing mutable access.
+    pub fn peek_elevation(&self, key: TileKey) -> Option<TileElevation> {
+        let &idx = self.map.get(&TileDataKey::Elevation(key))?;
+        match self.nodes.get(idx).and_then(|n| n.as_ref())?.value {
+            CachedTileData::Elevation(ref elev) => Some(elev.clone()),
+            CachedTileData::Imagery(_) => None,
+        }
+    }
+
     /// Inserts elevation for `key`, evicting older entries if exceeding the byte budget.
     pub fn insert_elevation(&mut self, key: TileKey, elevation: TileElevation) {
         self.insert(
@@ -983,6 +1002,12 @@ impl<S: TileSource> TileSource for LruTileCacheSource<S> {
             self.cache.insert_elevation(key, elev.clone());
         }
         Ok(result)
+    }
+
+    fn peek_cached_elevation(&self, key: TileKey) -> Option<TileElevation> {
+        self.cache
+            .peek_elevation(key)
+            .or_else(|| self.inner.peek_cached_elevation(key))
     }
 }
 
@@ -1950,5 +1975,9 @@ impl TileSource for NetworkTileSource {
         }
 
         Ok(None)
+    }
+
+    fn peek_cached_elevation(&self, key: TileKey) -> Option<TileElevation> {
+        self.cache.peek_elevation(key)
     }
 }

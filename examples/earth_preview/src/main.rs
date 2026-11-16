@@ -1,14 +1,15 @@
 // Interactive Earth window example using `strata_earth` and `strata::Canvas3D`.
 //
 // Opens a single native GPU window featuring the full-viewport Earth scene
-// (pan, orbit/tilt, scroll zoom with seamless 3D <-> 2.5D transitions) and
-// floating top-right control buttons that programmatically drive
-// [`EarthViewport`] modes, lighting, ephemeris, global clouds, and 2.5D weather.
+// (smooth damped pan, orbit/tilt around Earth's center in 3D, gentle scroll zoom
+// with seamless 3D <-> 2.5D ground transition) and floating top-right control
+// buttons that programmatically drive [`EarthViewport`] modes, lighting, ephemeris,
+// heightmap fetching, orbital satellites, global clouds, and 2.5D weather.
 
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::Duration;
 
 use strata::prelude::*;
 use strata_earth::{
@@ -20,6 +21,22 @@ use strata_layout::Rect;
 use strata_render::scene3d::Canvas3D;
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
+
+#[inline]
+fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn wrap_lon_delta_deg(delta: f64) -> f64 {
+    ((delta + 180.0).rem_euclid(360.0)) - 180.0
+}
+
+#[inline]
+fn wrap_deg_360_delta(target: f64, current: f64) -> f64 {
+    ((target - current + 180.0).rem_euclid(360.0)) - 180.0
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SunDemoMode {
@@ -34,6 +51,13 @@ struct OrbitState {
     heading_deg: f64,
     tilt_deg: f64,
     range_m: f64,
+
+    target_lat_deg: f64,
+    target_lon_deg: f64,
+    target_heading_deg: f64,
+    target_tilt_deg: f64,
+    target_range_m: f64,
+
     left_down: bool,
     right_down: bool,
     last_pos: Option<(f32, f32)>,
@@ -43,14 +67,110 @@ struct OrbitState {
 }
 
 impl OrbitState {
+    fn new(
+        lat_deg: f64,
+        lon_deg: f64,
+        heading_deg: f64,
+        tilt_deg: f64,
+        range_m: f64,
+        w: u32,
+        h: u32,
+    ) -> Self {
+        Self {
+            lat_deg,
+            lon_deg,
+            heading_deg,
+            tilt_deg,
+            range_m,
+            target_lat_deg: lat_deg,
+            target_lon_deg: lon_deg,
+            target_heading_deg: heading_deg,
+            target_tilt_deg: tilt_deg,
+            target_range_m: range_m,
+            left_down: false,
+            right_down: false,
+            last_pos: None,
+            viewport_w: w as f64,
+            viewport_h: h as f64,
+            sun_demo_mode: SunDemoMode::SystemClock,
+        }
+    }
+
+    fn snap_targets(&mut self) {
+        self.lat_deg = self.target_lat_deg;
+        self.lon_deg = self.target_lon_deg;
+        self.heading_deg = self.target_heading_deg;
+        self.tilt_deg = self.target_tilt_deg;
+        self.range_m = self.target_range_m;
+    }
+
+    fn has_pending_motion(&self) -> bool {
+        (self.range_m.ln() - self.target_range_m.ln()).abs() > 2e-4
+            || (self.lat_deg - self.target_lat_deg).abs() > 1e-4
+            || wrap_lon_delta_deg(self.target_lon_deg - self.lon_deg).abs() > 1e-4
+            || wrap_deg_360_delta(self.target_heading_deg, self.heading_deg).abs() > 1e-3
+            || (self.tilt_deg - self.target_tilt_deg).abs() > 1e-3
+    }
+
+    fn step_damping(&mut self, dt_s: f64) -> bool {
+        if !self.has_pending_motion() {
+            return false;
+        }
+        let alpha_zoom = 1.0 - (-dt_s * 10.5).exp();
+        let alpha_orbit = 1.0 - (-dt_s * 18.0).exp();
+
+        let log_cur = self.range_m.ln();
+        let log_tgt = self.target_range_m.ln();
+        if (log_tgt - log_cur).abs() <= 2e-4 {
+            self.range_m = self.target_range_m;
+        } else {
+            self.range_m = (log_cur + (log_tgt - log_cur) * alpha_zoom).exp();
+        }
+
+        let dlat = self.target_lat_deg - self.lat_deg;
+        self.lat_deg = if dlat.abs() <= 1e-4 {
+            self.target_lat_deg
+        } else {
+            self.lat_deg + dlat * alpha_orbit
+        };
+
+        let dlon = wrap_lon_delta_deg(self.target_lon_deg - self.lon_deg);
+        self.lon_deg = if dlon.abs() <= 1e-4 {
+            self.target_lon_deg
+        } else {
+            wrap_lon_delta_deg(self.lon_deg + dlon * alpha_orbit)
+        };
+
+        let dhead = wrap_deg_360_delta(self.target_heading_deg, self.heading_deg);
+        self.heading_deg = if dhead.abs() <= 1e-3 {
+            self.target_heading_deg
+        } else {
+            (self.heading_deg + dhead * alpha_orbit).rem_euclid(360.0)
+        };
+
+        let dtilt = self.target_tilt_deg - self.tilt_deg;
+        self.tilt_deg = if dtilt.abs() <= 1e-3 {
+            self.target_tilt_deg
+        } else {
+            self.tilt_deg + dtilt * alpha_orbit
+        };
+
+        true
+    }
+
     fn to_camera(&self) -> EarthCamera {
-        let tilt_rad = self.tilt_deg.to_radians();
+        // In 3D space (>1,200 km), always aim straight at the center of Earth so the full
+        // globe stays centered from every orbit angle; blend smoothly to angled ground 2.5D near surface.
+        let ground_weight = 1.0 - smoothstep(95_000.0, 1_150_000.0, self.range_m);
+        let eff_tilt_deg = (self.tilt_deg * ground_weight).max(0.05);
+        let tilt_rad = eff_tilt_deg.to_radians();
         let head_rad = self.heading_deg.to_radians();
         let horiz = self.range_m * tilt_rad.sin();
         let up = self.range_m * tilt_rad.cos();
+        let center_aim_drop = -EARTH_RADIUS_M * (1.0 - ground_weight);
         EarthCamera {
             focus: Geodetic::new(self.lat_deg, self.lon_deg, 0.0),
-            aim_offset_m: [0.0, 0.0, 0.0],
+            aim_offset_m: [0.0, 0.0, center_aim_drop],
             eye_offset_m: [-head_rad.sin() * horiz, -head_rad.cos() * horiz, up],
             fov_y_deg: 55.0,
             near_m: (self.range_m * 0.002).clamp(2.0, 20_000.0),
@@ -80,6 +200,7 @@ impl OrbitState {
                 clouds: true,
                 celestial: true,
             },
+            elevation_enabled: true,
             space,
             weather,
             tile_grid: 9,
@@ -93,13 +214,7 @@ impl OrbitState {
 struct PreviewState {
     viewport: EarthViewport,
     orbit: OrbitState,
-    last_tick: Instant,
-    last_cam_gen: u64,
-    last_geom_gen: u64,
-}
-
-fn wake_animation_loop() {
-    strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+    last_is_25d_ui: bool,
 }
 
 fn control_btn<F>(label: String, active: bool, on_click: F) -> View
@@ -136,22 +251,13 @@ fn main() -> Result<(), String> {
     let initial_w = 1280u32;
     let initial_h = 800u32;
 
-    let orbit = OrbitState {
-        lat_deg: 26.0,
-        lon_deg: 8.0,
-        heading_deg: 6.0,
-        tilt_deg: 22.0,
-        range_m: 10_200_000.0,
-        left_down: false,
-        right_down: false,
-        last_pos: None,
-        viewport_w: initial_w as f64,
-        viewport_h: initial_h as f64,
-        sun_demo_mode: SunDemoMode::SystemClock,
-    };
+    let orbit = OrbitState::new(22.0, 12.0, 0.0, 42.0, 13_200_000.0, initial_w, initial_h);
 
     let space = SpaceEnvironmentConfig::default().with_system_clock();
-    let weather = WeatherConfig::default();
+    let weather = WeatherConfig {
+        global_cloud_spin_rad_s: 0.0022,
+        ..WeatherConfig::default()
+    };
     let input = orbit.to_initial_input(EarthViewMode::Mode3D, space, weather);
 
     let tile_ready = Arc::new(AtomicBool::new(false));
@@ -165,33 +271,23 @@ fn main() -> Result<(), String> {
     };
     source.set_on_tile_ready(Some(Arc::new(move || {
         tile_ready_cb.store(true, Ordering::Release);
-        wake_animation_loop();
     })));
 
-    let viewport = EarthViewport::with_wakeup(
-        &input,
-        Box::new(source),
-        Some(Arc::new(wake_animation_loop)),
-    );
+    let viewport = EarthViewport::with_wakeup(&input, Box::new(source), None);
     viewport.sync_now();
 
     let retained = viewport.retained_scene();
-    let last_cam_gen = retained.camera_generation();
-    let last_geom_gen = retained.geometry_generation();
-
     let state = Arc::new(Mutex::new(PreviewState {
         viewport,
         orbit,
-        last_tick: Instant::now(),
-        last_cam_gen,
-        last_geom_gen,
+        last_is_25d_ui: false,
     }));
 
     let config = WindowConfig {
         title: "Strata Earth".to_string(),
         width: initial_w,
         height: initial_h,
-        present_mode: PresentMode::Immediate,
+        present_mode: PresentMode::Fifo,
         resizable: true,
         ..WindowConfig::default()
     };
@@ -199,16 +295,19 @@ fn main() -> Result<(), String> {
     let retained_for_view = retained;
     let state_view = Arc::clone(&state);
     let state_events = Arc::clone(&state);
+    let state_frame = Arc::clone(&state);
+    let tile_ready_frame = Arc::clone(&tile_ready);
 
-    launch_with_events(
+    launch_with_frame(
         move || {
-            let (is_2d, is_25d_view, sp, w, sun_mode) = {
+            let (is_2d, is_25d_view, sp, w, elev_on, sun_mode) = {
                 let guard = state_view.lock().unwrap();
                 (
                     guard.viewport.view_mode() == EarthViewMode::Mode2D,
                     guard.orbit.range_m < 100_000.0,
                     guard.viewport.space_config().clone(),
                     guard.viewport.weather_config().clone(),
+                    guard.viewport.elevation_enabled(),
                     guard.orbit.sun_demo_mode,
                 )
             };
@@ -224,8 +323,6 @@ fn main() -> Result<(), String> {
                         EarthViewMode::Mode2D => EarthViewMode::Mode3D,
                     };
                     st.viewport.set_view_mode(next);
-                    st.last_tick = Instant::now();
-                    wake_animation_loop();
                 },
             );
 
@@ -245,20 +342,24 @@ fn main() -> Result<(), String> {
                         st.orbit.lon_deg = -122.4194;
                         st.orbit.tilt_deg = 48.0;
                         st.orbit.range_m = 9_500.0;
+                        st.orbit.target_lat_deg = 37.7749;
+                        st.orbit.target_lon_deg = -122.4194;
+                        st.orbit.target_tilt_deg = 48.0;
+                        st.orbit.target_range_m = 9_500.0;
                     } else {
-                        st.orbit.lat_deg = 26.0;
-                        st.orbit.lon_deg = 8.0;
-                        st.orbit.tilt_deg = 22.0;
-                        st.orbit.range_m = 10_200_000.0;
+                        st.orbit.lat_deg = 22.0;
+                        st.orbit.lon_deg = 12.0;
+                        st.orbit.tilt_deg = 42.0;
+                        st.orbit.range_m = 13_200_000.0;
+                        st.orbit.target_lat_deg = 22.0;
+                        st.orbit.target_lon_deg = 12.0;
+                        st.orbit.target_tilt_deg = 42.0;
+                        st.orbit.target_range_m = 13_200_000.0;
                     }
                     let cam = st.orbit.to_camera();
                     let vw = st.orbit.viewport_w;
                     let vh = st.orbit.viewport_h;
                     st.viewport.update_camera(&cam, vw, vh);
-                    if st.viewport.has_active_weather_animation() {
-                        st.last_tick = Instant::now();
-                        wake_animation_loop();
-                    }
                 },
             );
 
@@ -293,8 +394,6 @@ fn main() -> Result<(), String> {
                     st.orbit.sun_demo_mode = match st.orbit.sun_demo_mode {
                         SunDemoMode::SystemClock => {
                             next.sun_direction = SunDirectionMode::SimulationTime;
-                            st.last_tick = Instant::now();
-                            wake_animation_loop();
                             SunDemoMode::OrbitalCycle
                         }
                         SunDemoMode::OrbitalCycle => {
@@ -324,6 +423,22 @@ fn main() -> Result<(), String> {
                 st.viewport.set_space_config(next);
             });
 
+            let s_sats = Arc::clone(&state_view);
+            let btn_sats =
+                control_btn("Satellites".to_string(), sp.satellites_visible, move |_| {
+                    let mut st = s_sats.lock().unwrap();
+                    let mut next = st.viewport.space_config().clone();
+                    next.satellites_visible = !next.satellites_visible;
+                    st.viewport.set_space_config(next);
+                });
+
+            let s_elev = Arc::clone(&state_view);
+            let btn_elev = control_btn("Heightmap".to_string(), elev_on, move |_| {
+                let mut st = s_elev.lock().unwrap();
+                let next = !st.viewport.elevation_enabled();
+                st.viewport.set_elevation_enabled(next);
+            });
+
             let s_gcloud = Arc::clone(&state_view);
             let btn_gcloud = control_btn("3D Clouds".to_string(), w.global_cloud_map, move |_| {
                 let mut st = s_gcloud.lock().unwrap();
@@ -338,10 +453,6 @@ fn main() -> Result<(), String> {
                 let mut next = st.viewport.weather_config().clone();
                 next.clouds_25d = !next.clouds_25d;
                 st.viewport.set_weather_config(next);
-                if st.viewport.has_active_weather_animation() {
-                    st.last_tick = Instant::now();
-                    wake_animation_loop();
-                }
             });
 
             let s_rain = Arc::clone(&state_view);
@@ -350,10 +461,6 @@ fn main() -> Result<(), String> {
                 let mut next = st.viewport.weather_config().clone();
                 next.rain = !next.rain;
                 st.viewport.set_weather_config(next);
-                if st.viewport.has_active_weather_animation() {
-                    st.last_tick = Instant::now();
-                    wake_animation_loop();
-                }
             });
 
             let s_snow = Arc::clone(&state_view);
@@ -362,10 +469,6 @@ fn main() -> Result<(), String> {
                 let mut next = st.viewport.weather_config().clone();
                 next.snow = !next.snow;
                 st.viewport.set_weather_config(next);
-                if st.viewport.has_active_weather_animation() {
-                    st.last_tick = Instant::now();
-                    wake_animation_loop();
-                }
             });
 
             let canvas = Canvas3D::builder()
@@ -378,7 +481,7 @@ fn main() -> Result<(), String> {
                     {canvas}
                     <div
                         data-earth-controls="true"
-                        class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[380px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
+                        class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[420px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
                     >
                         {btn_mode}
                         {btn_jump}
@@ -386,6 +489,8 @@ fn main() -> Result<(), String> {
                         {btn_city}
                         {btn_sun}
                         {btn_stars}
+                        {btn_sats}
+                        {btn_elev}
                         {btn_gcloud}
                         {btn_wclouds}
                         {btn_rain}
@@ -397,18 +502,13 @@ fn main() -> Result<(), String> {
         config,
         move |ev, rt| {
             let mut st = state_events.lock().unwrap();
-            let mut dirty = false;
-
             let rw = rt.viewport_width.max(1.0) as f64;
             let rh = rt.viewport_height.max(1.0) as f64;
-            let resized =
-                (rw - st.orbit.viewport_w).abs() > 0.5 || (rh - st.orbit.viewport_h).abs() > 0.5;
-            if resized {
+            if (rw - st.orbit.viewport_w).abs() > 0.5 || (rh - st.orbit.viewport_h).abs() > 0.5 {
                 st.orbit.viewport_w = rw;
                 st.orbit.viewport_h = rh;
                 let cam = st.orbit.to_camera();
                 st.viewport.update_camera(&cam, rw, rh);
-                dirty = true;
             }
 
             match ev {
@@ -437,32 +537,33 @@ fn main() -> Result<(), String> {
                         let dy = (*y - ly) as f64;
                         if st.orbit.left_down {
                             let meters_per_px =
-                                (st.orbit.range_m * 1.15) / st.orbit.viewport_h.max(1.0);
+                                (st.orbit.target_range_m * 1.05) / st.orbit.viewport_h.max(1.0);
                             let deg_per_m = 180.0 / (PI * EARTH_RADIUS_M);
-                            let cos_lat = st.orbit.lat_deg.to_radians().cos().abs().max(0.2);
-                            let h_rad = st.orbit.heading_deg.to_radians();
+                            let cos_lat = st.orbit.target_lat_deg.to_radians().cos().abs().max(0.2);
+                            let h_rad = st.orbit.target_heading_deg.to_radians();
                             let north_m = dy * h_rad.cos() - dx * h_rad.sin();
                             let east_m = -dx * h_rad.cos() - dy * h_rad.sin();
-                            st.orbit.lat_deg = (st.orbit.lat_deg
+                            st.orbit.target_lat_deg = (st.orbit.target_lat_deg
                                 + north_m * meters_per_px * deg_per_m)
-                                .clamp(-84.0, 84.0);
-                            let next_lon =
-                                st.orbit.lon_deg + east_m * meters_per_px * deg_per_m / cos_lat;
-                            st.orbit.lon_deg = ((next_lon + 180.0).rem_euclid(360.0)) - 180.0;
+                                .clamp(-85.0, 85.0);
+                            let next_lon = st.orbit.target_lon_deg
+                                + east_m * meters_per_px * deg_per_m / cos_lat;
+                            st.orbit.target_lon_deg = wrap_lon_delta_deg(next_lon);
+                            st.orbit.snap_targets();
                             let cam = st.orbit.to_camera();
                             let vw = st.orbit.viewport_w;
                             let vh = st.orbit.viewport_h;
                             st.viewport.update_camera(&cam, vw, vh);
-                            dirty = true;
                         } else if st.orbit.right_down {
-                            st.orbit.heading_deg =
-                                (st.orbit.heading_deg + dx * 0.25).rem_euclid(360.0);
-                            st.orbit.tilt_deg = (st.orbit.tilt_deg + dy * 0.25).clamp(0.0, 72.0);
+                            st.orbit.target_heading_deg =
+                                (st.orbit.target_heading_deg + dx * 0.25).rem_euclid(360.0);
+                            st.orbit.target_tilt_deg =
+                                (st.orbit.target_tilt_deg + dy * 0.25).clamp(0.0, 72.0);
+                            st.orbit.snap_targets();
                             let cam = st.orbit.to_camera();
                             let vw = st.orbit.viewport_w;
                             let vh = st.orbit.viewport_h;
                             st.viewport.update_camera(&cam, vw, vh);
-                            dirty = true;
                         }
                     }
                     st.orbit.last_pos = Some((*x, *y));
@@ -470,65 +571,60 @@ fn main() -> Result<(), String> {
                 PlatformEvent::Scroll { delta_y, .. } => {
                     let (mx, my) = rt.last_mouse_pos;
                     if !is_over_controls(rt, mx, my) {
-                        let zoom_factor = 0.86f64.powf((*delta_y as f64).clamp(-5.0, 5.0));
-                        st.orbit.range_m =
-                            (st.orbit.range_m * zoom_factor).clamp(1_200.0, 18_000_000.0);
-                        let cam = st.orbit.to_camera();
-                        let vw = st.orbit.viewport_w;
-                        let vh = st.orbit.viewport_h;
-                        st.viewport.update_camera(&cam, vw, vh);
-                        if st.viewport.has_active_weather_animation() {
-                            st.last_tick = Instant::now();
-                            wake_animation_loop();
-                        }
-                        dirty = true;
-                    }
-                }
-                PlatformEvent::AnimationTick => {
-                    let now = Instant::now();
-                    let dt = (now - st.last_tick).as_secs_f64().clamp(1.0 / 240.0, 0.05);
-                    st.last_tick = now;
-
-                    if tile_ready.swap(false, Ordering::AcqRel) {
-                        let cam = st.orbit.to_camera();
-                        let vw = st.orbit.viewport_w;
-                        let vh = st.orbit.viewport_h;
-                        st.viewport.update_camera(&cam, vw, vh);
-                        dirty = true;
-                    }
-
-                    let mut keep_ticking = false;
-                    if st.viewport.is_transitioning() {
-                        st.viewport.step_transition(dt);
-                        keep_ticking = true;
-                        dirty = true;
-                    }
-                    if st.orbit.sun_demo_mode == SunDemoMode::OrbitalCycle {
-                        let next_t = st.viewport.input().sim_time_unix_s + dt * 3_600.0;
-                        st.viewport.set_sim_time_unix_s(next_t);
-                        keep_ticking = true;
-                        dirty = true;
-                    }
-                    if st.viewport.step_weather(dt) {
-                        keep_ticking = true;
-                        dirty = true;
-                    }
-                    if keep_ticking {
-                        wake_animation_loop();
+                        // Normalize GTK 110px wheel notch vs +/-1 wheel click units; scroll up (<0) zooms IN.
+                        let raw_notches = if delta_y.abs() > 8.0 {
+                            (*delta_y as f64) / 110.0
+                        } else {
+                            *delta_y as f64
+                        };
+                        let notches = raw_notches.clamp(-3.0, 3.0);
+                        let zoom_factor = 1.075f64.powf(notches);
+                        st.orbit.target_range_m =
+                            (st.orbit.target_range_m * zoom_factor).clamp(1_200.0, 18_000_000.0);
                     }
                 }
                 _ => {}
             }
+            false
+        },
+        Some(Duration::from_millis(16)),
+        move |info, _rt| {
+            let mut st = state_frame.lock().unwrap();
+            let dt = info.dt.as_secs_f64().clamp(0.0, 0.05);
 
-            let ret = st.viewport.retained_scene();
-            let cg = ret.camera_generation();
-            let gg = ret.geometry_generation();
-            if cg != st.last_cam_gen || gg != st.last_geom_gen {
-                st.last_cam_gen = cg;
-                st.last_geom_gen = gg;
-                dirty = true;
+            if tile_ready_frame.swap(false, Ordering::AcqRel) {
+                let cam = st.orbit.to_camera();
+                let vw = st.orbit.viewport_w;
+                let vh = st.orbit.viewport_h;
+                st.viewport.update_camera(&cam, vw, vh);
             }
-            dirty
+
+            if st.orbit.step_damping(dt) {
+                let cam = st.orbit.to_camera();
+                let vw = st.orbit.viewport_w;
+                let vh = st.orbit.viewport_h;
+                st.viewport.update_camera(&cam, vw, vh);
+            }
+
+            if st.viewport.is_transitioning() {
+                st.viewport.step_transition(dt);
+            }
+
+            if st.orbit.sun_demo_mode == SunDemoMode::OrbitalCycle {
+                let next_t = st.viewport.input().sim_time_unix_s + dt * 3_600.0;
+                st.viewport.set_sim_time_unix_s(next_t);
+            }
+
+            let tick_satellites = st.orbit.sun_demo_mode != SunDemoMode::FixedSunset;
+            let _ = st.viewport.step_dynamic_overlays(dt, tick_satellites);
+
+            let is_25d_ui = st.orbit.range_m < 100_000.0;
+            if is_25d_ui != st.last_is_25d_ui {
+                st.last_is_25d_ui = is_25d_ui;
+                FrameOutcome::Dirty
+            } else {
+                FrameOutcome::Unchanged
+            }
         },
     )
 }

@@ -123,6 +123,12 @@ pub struct SpaceEnvironmentConfig {
     pub stars_visible: bool,
     /// Starfield & Milky Way brightness multiplier (`1.0` default).
     pub stars_intensity: f32,
+    /// Render live / propagated real orbital satellites (ISS, Hubble, NOAA, GPS, etc.) in 3D space (fades out in 2.5D).
+    pub satellites_visible: bool,
+    /// Render orbital ground-track arcs for flagship spacecraft in 3D space.
+    pub satellite_orbits_visible: bool,
+    /// Base radius scale in metres for 3D spacecraft beacons from orbital distance.
+    pub satellite_scale_m: f32,
 }
 
 impl Default for SpaceEnvironmentConfig {
@@ -140,6 +146,9 @@ impl Default for SpaceEnvironmentConfig {
             custom_moon_dir: None,
             stars_visible: true,
             stars_intensity: 1.0,
+            satellites_visible: true,
+            satellite_orbits_visible: true,
+            satellite_scale_m: 38_000.0,
         }
     }
 }
@@ -226,7 +235,9 @@ pub struct EarthInput {
     /// Tint applied to terrain patches that have no imagery loaded. Neutral
     /// mid-gray by default so hosts can theme it.
     pub fallback_tint: Color,
-    /// Toggleable space skybox, Sun/Moon, day/night terminator, and deterministic land city lights.
+    /// Enable heightmap (DEM) fetching and terrain elevation displacement (`true` default).
+    pub elevation_enabled: bool,
+    /// Toggleable space skybox, Sun/Moon, day/night terminator, satellites, and city lights.
     pub space: SpaceEnvironmentConfig,
     /// Toggleable 3D global cloud map and 2.5D-only 3D CC0 clouds, rain, and snow models.
     pub weather: crate::gltf::WeatherConfig,
@@ -342,6 +353,7 @@ impl Default for EarthInput {
             sse_threshold: 4.0,
             terrain_skirts: None,
             fallback_tint: Color::rgba(128, 128, 128, 255),
+            elevation_enabled: true,
             space: SpaceEnvironmentConfig::default(),
             weather: crate::gltf::WeatherConfig::default(),
         }

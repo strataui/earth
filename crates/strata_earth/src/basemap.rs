@@ -1,6 +1,6 @@
 //! Embedded compressed default base world map and seamless hybrid tile streaming.
 //!
-//! Embeds public-domain NASA Blue Marble (`z=0..2`, EPSG:3857) JPEG tiles inside the
+//! Embeds public-domain NASA Blue Marble (`z=0..=4`, `4096x4096` EPSG:3857) JPEG tiles inside the
 //! `strata_earth` crate so every Earth view immediately renders crisp global continents,
 //! oceans, bathymetry, and mountain shading on frame 0—even offline—and smoothly upgrades
 //! chunk-by-chunk as higher-zoom network tiles arrive.
@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::geodesy::TileKey;
 use crate::tiles::{NetworkTileSource, TileElevation, TileError, TileImage, TileSource};
+
+/// Highest zoom level baked inside `assets/base_world_map.pack`.
+pub const MAX_EMBEDDED_BASE_LEVEL: u8 = 4;
 
 const EMBEDDED_PACK: &[u8] = include_bytes!("../assets/base_world_map.pack");
 const PACK_MAGIC: &[u8; 8] = b"SEBM0001";
@@ -67,9 +70,9 @@ fn raw_entries() -> &'static HashMap<TileKey, &'static [u8]> {
     })
 }
 
-/// Decodes and returns a cached RGBA8 base world map tile (`z=0..=2`), if present in the embedded pack.
+/// Decodes and returns a cached RGBA8 base world map tile (`z=0..=4`), if present in the embedded pack.
 pub fn embedded_base_tile(key: TileKey) -> Option<TileImage> {
-    if key.level > 2 {
+    if key.level > MAX_EMBEDDED_BASE_LEVEL {
         return None;
     }
     let cache = DECODED_BASE_TILES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -92,7 +95,7 @@ pub fn embedded_base_tile(key: TileKey) -> Option<TileImage> {
     Some(img)
 }
 
-/// Synchronous [`TileSource`] serving only the embedded compressed base world map (`z=0..=2`).
+/// Synchronous [`TileSource`] serving only the embedded compressed base world map (`z=0..=4`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EmbeddedBaseMapSource;
 
@@ -117,10 +120,10 @@ impl TileSource for EmbeddedBaseMapSource {
 }
 
 /// Default production Earth tile source:
-/// - Immediately provides the embedded compressed NASA Blue Marble base map (`z=0..=2`).
+/// - Immediately provides the embedded compressed NASA Blue Marble base map (`z=0..=4`, `4096x4096`).
 /// - Streams higher-resolution satellite/street imagery and Terrarium DEM heightmaps asynchronously
 ///   from network endpoints (with in-memory + optional disk LRU caching).
-/// - Never flashes missing/gray tiles while zoomed chunks are still downloading.
+/// - Always serves lower-resolution built-in or cached ancestors while higher-zoom chunks stream.
 pub struct EarthDefaultTileSource {
     network: Option<NetworkTileSource>,
     max_elevation_level: u8,
@@ -184,9 +187,7 @@ impl EarthDefaultTileSource {
 
 impl TileSource for EarthDefaultTileSource {
     fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
-        if key.level <= 2 {
-            // Serve the embedded compressed base world map immediately; optionally let network
-            // populate z=2+ only when zoomed deeper.
+        if key.level <= MAX_EMBEDDED_BASE_LEVEL {
             return Ok(embedded_base_tile(key));
         }
         if let Some(ref mut net) = self.network {
@@ -218,5 +219,19 @@ impl TileSource for EarthDefaultTileSource {
             return net.elevation(eff);
         }
         Ok(None)
+    }
+
+    fn peek_cached_elevation(&self, key: TileKey) -> Option<TileElevation> {
+        let mut eff = key;
+        while eff.level > self.max_elevation_level {
+            eff = match eff.parent() {
+                Some(p) => p,
+                None => break,
+            };
+        }
+        if let Some(ref net) = self.network {
+            return net.peek_cached_elevation(eff);
+        }
+        None
     }
 }
