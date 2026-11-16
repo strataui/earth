@@ -1,7 +1,7 @@
 //! Interactive standalone preview window rendering ONLY the Strata Earth `Canvas3D` component
-//! using `EarthDefaultTileSource` (embedded compressed NASA Blue Marble `z=0..2` base world map +
-//! live ArcGIS satellite & AWS Terrarium DEM streaming), seamless 3D <-> 2.5D ground morphing,
-//! programmatic `2`/`3`/`M` 3D <-> 2D morphing, and direct zero-readback `wgpu` swapchain output.
+//! with real-time OS clock solar/lunar ephemeris, BSC5 deep-space starfield, limb-darkened Sun &
+//! NASA LRO Moon, land-masked deterministic city lights, live global satellite cloud map in 3D,
+//! seamless 3D <-> 2.5D terrain & lighting transition, and CC0 3D cloud/rain/snow models in 2.5D.
 
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,13 +10,21 @@ use std::time::Instant;
 
 use strata_earth::{
     EarthCamera, EarthDefaultTileSource, EarthInput, EarthViewMode, EarthViewport, Geodetic,
-    LayerToggles, SurfaceMode, TileProjection,
+    LayerToggles, SpaceEnvironmentConfig, SunDirectionMode, SurfaceMode, TileProjection,
+    WeatherConfig,
 };
 use strata_layout::Rect;
 use strata_platform::{MouseButton, PlatformEvent, PresentMode, WindowConfig};
 use strata_render::scene3d::Canvas3D;
 
 const EARTH_RADIUS_M: f64 = 6_378_137.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SunDemoMode {
+    SystemClock,
+    OrbitalCycle,
+    FixedSunset,
+}
 
 struct OrbitState {
     lat_deg: f64,
@@ -29,6 +37,7 @@ struct OrbitState {
     last_pos: Option<(f32, f32)>,
     viewport_w: f64,
     viewport_h: f64,
+    sun_demo_mode: SunDemoMode,
 }
 
 impl OrbitState {
@@ -46,14 +55,19 @@ impl OrbitState {
         }
     }
 
-    fn to_input(&self, view_mode: EarthViewMode) -> EarthInput {
+    fn to_initial_input(
+        &self,
+        view_mode: EarthViewMode,
+        space: SpaceEnvironmentConfig,
+        weather: WeatherConfig,
+    ) -> EarthInput {
         EarthInput {
             camera: self.to_camera(),
             viewport: Rect::new(0.0, 0.0, self.viewport_w as f32, self.viewport_h as f32),
             view_mode,
             seamless_25d: true,
             tile_projection: TileProjection::WebMercator,
-            daylight: 0.94,
+            daylight: 0.96,
             cloud_cover: 0.0,
             surface_mode: SurfaceMode::QuadtreeLod,
             layers: LayerToggles {
@@ -61,9 +75,11 @@ impl OrbitState {
                 buildings: false,
                 graticule: false,
                 labels: false,
-                clouds: false,
+                clouds: true,
                 celestial: true,
             },
+            space,
+            weather,
             tile_grid: 9,
             max_tile_level: 16,
             sse_threshold: 4.5,
@@ -76,20 +92,43 @@ fn main() -> Result<(), String> {
     let initial_w = 1280u32;
     let initial_h = 800u32;
 
+    let args: Vec<String> = std::env::args().collect();
+    let is_25d_rain = args.iter().any(|a| a == "--25d-rain");
+    let is_25d_snow = args.iter().any(|a| a == "--25d-snow");
+    let has_spin = args.iter().any(|a| a == "--sun-cycle");
+
+    let (lat_deg, lon_deg, tilt_deg, range_m, rain_on, snow_on) = if is_25d_rain || is_25d_snow {
+        (37.7749, -122.4194, 48.0, 9_500.0, is_25d_rain, is_25d_snow)
+    } else {
+        (26.0, 8.0, 22.0, 10_200_000.0, false, false)
+    };
+
     let orbit = OrbitState {
-        lat_deg: 28.0,
-        lon_deg: 12.0,
+        lat_deg,
+        lon_deg,
         heading_deg: 6.0,
-        tilt_deg: 12.0,
-        range_m: 10_200_000.0,
+        tilt_deg,
+        range_m,
         left_down: false,
         right_down: false,
         last_pos: None,
         viewport_w: initial_w as f64,
         viewport_h: initial_h as f64,
+        sun_demo_mode: if has_spin {
+            SunDemoMode::OrbitalCycle
+        } else {
+            SunDemoMode::SystemClock
+        },
     };
 
-    let input = orbit.to_input(EarthViewMode::Mode3D);
+    let space = SpaceEnvironmentConfig::default().with_system_clock();
+    let weather = WeatherConfig {
+        rain: rain_on,
+        snow: snow_on,
+        ..WeatherConfig::default()
+    };
+
+    let input = orbit.to_initial_input(EarthViewMode::Mode3D, space, weather);
 
     let tile_ready = Arc::new(AtomicBool::new(false));
     let tile_ready_cb = Arc::clone(&tile_ready);
@@ -110,6 +149,10 @@ fn main() -> Result<(), String> {
     });
     let viewport = EarthViewport::with_wakeup(&input, Box::new(source), Some(wakeup));
     viewport.sync_now();
+
+    eprintln!(
+        "Strata Earth controls: Drag=Pan | Right-Drag=Orbit/Tilt | Scroll=Zoom(3D<->2.5D) | 2/3/M=2D/3D | Z=Space/2.5D Jump | L=Day/Night | C=CityLights | T=SunMode | G=CloudMap | W=2.5D Clouds | R=Rain | S=Snow | B=Space/Stars/Moon"
+    );
 
     let retained = viewport.retained_scene();
     let last_cam_gen = retained.camera_generation();
@@ -133,6 +176,10 @@ fn main() -> Result<(), String> {
 
     let retained_for_view = retained;
     let state_events = Arc::clone(&state);
+
+    if has_spin || rain_on || snow_on {
+        strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+    }
 
     strata::launch_with_events(
         move || {
@@ -206,6 +253,10 @@ fn main() -> Result<(), String> {
                     orb.range_m = (orb.range_m * zoom_factor).clamp(1_200.0, 18_000_000.0);
                     let cam = orb.to_camera();
                     vp.update_camera(&cam, orb.viewport_w, orb.viewport_h);
+                    if vp.has_active_weather_animation() {
+                        *last_tick = Instant::now();
+                        strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                    }
                     dirty = true;
                 }
                 PlatformEvent::ReceivedCharacter(c) => match c {
@@ -231,6 +282,107 @@ fn main() -> Result<(), String> {
                         strata_platform::post_platform_event(PlatformEvent::AnimationTick);
                         dirty = true;
                     }
+                    'z' | 'Z' => {
+                        if orb.range_m > 100_000.0 {
+                            orb.lat_deg = 37.7749;
+                            orb.lon_deg = -122.4194;
+                            orb.tilt_deg = 48.0;
+                            orb.range_m = 9_500.0;
+                        } else {
+                            orb.lat_deg = 26.0;
+                            orb.lon_deg = 8.0;
+                            orb.tilt_deg = 22.0;
+                            orb.range_m = 10_200_000.0;
+                        }
+                        let cam = orb.to_camera();
+                        vp.update_camera(&cam, orb.viewport_w, orb.viewport_h);
+                        if vp.has_active_weather_animation() {
+                            *last_tick = Instant::now();
+                            strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                        }
+                        dirty = true;
+                    }
+                    'l' | 'L' => {
+                        let mut sp = vp.space_config().clone();
+                        sp.day_night_lighting = !sp.day_night_lighting;
+                        vp.set_space_config(sp);
+                        dirty = true;
+                    }
+                    'c' | 'C' => {
+                        let mut sp = vp.space_config().clone();
+                        sp.city_lights = !sp.city_lights;
+                        vp.set_space_config(sp);
+                        dirty = true;
+                    }
+                    'b' | 'B' => {
+                        let mut sp = vp.space_config().clone();
+                        let on = !sp.stars_visible;
+                        sp.stars_visible = on;
+                        sp.sun_visible = on;
+                        sp.moon_visible = on;
+                        vp.set_space_config(sp);
+                        dirty = true;
+                    }
+                    't' | 'T' => {
+                        let mut sp = vp.space_config().clone();
+                        orb.sun_demo_mode = match orb.sun_demo_mode {
+                            SunDemoMode::SystemClock => {
+                                sp.sun_direction = SunDirectionMode::SimulationTime;
+                                *last_tick = Instant::now();
+                                strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                                SunDemoMode::OrbitalCycle
+                            }
+                            SunDemoMode::OrbitalCycle => {
+                                sp.sun_direction = SunDirectionMode::SubsolarPoint {
+                                    lat_deg: 20.0,
+                                    lon_deg: orb.lon_deg - 52.0,
+                                };
+                                SunDemoMode::FixedSunset
+                            }
+                            SunDemoMode::FixedSunset => {
+                                sp.sun_direction = SunDirectionMode::SystemClock;
+                                SunDemoMode::SystemClock
+                            }
+                        };
+                        vp.set_space_config(sp);
+                        dirty = true;
+                    }
+                    'g' | 'G' => {
+                        let mut w = vp.weather_config().clone();
+                        w.global_cloud_map = !w.global_cloud_map;
+                        vp.set_weather_config(w);
+                        dirty = true;
+                    }
+                    'w' | 'W' => {
+                        let mut w = vp.weather_config().clone();
+                        w.clouds_25d = !w.clouds_25d;
+                        vp.set_weather_config(w);
+                        if vp.has_active_weather_animation() {
+                            *last_tick = Instant::now();
+                            strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                        }
+                        dirty = true;
+                    }
+                    'r' | 'R' => {
+                        let mut w = vp.weather_config().clone();
+                        w.rain = !w.rain;
+                        vp.set_weather_config(w);
+                        if vp.has_active_weather_animation() {
+                            *last_tick = Instant::now();
+                            strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                        }
+                        dirty = true;
+                    }
+                    's' | 'S' => {
+                        let mut w = vp.weather_config().clone();
+                        w.snow = !w.snow;
+                        vp.set_weather_config(w);
+                        if vp.has_active_weather_animation() {
+                            *last_tick = Instant::now();
+                            strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                        }
+                        dirty = true;
+                    }
                     _ => {}
                 },
                 PlatformEvent::AnimationTick => {
@@ -239,13 +391,29 @@ fn main() -> Result<(), String> {
                     *last_tick = now;
 
                     if tile_ready.swap(false, Ordering::AcqRel) {
-                        let next_in = orb.to_input(vp.view_mode());
-                        vp.update_input(&next_in);
+                        let cam = orb.to_camera();
+                        vp.update_camera(&cam, orb.viewport_w, orb.viewport_h);
+                        dirty = true;
                     }
+
+                    let mut keep_ticking = false;
                     if vp.is_transitioning() {
                         vp.step_transition(dt);
-                        strata_platform::post_platform_event(PlatformEvent::AnimationTick);
+                        keep_ticking = true;
                         dirty = true;
+                    }
+                    if orb.sun_demo_mode == SunDemoMode::OrbitalCycle {
+                        let next_t = vp.input().sim_time_unix_s + dt * 3_600.0;
+                        vp.set_sim_time_unix_s(next_t);
+                        keep_ticking = true;
+                        dirty = true;
+                    }
+                    if vp.step_weather(dt) {
+                        keep_ticking = true;
+                        dirty = true;
+                    }
+                    if keep_ticking {
+                        strata_platform::post_platform_event(PlatformEvent::AnimationTick);
                     }
                 }
                 _ => {}

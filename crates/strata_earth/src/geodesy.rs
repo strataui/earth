@@ -611,12 +611,15 @@ impl Default for SurfaceMorphParams {
 }
 
 /// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)
-/// for a `TileKey` on the WGS84 ellipsoid.
-pub fn tile_bounding_sphere(key: TileKey) -> (DVec3, f64) {
+/// for a `TileKey` on the WGS84 ellipsoid using the requested tile projection.
+pub fn tile_bounding_sphere_projected(key: TileKey, projection: TileProjection) -> (DVec3, f64) {
     if key.level == 0 {
         return (DVec3::new(0.0, 0.0, 0.0), wgs84::A * 1.08);
     }
-    let bounds = tile_bounds(key);
+    let bounds = match projection {
+        TileProjection::WebMercator => tile_bounds_mercator(key),
+        TileProjection::Geographic4326 => tile_bounds(key),
+    };
     let mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
     let mid_lat = (bounds.lat0 + bounds.lat1) * 0.5;
     let center = geodetic_to_ecef(Geodetic::new(mid_lat, mid_lon, 0.0));
@@ -645,6 +648,12 @@ pub fn tile_bounding_sphere(key: TileKey) -> (DVec3, f64) {
     // Include 5000 metres margin for topography relief and curvature
     let radius = max_dist_sq.sqrt() + 5000.0;
     (center, radius)
+}
+
+/// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)
+/// for a Geographic4326 `TileKey` on the WGS84 ellipsoid.
+pub fn tile_bounding_sphere(key: TileKey) -> (DVec3, f64) {
+    tile_bounding_sphere_projected(key, TileProjection::Geographic4326)
 }
 
 /// Tests whether a tile bounding sphere is occluded behind the WGS84 ellipsoid horizon.
@@ -1048,6 +1057,102 @@ impl PartialOrd for LodCandidate {
 }
 
 /// Traverses the planetary quadtree using exact 6-plane frustum culling, horizon occlusion,
+/// and SSE-prioritized subdivision using `projection` bounds (`WebMercator` or `Geographic4326`).
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod_frustum6_projected(
+    camera: &EarthCamera,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+    horizon_cull: bool,
+    max_leaves: usize,
+    projection: TileProjection,
+) -> Vec<TileKey> {
+    let cap = max_leaves.max(4);
+    let placement = camera.placement();
+    let eye = placement.eye;
+    let frustum = Frustum6::from_camera(camera, viewport_width_px, viewport_height_px);
+    let mut heap = std::collections::BinaryHeap::<LodCandidate>::with_capacity(cap * 2);
+    let mut leaves = Vec::with_capacity(cap);
+
+    let root = TileKey::new(0, 0, 0);
+    let root_span_m = 2.0 * std::f64::consts::PI * wgs84::A;
+    let root_sse = compute_tile_sse(
+        root_span_m,
+        tile_grid,
+        eye.length().max(1.0),
+        viewport_height_px,
+        camera.fov_y_deg,
+    );
+    heap.push(LodCandidate {
+        sse: root_sse,
+        key: root,
+    });
+
+    while let Some(node) = heap.pop() {
+        let key = node.key;
+        if key.level < max_level && node.sse > sse_threshold_px {
+            let mut visible_children = [None, None, None, None];
+            let mut vis_count = 0usize;
+            for q in 0..4u8 {
+                let Some(child) = key.child(q) else {
+                    continue;
+                };
+                let (center, radius) = tile_bounding_sphere_projected(child, projection);
+                if horizon_cull && is_tile_horizon_culled(center, radius, eye) {
+                    continue;
+                }
+                if horizon_cull && !frustum.intersects_sphere(center, radius * 1.15) {
+                    continue;
+                }
+                let dist_to_eye = (center.sub(eye).length() - radius).max(1.0);
+                let per_axis = child.tiles_per_axis() as f64;
+                let ground_span_m = (2.0 * std::f64::consts::PI * wgs84::A) / per_axis;
+                let child_sse = compute_tile_sse(
+                    ground_span_m,
+                    tile_grid,
+                    dist_to_eye,
+                    viewport_height_px,
+                    camera.fov_y_deg,
+                );
+                visible_children[q as usize] = Some(LodCandidate {
+                    sse: child_sse,
+                    key: child,
+                });
+                vis_count += 1;
+            }
+            if vis_count == 0 {
+                continue;
+            }
+            if leaves.len() + heap.len() + vis_count <= cap {
+                for ch in visible_children.into_iter().flatten() {
+                    heap.push(ch);
+                }
+            } else {
+                leaves.push(key);
+                break;
+            }
+        } else {
+            leaves.push(key);
+            if leaves.len() + heap.len() >= cap {
+                break;
+            }
+        }
+    }
+    while let Some(rem) = heap.pop() {
+        if leaves.len() < cap {
+            leaves.push(rem.key);
+        } else {
+            break;
+        }
+    }
+    leaves.sort();
+    leaves
+}
+
+/// Traverses the planetary quadtree using exact 6-plane frustum culling, horizon occlusion,
 /// and SSE-prioritized subdivision capped safely to [`MAX_QUADTREE_LEAVES`].
 pub fn traverse_quadtree_lod_frustum6(
     camera: &EarthCamera,
@@ -1204,6 +1309,7 @@ pub fn retained_camera_uniforms(
         background,
         near: placement.near_m as f32,
         far: placement.far_m as f32,
+        ..Default::default()
     }
 }
 
