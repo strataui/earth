@@ -78,6 +78,98 @@ pub struct EarthLowLevelState {
     pub map_2d_morph: f32,
 }
 
+/// Selectable astronomical or custom solar lighting source.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SunDirectionMode {
+    /// Dynamically computes solar ephemeris & sidereal rotation using OS wall-clock UTC and timezone offset.
+    SystemClock,
+    /// Computes astronomical solar position from [`EarthInput::sim_time_unix_s`].
+    SimulationTime,
+    /// Computes solar position from an explicit local timestamp and UTC offset (ready for time handlers).
+    LocalTimeOffset {
+        local_unix_s: f64,
+        utc_offset_s: i32,
+    },
+    /// Places noon directly overhead a chosen geodetic `(lat_deg, lon_deg)`.
+    SubsolarPoint { lat_deg: f64, lon_deg: f64 },
+    /// Explicit normalized ECEF sunlight vector `[x, y, z]`.
+    CustomEcef([f32; 3]),
+}
+
+/// Toggleable and customizable planetary lighting, space skybox, Sun/Moon, and land-masked city lights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceEnvironmentConfig {
+    /// Enables physical day/night terminator shadows (`true` by default; auto-fades to shadowless daylight in 2.5D).
+    pub day_night_lighting: bool,
+    /// Day/night shadow contrast `[0.0..=1.0]` (`1.0` default).
+    pub shadow_contrast: f32,
+    /// Enables deterministic night city lights masked strictly to landmass (`true` default).
+    pub city_lights: bool,
+    /// Brightness multiplier for deterministic city lights (`1.0` default).
+    pub city_lights_intensity: f32,
+    /// Solar position & lighting source mode (defaults to [`SunDirectionMode::SystemClock`]).
+    pub sun_direction: SunDirectionMode,
+    /// Render physical limb-darkened Sun disc & solar corona (`true` default).
+    pub sun_visible: bool,
+    /// Apparent Sun angular radius in radians (default `0.018`).
+    pub sun_angular_radius_rad: f32,
+    /// Render NASA LRO textured Moon with accurate orbital lunar phase (`true` default).
+    pub moon_visible: bool,
+    /// Apparent Moon angular radius in radians (default `0.022`).
+    pub moon_angular_radius_rad: f32,
+    /// Optional custom ECEF direction for Moon; `None` computes astronomical lunar ephemeris.
+    pub custom_moon_dir: Option<[f32; 3]>,
+    /// Render pitch-black deep-space skybox with Yale BSC5 scientific stars & Milky Way (`true` default).
+    pub stars_visible: bool,
+    /// Starfield & Milky Way brightness multiplier (`1.0` default).
+    pub stars_intensity: f32,
+}
+
+impl Default for SpaceEnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            day_night_lighting: true,
+            shadow_contrast: 1.0,
+            city_lights: true,
+            city_lights_intensity: 1.0,
+            sun_direction: SunDirectionMode::SimulationTime,
+            sun_visible: true,
+            sun_angular_radius_rad: 0.018,
+            moon_visible: true,
+            moon_angular_radius_rad: 0.022,
+            custom_moon_dir: None,
+            stars_visible: true,
+            stars_intensity: 1.0,
+        }
+    }
+}
+
+impl SpaceEnvironmentConfig {
+    /// Uses the host OS wall clock and local UTC offset to compute solar/lunar direction.
+    pub fn with_system_clock(mut self) -> Self {
+        self.sun_direction = SunDirectionMode::SystemClock;
+        self
+    }
+
+    /// Pre-ready helper to wire local timestamp and UTC offset directly from a time handler.
+    pub fn with_local_time(mut self, local_unix_s: f64, utc_offset_s: i32) -> Self {
+        self.sun_direction = SunDirectionMode::LocalTimeOffset {
+            local_unix_s,
+            utc_offset_s,
+        };
+        self
+    }
+
+    /// Pre-ready helper to wire UTC timestamp and OS/explicit UTC offset directly from a time handler.
+    pub fn with_utc_and_offset(mut self, unix_utc_s: f64, utc_offset_s: i32) -> Self {
+        self.sun_direction = SunDirectionMode::LocalTimeOffset {
+            local_unix_s: unix_utc_s + utc_offset_s as f64,
+            utc_offset_s,
+        };
+        self
+    }
+}
+
 /// Low-level surface geometry mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SurfaceMode {
@@ -103,7 +195,7 @@ pub struct EarthInput {
     pub seamless_25d: bool,
     /// Tile latitude projection (`WebMercator` default for standard Slippy/XYZ tiles).
     pub tile_projection: crate::geodesy::TileProjection,
-    /// Simulation time in Unix seconds, used for sun and moon direction.
+    /// Simulation time in Unix seconds, used for sun, moon, and sidereal rotation.
     pub sim_time_unix_s: f64,
     /// Cloud coverage, 0..=1.
     pub cloud_cover: f32,
@@ -134,6 +226,10 @@ pub struct EarthInput {
     /// Tint applied to terrain patches that have no imagery loaded. Neutral
     /// mid-gray by default so hosts can theme it.
     pub fallback_tint: Color,
+    /// Toggleable space skybox, Sun/Moon, day/night terminator, and deterministic land city lights.
+    pub space: SpaceEnvironmentConfig,
+    /// Toggleable 3D global cloud map and 2.5D-only 3D CC0 clouds, rain, and snow models.
+    pub weather: crate::gltf::WeatherConfig,
 }
 
 impl EarthInput {
@@ -141,6 +237,58 @@ impl EarthInput {
     #[inline]
     pub fn effective_surface_mode(&self) -> SurfaceMode {
         self.low_level_surface_override.unwrap_or(self.surface_mode)
+    }
+
+    /// Resolves `(sun_dir_ecef, moon_dir_ecef, unix_utc_s)` for the current configuration.
+    pub fn resolved_celestial_state(&self) -> ([f32; 3], [f32; 3], f64) {
+        let (sun_dir, unix_utc_s) = match self.space.sun_direction {
+            SunDirectionMode::SystemClock => {
+                let clock = crate::astro::system_clock_time();
+                (
+                    crate::astro::sun_direction_from_local_time(
+                        clock.local_unix_s,
+                        clock.utc_offset_s,
+                    ),
+                    clock.unix_utc_s,
+                )
+            }
+            SunDirectionMode::SimulationTime => (
+                crate::astro::sun_direction_from_unix_utc(self.sim_time_unix_s),
+                self.sim_time_unix_s,
+            ),
+            SunDirectionMode::LocalTimeOffset {
+                local_unix_s,
+                utc_offset_s,
+            } => (
+                crate::astro::sun_direction_from_local_time(local_unix_s, utc_offset_s),
+                local_unix_s - utc_offset_s as f64,
+            ),
+            SunDirectionMode::SubsolarPoint { lat_deg, lon_deg } => (
+                crate::astro::sun_direction_from_subsolar_lat_lon(lat_deg, lon_deg),
+                self.sim_time_unix_s,
+            ),
+            SunDirectionMode::CustomEcef(v) => {
+                let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                let dir = if len > 1e-6 {
+                    [v[0] / len, v[1] / len, v[2] / len]
+                } else {
+                    [1.0, 0.0, 0.0]
+                };
+                (dir, self.sim_time_unix_s)
+            }
+        };
+        let moon_dir = match self.space.custom_moon_dir {
+            Some(v) => {
+                let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                if len > 1e-6 {
+                    [v[0] / len, v[1] / len, v[2] / len]
+                } else {
+                    crate::astro::moon_direction_from_unix_utc(unix_utc_s)
+                }
+            }
+            None => crate::astro::moon_direction_from_unix_utc(unix_utc_s),
+        };
+        (sun_dir, moon_dir, unix_utc_s)
     }
 
     /// Computes the current low-level internal surface state (3D vs seamless 2.5D vs 2D morph).
@@ -194,6 +342,8 @@ impl Default for EarthInput {
             sse_threshold: 4.0,
             terrain_skirts: None,
             fallback_tint: Color::rgba(128, 128, 128, 255),
+            space: SpaceEnvironmentConfig::default(),
+            weather: crate::gltf::WeatherConfig::default(),
         }
     }
 }
@@ -744,7 +894,7 @@ impl EarthScene {
             (0, 0)
         };
         if input.layers.terrain && effective_mode == SurfaceMode::QuadtreeLod {
-            let leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_options(
+            let leaves = crate::geodesy::traverse_quadtree_lod_frustum6_projected(
                 &input.camera,
                 input.viewport.width.max(1.0) as f64,
                 input.viewport.height.max(1.0) as f64,
@@ -753,6 +903,7 @@ impl EarthScene {
                 input.tile_grid.max(2),
                 low_state.map_2d_morph < 0.15,
                 crate::geodesy::MAX_QUADTREE_LEAVES,
+                input.tile_projection,
             );
             let with_skirts = input.terrain_skirts.unwrap_or(true);
             let sig = (
@@ -770,6 +921,7 @@ impl EarthScene {
             );
             if self.last_retained_leaves.as_ref() == Some(&sig)
                 && self.last_retained_stats.ancestor_fallbacks == 0
+                && self.retained_builder.frame_cache_valid_for_fast_path(input)
                 && self.retained_handle.snapshot_terrain().is_some()
             {
                 self.retained_handle.update_camera(cam_u);

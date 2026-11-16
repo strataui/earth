@@ -1,14 +1,17 @@
 //! Asynchronous tile streaming, frustum-culled LOD selection, and retained GPU mesh builder.
 
+use crate::astro::{build_environment_assets, icrf_to_ecef_matrix, GlobalCloudMapStore};
 use crate::geodesy::{
     build_tile_local_rtc_mesh_morphed, level_for_altitude, retained_camera_uniforms,
     tile_bounding_sphere, tile_bounds, tile_bounds_mercator,
-    traverse_quadtree_lod_frustum6_with_options, EarthCamera, Frustum6, PatchBounds,
+    traverse_quadtree_lod_frustum6_projected, EarthCamera, Frustum6, PatchBounds,
     SurfaceMorphParams, TileKey, TileProjection, MAX_QUADTREE_LEAVES,
 };
+use crate::gltf::{build_25d_weather_meshes, CustomWeatherMeshes, WeatherConfig};
 use crate::scene::{
     compute_adaptive_skirt_depth, requested_tile, sky_gradient, surrounding_patches,
-    tile_patch_span_deg, EarthInput, EarthLowLevelState, EarthViewMode, SurfaceMode,
+    tile_patch_span_deg, EarthInput, EarthLowLevelState, EarthViewMode, SpaceEnvironmentConfig,
+    SurfaceMode,
 };
 use crate::tiles::{TileElevation, TileImage, TileSource};
 use std::collections::{HashMap, HashSet};
@@ -17,9 +20,15 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use strata_render::camera64::DVec3;
 use strata_render::scene3d::{
-    RetainedCameraUniforms, RetainedScene3D, RetainedTerrainFrame, RetainedTileInstance,
-    RetainedTileMesh, RetainedTileTexture, TileKeyId,
+    RetainedCameraUniforms, RetainedEnvironmentAssets, RetainedScene3D, RetainedTerrainFrame,
+    RetainedTileInstance, RetainedTileMesh, RetainedTileTexture, TileKeyId,
 };
+
+#[inline]
+fn smoothstep_f32(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
 
 #[inline]
 fn hash_bytes_64(bytes: &[u8]) -> u64 {
@@ -142,6 +151,13 @@ pub struct RetainedTerrainBuilder {
     textures: HashMap<TileKey, CachedTexEntry>,
     next_tex_id: u64,
     next_revision: u64,
+    cloud_store: Arc<GlobalCloudMapStore>,
+    custom_weather: Option<CustomWeatherMeshes>,
+    weather_ids: HashMap<u64, u64>,
+    weather_rev: u64,
+    last_cloud_rev: u64,
+    last_built_weather: Option<(i64, i64, WeatherConfig)>,
+    cached_env: Option<(u64, Arc<RetainedEnvironmentAssets>)>,
 }
 
 impl std::fmt::Debug for RetainedTerrainBuilder {
@@ -162,12 +178,56 @@ impl Default for RetainedTerrainBuilder {
 
 impl RetainedTerrainBuilder {
     pub fn new() -> Self {
+        Self::with_cloud_store(Arc::new(GlobalCloudMapStore::new(None, None)))
+    }
+
+    pub fn with_cloud_store(cloud_store: Arc<GlobalCloudMapStore>) -> Self {
         Self {
             meshes: HashMap::new(),
             textures: HashMap::new(),
             next_tex_id: 1,
             next_revision: 1,
+            cloud_store,
+            custom_weather: None,
+            weather_ids: HashMap::new(),
+            weather_rev: 0,
+            last_cloud_rev: 0,
+            last_built_weather: None,
+            cached_env: None,
         }
+    }
+
+    pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
+        self.custom_weather = custom;
+        self.last_built_weather = None;
+    }
+
+    #[inline]
+    pub fn cloud_revision(&self) -> u64 {
+        self.cloud_store.snapshot().0
+    }
+
+    #[inline]
+    pub fn last_built_cloud_rev(&self) -> u64 {
+        self.last_cloud_rev
+    }
+
+    /// Returns `true` when neither background cloudmap nor 2.5D weather meshes require rebuilding.
+    pub fn frame_cache_valid_for_fast_path(&self, input: &EarthInput) -> bool {
+        if self.last_cloud_rev != self.cloud_store.snapshot().0 {
+            return false;
+        }
+        let ll = input.low_level_state();
+        let active_25d = ll.local_25d_blend.max(ll.map_2d_morph) > 0.02
+            && (input.weather.clouds_25d || input.weather.rain || input.weather.snow);
+        if !active_25d {
+            return self.last_built_weather.is_none();
+        }
+        let lat_q = (input.camera.focus.lat_deg * 1e5).round() as i64;
+        let lon_q = (input.camera.focus.lon_deg * 1e5).round() as i64;
+        self.last_built_weather
+            .as_ref()
+            .is_some_and(|(a, b, w)| *a == lat_q && *b == lon_q && w == &input.weather)
     }
 
     pub fn camera_from_input(input: &EarthInput) -> RetainedCameraUniforms {
@@ -188,26 +248,24 @@ impl RetainedTerrainBuilder {
                 cam.aim_offset_m[2] * (1.0 - map_t),
             ];
         }
-        let placement = cam.placement();
-        let key_dir = placement.eye.sub(placement.aim).normalize();
-        let sun_dir = {
-            let v = [
-                key_dir.x as f32 + 0.35,
-                key_dir.y as f32 + 0.35,
-                key_dir.z as f32 + 0.25,
-            ];
-            let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
-            [v[0] / len, v[1] / len, v[2] / len]
+        let (sun_dir, moon_dir, unix_utc_s) = input.resolved_celestial_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph).clamp(0.0, 1.0);
+        // Smoothly fade orbital terminator shadows, night city lights, and the 3D global cloud map
+        // as Earth transitions automatically from 3D globe into the shadowless 2.5D ground view.
+        let space_factor = 1.0 - smoothstep_f32(0.0, 0.85, flat_t);
+        let day_night_strength = if input.space.day_night_lighting {
+            input.space.shadow_contrast.clamp(0.0, 1.0) * space_factor
+        } else {
+            0.0
         };
-        let dl = input.daylight.clamp(0.0, 1.0);
-        let sun_color = [0.15 + 0.2 * dl, 0.15 + 0.2 * dl, 0.14 + 0.18 * dl];
-        let amb_s = 0.25 + 0.2 * dl;
-        let ambient_color = [
-            (150.0 / 255.0) * amb_s,
-            (170.0 / 255.0) * amb_s,
-            (200.0 / 255.0) * amb_s,
-        ];
-        retained_camera_uniforms(
+        let city_lights_intensity = if input.space.day_night_lighting && input.space.city_lights {
+            input.space.city_lights_intensity.max(0.0) * space_factor
+        } else {
+            0.0
+        };
+        let sun_color = [1.0, 0.97, 0.92];
+        let ambient_color = [0.16, 0.19, 0.24];
+        let mut u = retained_camera_uniforms(
             &cam,
             input.viewport.width as f64,
             input.viewport.height as f64,
@@ -215,7 +273,34 @@ impl RetainedTerrainBuilder {
             sun_color,
             ambient_color,
             sky_gradient(input.daylight),
-        )
+        );
+        u.ecef_from_icrf = icrf_to_ecef_matrix(unix_utc_s);
+        u.moon_dir = if let Some(cm) = input.space.custom_moon_dir {
+            let len = (cm[0] * cm[0] + cm[1] * cm[1] + cm[2] * cm[2])
+                .sqrt()
+                .max(1e-6);
+            [cm[0] / len, cm[1] / len, cm[2] / len]
+        } else {
+            moon_dir
+        };
+        u.day_night_strength = day_night_strength;
+        u.city_lights_intensity = city_lights_intensity;
+        u.local_25d_blend = flat_t;
+        u.sun_visible = input.space.sun_visible && input.layers.celestial;
+        u.sun_angular_radius_rad = input.space.sun_angular_radius_rad.max(1e-4);
+        u.moon_visible = input.space.moon_visible && input.layers.celestial;
+        u.moon_angular_radius_rad = input.space.moon_angular_radius_rad.max(1e-4);
+        u.stars_visible = input.space.stars_visible;
+        u.stars_intensity = input.space.stars_intensity.max(0.0);
+        u.cloud_layer_opacity = if input.weather.global_cloud_map && input.layers.clouds {
+            input.weather.global_cloud_opacity.clamp(0.0, 1.0) * space_factor
+        } else {
+            0.0
+        };
+        u.cloud_lon_offset_rad =
+            (input.weather.global_cloud_spin_rad_s * input.weather.weather_time_s) as f32;
+        u.time_s = input.weather.weather_time_s as f32;
+        u
     }
 
     fn resolve_or_cache_texture(
@@ -344,6 +429,56 @@ impl RetainedTerrainBuilder {
         None
     }
 
+    fn resolve_environment_and_weather(
+        &mut self,
+        input: &EarthInput,
+    ) -> (
+        Option<Arc<RetainedEnvironmentAssets>>,
+        Vec<strata_render::scene3d::RetainedDynamicMesh>,
+    ) {
+        let ll = input.low_level_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
+        if flat_t < 0.85
+            && input.weather.global_cloud_map
+            && input.layers.clouds
+            && std::env::var_os("STRATA_EARTH_OFFLINE").is_none()
+        {
+            self.cloud_store
+                .ensure_fetched(&input.weather.cloud_map_url);
+        }
+        let (cloud_rev, cloud_tex) = self.cloud_store.snapshot();
+        self.last_cloud_rev = cloud_rev;
+        let env = match &self.cached_env {
+            Some((r, cached)) if *r == cloud_rev => Arc::clone(cached),
+            _ => {
+                let built = build_environment_assets(Some(cloud_tex), cloud_rev);
+                self.cached_env = Some((cloud_rev, Arc::clone(&built)));
+                built
+            }
+        };
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
+        let active_25d =
+            flat_t > 0.02 && (input.weather.clouds_25d || input.weather.rain || input.weather.snow);
+        self.last_built_weather = if active_25d {
+            let lat_q = (input.camera.focus.lat_deg * 1e5).round() as i64;
+            let lon_q = (input.camera.focus.lon_deg * 1e5).round() as i64;
+            Some((lat_q, lon_q, input.weather.clone()))
+        } else {
+            None
+        };
+        self.weather_rev = self.weather_rev.wrapping_add(1);
+        let dynamic_meshes = build_25d_weather_meshes(
+            input.camera.focus,
+            input.camera.altitude_m(),
+            flat_t,
+            &input.weather,
+            self.custom_weather.as_ref(),
+            self.weather_rev,
+            &mut self.weather_ids,
+        );
+        (Some(env), dynamic_meshes)
+    }
+
     /// Builds a [`RetainedTerrainFrame`] from cached tile-local RTC geometry & textures.
     pub fn build_frame(
         &mut self,
@@ -353,6 +488,7 @@ impl RetainedTerrainBuilder {
         allow_ancestor_mesh_fallback: bool,
     ) -> (Arc<RetainedTerrainFrame>, RetainedBuildStats) {
         let camera = Self::camera_from_input(input);
+        let (environment, dynamic_meshes) = self.resolve_environment_and_weather(input);
         let mut stats = RetainedBuildStats::default();
         let mut meshes_out = Vec::new();
         let mut instances_out = Vec::new();
@@ -368,7 +504,8 @@ impl RetainedTerrainBuilder {
                     meshes: meshes_out,
                     instances: instances_out,
                     textures: textures_out,
-                    dynamic_meshes: Vec::new(),
+                    dynamic_meshes,
+                    environment,
                 }),
                 stats,
             );
@@ -397,7 +534,7 @@ impl RetainedTerrainBuilder {
                 };
                 let morph_sig = mesh_morph_signature(morph);
                 let horizon_cull = ll.map_2d_morph <= 0.05;
-                let leaves = traverse_quadtree_lod_frustum6_with_options(
+                let leaves = traverse_quadtree_lod_frustum6_projected(
                     &input.camera,
                     input.viewport.width.max(1.0) as f64,
                     input.viewport.height.max(1.0) as f64,
@@ -406,6 +543,7 @@ impl RetainedTerrainBuilder {
                     grid,
                     horizon_cull,
                     MAX_QUADTREE_LEAVES,
+                    input.tile_projection,
                 );
                 let mut emitted_ancestors = HashSet::new();
                 for leaf in leaves {
@@ -628,7 +766,8 @@ impl RetainedTerrainBuilder {
                 meshes: meshes_out,
                 instances: instances_out,
                 textures: textures_out,
-                dynamic_meshes: Vec::new(),
+                dynamic_meshes,
+                environment,
             }),
             stats,
         )
@@ -738,6 +877,9 @@ fn find_resident_ancestor(
 
 struct WorkerShared {
     latest_input: Option<(u64, EarthInput)>,
+    last_dispatched: Option<(u64, EarthInput)>,
+    custom_weather: Option<CustomWeatherMeshes>,
+    custom_weather_gen: u64,
     shutdown: bool,
     stats: EarthViewportStats,
 }
@@ -770,6 +912,9 @@ impl EarthTileWorker {
         let shared = Arc::new((
             Mutex::new(WorkerShared {
                 latest_input: None,
+                last_dispatched: None,
+                custom_weather: None,
+                custom_weather_gen: 0,
                 shutdown: false,
                 stats: EarthViewportStats::default(),
             }),
@@ -777,15 +922,35 @@ impl EarthTileWorker {
         ));
         let completed_seq = Arc::new(AtomicU64::new(0));
         let shared_bg = Arc::clone(&shared);
+        let shared_cloud = Arc::clone(&shared);
         let completed_bg = Arc::clone(&completed_seq);
+        let cloud_wakeup_outer = wakeup.clone();
+        let cloud_wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            {
+                let (lock, cv) = &*shared_cloud;
+                if let Ok(mut guard) = lock.lock() {
+                    if guard.latest_input.is_none() {
+                        if let Some((seq, ref inp)) = guard.last_dispatched {
+                            guard.latest_input = Some((seq, inp.clone()));
+                            cv.notify_one();
+                        }
+                    }
+                }
+            }
+            if let Some(ref w) = cloud_wakeup_outer {
+                w();
+            }
+        });
+        let cloud_store = Arc::new(GlobalCloudMapStore::new(None, Some(cloud_wakeup)));
 
         let handle = std::thread::Builder::new()
             .name("strata-earth-worker".to_string())
             .spawn(move || {
-                let mut builder = RetainedTerrainBuilder::new();
+                let mut builder = RetainedTerrainBuilder::with_cloud_store(cloud_store);
                 let mut geom_rev = 0u64;
+                let mut seen_custom_gen = 0u64;
                 loop {
-                    let (seq, input) = {
+                    let (seq, input, custom_update) = {
                         let (lock, cv) = &*shared_bg;
                         let mut guard = lock.lock().unwrap();
                         while guard.latest_input.is_none() && !guard.shutdown {
@@ -794,8 +959,19 @@ impl EarthTileWorker {
                         if guard.shutdown {
                             return;
                         }
-                        guard.latest_input.take().unwrap()
+                        let cw = if guard.custom_weather_gen != seen_custom_gen {
+                            seen_custom_gen = guard.custom_weather_gen;
+                            Some(guard.custom_weather.clone())
+                        } else {
+                            None
+                        };
+                        let pair = guard.latest_input.take().unwrap();
+                        (pair.0, pair.1, cw)
                     };
+
+                    if let Some(cw) = custom_update {
+                        builder.set_custom_weather_meshes(cw);
+                    }
 
                     geom_rev += 1;
                     let (frame, build_stats) =
@@ -828,12 +1004,28 @@ impl EarthTileWorker {
         }
     }
 
+    /// Updates custom GLTF weather meshes on the background builder and schedules a refresh.
+    pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut guard) = lock.lock() {
+            guard.custom_weather = custom;
+            guard.custom_weather_gen = guard.custom_weather_gen.wrapping_add(1);
+            if guard.latest_input.is_none() {
+                if let Some((seq, ref inp)) = guard.last_dispatched {
+                    guard.latest_input = Some((seq, inp.clone()));
+                }
+            }
+            cv.notify_one();
+        }
+    }
+
     /// Queues `input` for background LOD traversal + tile assembly, coalescing any unstarted request.
     pub fn request_update(&mut self, input: EarthInput) -> u64 {
         self.next_seq += 1;
         let seq = self.next_seq;
         let (lock, cv) = &*self.shared;
         if let Ok(mut guard) = lock.lock() {
+            guard.last_dispatched = Some((seq, input.clone()));
             guard.latest_input = Some((seq, input));
             guard.stats.camera_updates += 1;
             cv.notify_one();
@@ -912,6 +1104,87 @@ impl EarthViewport {
     #[inline]
     pub fn retained_scene(&self) -> RetainedScene3D {
         self.retained.clone()
+    }
+
+    #[inline]
+    pub fn input(&self) -> &EarthInput {
+        &self.input
+    }
+
+    #[inline]
+    pub fn space_config(&self) -> &SpaceEnvironmentConfig {
+        &self.input.space
+    }
+
+    /// Updates planetary lighting, starfield, Sun/Moon, and city-light configuration in O(1).
+    pub fn set_space_config(&mut self, space: SpaceEnvironmentConfig) {
+        self.input.space = space;
+        let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+        self.retained.update_camera(cam_u);
+    }
+
+    #[inline]
+    pub fn weather_config(&self) -> &WeatherConfig {
+        &self.input.weather
+    }
+
+    /// Updates global cloudmap & 2.5D clouds/rain/snow toggles cleanly.
+    pub fn set_weather_config(&mut self, weather: WeatherConfig) {
+        self.input.weather = weather;
+        let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+        self.retained.update_camera(cam_u);
+        if !self.stopped.load(Ordering::Relaxed) {
+            self.worker.request_update(self.input.clone());
+        }
+    }
+
+    /// Replaces the default embedded CC0 weather meshes with custom parsed GLTF meshes.
+    pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
+        self.worker.set_custom_weather_meshes(custom);
+    }
+
+    /// Updates simulation UNIX UTC timestamp (O(1) solar/lunar/sidereal uniform update).
+    pub fn set_sim_time_unix_s(&mut self, unix_utc_s: f64) {
+        self.input.sim_time_unix_s = unix_utc_s;
+        let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+        self.retained.update_camera(cam_u);
+    }
+
+    /// Returns `true` when animated 2.5D precipitation/clouds or global cloud spin need ticking.
+    pub fn has_active_weather_animation(&self) -> bool {
+        let ll = self.input.low_level_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
+        let w = &self.input.weather;
+        let spin_3d = w.global_cloud_map
+            && self.input.layers.clouds
+            && flat_t < 0.85
+            && w.global_cloud_spin_rad_s.abs() > 1e-9;
+        let weather_25d = flat_t > 0.02
+            && ((w.clouds_25d && w.cloud_count > 0)
+                || (w.rain && w.rain_density > 0)
+                || (w.snow && w.snow_density > 0));
+        spin_3d || weather_25d
+    }
+
+    /// Advances active weather animations by `dt_s` seconds; returns `false` when idle.
+    pub fn step_weather(&mut self, dt_s: f64) -> bool {
+        if !self.has_active_weather_animation() {
+            return false;
+        }
+        self.input.weather.weather_time_s += dt_s.max(0.0);
+        let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+        self.retained.update_camera(cam_u);
+        let ll = self.input.low_level_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
+        let w = &self.input.weather;
+        let weather_25d = flat_t > 0.02
+            && ((w.clouds_25d && w.cloud_count > 0)
+                || (w.rain && w.rain_density > 0)
+                || (w.snow && w.snow_density > 0));
+        if weather_25d && !self.stopped.load(Ordering::Relaxed) {
+            self.worker.request_update(self.input.clone());
+        }
+        true
     }
 
     /// Returns the high-level view mode (`Mode3D` or `Mode2D`).

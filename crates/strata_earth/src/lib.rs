@@ -15,9 +15,11 @@
 //! - Mesh rebuilds reuse buffers; steady-state frames do not allocate.
 
 pub mod acceptance;
+pub mod astro;
 pub mod basemap;
 pub mod descriptor;
 pub mod geodesy;
+pub mod gltf;
 pub mod json;
 pub mod scene;
 pub mod tiles;
@@ -25,6 +27,14 @@ pub mod worker;
 
 pub use acceptance::{
     evaluate as evaluate_acceptance, AcceptanceCriteria, AcceptanceReport, PixelDelta,
+};
+pub use astro::{
+    build_environment_assets, embedded_bsc5_stars, embedded_clouds_fallback, embedded_land_mask,
+    embedded_moon_texture, equatorial_to_ecef, greenwich_mean_sidereal_time_rad,
+    icrf_to_ecef_matrix, moon_direction_from_unix_utc, sun_direction_from_local_time,
+    sun_direction_from_subsolar_lat_lon, sun_direction_from_system_clock,
+    sun_direction_from_unix_utc, system_clock_time, unix_to_julian_date, GlobalCloudMapStore,
+    LocalClockTime, DEFAULT_CLOUD_MAP_URL,
 };
 pub use basemap::{embedded_base_tile, EarthDefaultTileSource, EmbeddedBaseMapSource};
 pub use descriptor::{
@@ -39,11 +49,16 @@ pub use geodesy::{
     horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum, level_for_altitude,
     mercator_gy_to_lat_deg, pick_geodetic, raycast_ellipsoid, resolve_tile_imagery,
     retained_camera_uniforms, rte_gpu_relative_position, rte_relative_position_f32, screen_to_ray,
-    split_dvec3_to_high_low, split_f64_to_high_low, tile_bounding_sphere, tile_bounds,
-    tile_bounds_mercator, traverse_quadtree_lod, traverse_quadtree_lod_frustum6, wrap_longitude,
+    split_dvec3_to_high_low, split_f64_to_high_low, tile_bounding_sphere,
+    tile_bounding_sphere_projected, tile_bounds, tile_bounds_mercator, traverse_quadtree_lod,
+    traverse_quadtree_lod_frustum6, traverse_quadtree_lod_frustum6_projected, wrap_longitude,
     CameraPlacement, EarthCamera, Frustum6, Geodetic, LocalFrame, RteEyeUniforms,
     SurfaceMorphParams, TileKey, TileProjection, TileTextureResolution, GLOBE_ALTITUDE_M,
     MAX_QUADTREE_LEAVES,
+};
+pub use gltf::{
+    build_25d_weather_meshes, cc0_cloud_mesh, cc0_rain_mesh, cc0_snow_mesh, parse_glb_mesh,
+    CustomWeatherMeshes, WeatherConfig, WeatherMesh,
 };
 pub use scene::{
     building_triangle_count, celestial_bodies, compute_adaptive_skirt_depth,
@@ -51,7 +66,8 @@ pub use scene::{
     terrain_skirt_triangle_count, terrain_triangle_count, terrain_triangle_count_with_skirts,
     tile_patch_span_deg, BuildingFootprint, BuildingSource, EarthInput, EarthLowLevelState,
     EarthScene, EarthViewMode, EntityMarker, FrameStats, LayerToggles, MemoryBuildingSource,
-    NetworkBuildingSource, PatchBounds, PatchFrame, SurfaceMode,
+    NetworkBuildingSource, PatchBounds, PatchFrame, SpaceEnvironmentConfig, SunDirectionMode,
+    SurfaceMode,
 };
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{

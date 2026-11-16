@@ -1481,6 +1481,45 @@ impl NetworkTileSource {
         )
     }
 
+    fn spawn_fetch_workers(
+        worker_count: usize,
+        task_rx: std::sync::mpsc::Receiver<FetchTask>,
+        results_tx: std::sync::mpsc::Sender<(TileDataKey, Result<CachedTileData, TileError>)>,
+        transport: Arc<dyn HttpTransport>,
+        on_tile_ready: TileReadySlot,
+    ) {
+        let shared_rx = Arc::new(Mutex::new(task_rx));
+        for idx in 0..worker_count.max(1) {
+            let rx = Arc::clone(&shared_rx);
+            let tx = results_tx.clone();
+            let worker_transport = Arc::clone(&transport);
+            let worker_ready = Arc::clone(&on_tile_ready);
+            let _ = std::thread::Builder::new()
+                .name(format!("strata-tile-fetcher-{idx}"))
+                .spawn(move || loop {
+                    let task = {
+                        let Ok(guard) = rx.lock() else {
+                            break;
+                        };
+                        match guard.recv() {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        }
+                    };
+                    let result = Self::process_fetch_task(&worker_transport, &task);
+                    let ok = result.is_ok();
+                    let _ = tx.send((task.key, result));
+                    if ok {
+                        if let Ok(guard) = worker_ready.lock() {
+                            if let Some(ref cb) = *guard {
+                                cb();
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
     /// Fully customizable builder constructor.
     pub fn with_options(
         imagery_url_template: impl Into<String>,
@@ -1495,25 +1534,13 @@ impl NetworkTileSource {
             channel::<(TileDataKey, Result<CachedTileData, TileError>)>();
         let on_tile_ready: TileReadySlot = Arc::new(Mutex::new(None));
 
-        let worker_transport = Arc::clone(&transport);
-        let worker_ready = Arc::clone(&on_tile_ready);
-        std::thread::Builder::new()
-            .name("strata-tile-fetcher".to_string())
-            .spawn(move || {
-                while let Ok(task) = task_rx.recv() {
-                    let result = Self::process_fetch_task(&worker_transport, &task);
-                    let ok = result.is_ok();
-                    let _ = results_tx.send((task.key, result));
-                    if ok {
-                        if let Ok(guard) = worker_ready.lock() {
-                            if let Some(ref cb) = *guard {
-                                cb();
-                            }
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn strata-tile-fetcher thread");
+        Self::spawn_fetch_workers(
+            6,
+            task_rx,
+            results_tx,
+            Arc::clone(&transport),
+            Arc::clone(&on_tile_ready),
+        );
 
         Self {
             imagery_url_template: imagery_url_template.into(),
@@ -1548,29 +1575,16 @@ impl NetworkTileSource {
     pub fn with_transport(mut self, transport: impl HttpTransport) -> Self {
         let transport: Arc<dyn HttpTransport> = Arc::new(transport);
         self.transport = Arc::clone(&transport);
-        // Restart worker with new transport
         let (task_tx, task_rx) = channel::<FetchTask>();
         let (results_tx, results_rx) =
             channel::<(TileDataKey, Result<CachedTileData, TileError>)>();
-        let worker_transport = Arc::clone(&transport);
-        let worker_ready = Arc::clone(&self.on_tile_ready);
-        std::thread::Builder::new()
-            .name("strata-tile-fetcher".to_string())
-            .spawn(move || {
-                while let Ok(task) = task_rx.recv() {
-                    let result = Self::process_fetch_task(&worker_transport, &task);
-                    let ok = result.is_ok();
-                    let _ = results_tx.send((task.key, result));
-                    if ok {
-                        if let Ok(guard) = worker_ready.lock() {
-                            if let Some(ref cb) = *guard {
-                                cb();
-                            }
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn strata-tile-fetcher thread");
+        Self::spawn_fetch_workers(
+            6,
+            task_rx,
+            results_tx,
+            Arc::clone(&transport),
+            Arc::clone(&self.on_tile_ready),
+        );
 
         self.task_tx = task_tx;
         self.results_rx = results_rx;

@@ -1635,6 +1635,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "image",
+ "libc",
  "strata_layout",
  "strata_primitives",
  "strata_render",
