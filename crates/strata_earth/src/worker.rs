@@ -1,12 +1,14 @@
 //! Asynchronous tile streaming, frustum-culled LOD selection, and retained GPU mesh builder.
 
 use crate::geodesy::{
-    build_tile_local_rtc_mesh, level_for_altitude, retained_camera_uniforms, tile_bounding_sphere,
-    tile_bounds, traverse_quadtree_lod_frustum6, EarthCamera, Frustum6, PatchBounds, TileKey,
+    build_tile_local_rtc_mesh_morphed, level_for_altitude, retained_camera_uniforms,
+    tile_bounding_sphere, tile_bounds, tile_bounds_mercator,
+    traverse_quadtree_lod_frustum6_with_options, EarthCamera, Frustum6, PatchBounds,
+    SurfaceMorphParams, TileKey, TileProjection, MAX_QUADTREE_LEAVES,
 };
 use crate::scene::{
     compute_adaptive_skirt_depth, requested_tile, sky_gradient, surrounding_patches,
-    tile_patch_span_deg, EarthInput, SurfaceMode,
+    tile_patch_span_deg, EarthInput, EarthLowLevelState, EarthViewMode, SurfaceMode,
 };
 use crate::tiles::{TileElevation, TileImage, TileSource};
 use std::collections::{HashMap, HashSet};
@@ -99,8 +101,30 @@ pub struct RetainedBuildStats {
     pub ancestor_fallbacks: usize,
 }
 
+#[inline]
+fn mesh_morph_signature(morph: SurfaceMorphParams) -> u64 {
+    let proj_bit = match morph.projection {
+        TileProjection::WebMercator => 1u64,
+        TileProjection::Geographic4326 => 2u64,
+    };
+    if morph.flat_blend <= 1e-6 {
+        return proj_bit;
+    }
+    let flat_q = (morph.flat_blend.clamp(0.0, 1.0) * 1000.0).round() as u64;
+    let map_q = (morph.map_2d_morph.clamp(0.0, 1.0) * 1000.0).round() as u64;
+    let lat_q = ((morph.focus.lat_deg + 90.0) * 10_000.0).round() as u64;
+    let lon_q = ((morph.focus.lon_deg + 180.0) * 10_000.0).round() as u64;
+    let mut h = 0xcbf29ce484222325u64 ^ proj_bit;
+    for v in [flat_q, map_q, lat_q, lon_q] {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 struct CachedMeshEntry {
     elev_hash: u64,
+    morph_sig: u64,
     revision: u64,
     mesh: Arc<RetainedTileMesh>,
 }
@@ -147,7 +171,24 @@ impl RetainedTerrainBuilder {
     }
 
     pub fn camera_from_input(input: &EarthInput) -> RetainedCameraUniforms {
-        let placement = input.camera.placement();
+        let ll = input.low_level_state();
+        let map_t = ll.map_2d_morph as f64;
+        let mut cam = input.camera;
+        if map_t > 1e-4 {
+            let [ex, ey, ez] = cam.eye_offset_m;
+            let dist = (ex * ex + ey * ey + ez * ez).sqrt().max(cam.altitude_m());
+            cam.eye_offset_m = [
+                ex * (1.0 - map_t),
+                ey * (1.0 - map_t),
+                ez + (dist - ez) * map_t,
+            ];
+            cam.aim_offset_m = [
+                cam.aim_offset_m[0] * (1.0 - map_t),
+                cam.aim_offset_m[1] * (1.0 - map_t),
+                cam.aim_offset_m[2] * (1.0 - map_t),
+            ];
+        }
+        let placement = cam.placement();
         let key_dir = placement.eye.sub(placement.aim).normalize();
         let sun_dir = {
             let v = [
@@ -167,7 +208,7 @@ impl RetainedTerrainBuilder {
             (200.0 / 255.0) * amb_s,
         ];
         retained_camera_uniforms(
-            &input.camera,
+            &cam,
             input.viewport.width as f64,
             input.viewport.height as f64,
             sun_dir,
@@ -244,44 +285,63 @@ impl RetainedTerrainBuilder {
         stats: &mut RetainedBuildStats,
     ) -> Option<(u64, u64, [f32; 4], Arc<RetainedTileTexture>)> {
         let mut probe = key;
-        if probe.level > max_level {
-            while probe.level > max_level {
-                probe = probe.parent()?;
+        while probe.level > max_level {
+            probe = probe.parent()?;
+        }
+
+        // Request exact leaf once (queues async network download if not cached).
+        if let Ok(Some(img)) = source.imagery(probe) {
+            if !img.pixels.is_empty() {
+                let (id, rev, tex) = self.resolve_or_cache_texture(probe, &img, stats);
+                let uv_rect = if probe == key {
+                    [0.0, 0.0, 1.0, 1.0]
+                } else {
+                    stats.ancestor_fallbacks += 1;
+                    let (u0, v0) = ancestor_uv_point(key, probe, 0.0, 0.0);
+                    let (u1, v1) = ancestor_uv_point(key, probe, 1.0, 1.0);
+                    [u0, v0, u1, v1]
+                };
+                return Some((id, rev, uv_rect, tex));
             }
         }
-        loop {
-            match source.imagery(probe) {
-                Ok(Some(img)) if !img.pixels.is_empty() => {
-                    let (id, rev, tex) = self.resolve_or_cache_texture(probe, &img, stats);
-                    let uv_rect = if probe == key {
-                        [0.0, 0.0, 1.0, 1.0]
-                    } else {
+
+        // Walk ancestors without issuing spurious network fetches for intermediate missing levels.
+        let mut anc = probe.parent();
+        while let Some(a) = anc {
+            if let Some(img) = source.peek_cached_imagery(a) {
+                if !img.pixels.is_empty() {
+                    let (id, rev, tex) = self.resolve_or_cache_texture(a, &img, stats);
+                    stats.ancestor_fallbacks += 1;
+                    let (u0, v0) = ancestor_uv_point(key, a, 0.0, 0.0);
+                    let (u1, v1) = ancestor_uv_point(key, a, 1.0, 1.0);
+                    return Some((id, rev, [u0, v0, u1, v1], tex));
+                }
+            }
+            if let Some(entry) = self.textures.get(&a) {
+                stats.ancestor_fallbacks += 1;
+                let (u0, v0) = ancestor_uv_point(key, a, 0.0, 0.0);
+                let (u1, v1) = ancestor_uv_point(key, a, 1.0, 1.0);
+                return Some((
+                    entry.id,
+                    entry.revision,
+                    [u0, v0, u1, v1],
+                    Arc::clone(&entry.texture),
+                ));
+            }
+            if a.level <= 2 {
+                if let Ok(Some(img)) = source.imagery(a) {
+                    if !img.pixels.is_empty() {
+                        let (id, rev, tex) = self.resolve_or_cache_texture(a, &img, stats);
                         stats.ancestor_fallbacks += 1;
-                        let (u0, v0) = ancestor_uv_point(key, probe, 0.0, 0.0);
-                        let (u1, v1) = ancestor_uv_point(key, probe, 1.0, 1.0);
-                        [u0, v0, u1, v1]
-                    };
-                    return Some((id, rev, uv_rect, tex));
-                }
-                _ => {
-                    if let Some(entry) = self.textures.get(&probe) {
-                        let id = entry.id;
-                        let rev = entry.revision;
-                        let tex = Arc::clone(&entry.texture);
-                        let uv_rect = if probe == key {
-                            [0.0, 0.0, 1.0, 1.0]
-                        } else {
-                            stats.ancestor_fallbacks += 1;
-                            let (u0, v0) = ancestor_uv_point(key, probe, 0.0, 0.0);
-                            let (u1, v1) = ancestor_uv_point(key, probe, 1.0, 1.0);
-                            [u0, v0, u1, v1]
-                        };
-                        return Some((id, rev, uv_rect, tex));
+                        let (u0, v0) = ancestor_uv_point(key, a, 0.0, 0.0);
+                        let (u1, v1) = ancestor_uv_point(key, a, 1.0, 1.0);
+                        return Some((id, rev, [u0, v0, u1, v1], tex));
                     }
-                    probe = probe.parent()?;
                 }
             }
+            anc = a.parent();
         }
+        None
     }
 
     /// Builds a [`RetainedTerrainFrame`] from cached tile-local RTC geometry & textures.
@@ -314,10 +374,12 @@ impl RetainedTerrainBuilder {
             );
         }
 
+        let ll = input.low_level_state();
+        let effective_mode = ll.active_surface_mode;
         let grid = input.tile_grid.max(2);
         let with_skirts = input
             .terrain_skirts
-            .unwrap_or(input.surface_mode == SurfaceMode::QuadtreeLod);
+            .unwrap_or(effective_mode == SurfaceMode::QuadtreeLod);
         let fallback_tint = [
             input.fallback_tint.r(),
             input.fallback_tint.g(),
@@ -325,15 +387,25 @@ impl RetainedTerrainBuilder {
             input.fallback_tint.a(),
         ];
 
-        match input.surface_mode {
+        match effective_mode {
             SurfaceMode::QuadtreeLod => {
-                let leaves = traverse_quadtree_lod_frustum6(
+                let morph = SurfaceMorphParams {
+                    focus: input.camera.focus,
+                    flat_blend: (ll.local_25d_blend.max(ll.map_2d_morph)) as f64,
+                    map_2d_morph: ll.map_2d_morph as f64,
+                    projection: input.tile_projection,
+                };
+                let morph_sig = mesh_morph_signature(morph);
+                let horizon_cull = ll.map_2d_morph <= 0.05;
+                let leaves = traverse_quadtree_lod_frustum6_with_options(
                     &input.camera,
                     input.viewport.width.max(1.0) as f64,
                     input.viewport.height.max(1.0) as f64,
                     input.sse_threshold,
                     input.max_tile_level,
                     grid,
+                    horizon_cull,
+                    MAX_QUADTREE_LEAVES,
                 );
                 let mut emitted_ancestors = HashSet::new();
                 for leaf in leaves {
@@ -342,41 +414,15 @@ impl RetainedTerrainBuilder {
                     let elev_hash = hash_elevation_64(elev);
                     let key_id = TileKeyId::quadtree(leaf.level, leaf.x, leaf.y);
 
-                    let mesh = if let Some(cached) = self.meshes.get(&(key_id, grid, with_skirts)) {
-                        if cached.elev_hash == elev_hash {
-                            stats.mesh_cache_hits += 1;
-                            Arc::clone(&cached.mesh)
-                        } else {
-                            stats.mesh_cache_misses += 1;
-                            let rev = cached.revision + 1;
-                            let bounds = tile_bounds(leaf);
-                            let skirt_depth =
-                                compute_adaptive_skirt_depth(bounds, elevation_range(elev));
-                            let built = Arc::new(build_tile_local_rtc_mesh(
-                                leaf,
-                                bounds,
-                                grid,
-                                elev,
-                                leaf,
-                                with_skirts,
-                                skirt_depth,
-                                rev,
-                                0,
-                            ));
-                            self.meshes.insert(
-                                (key_id, grid, with_skirts),
-                                CachedMeshEntry {
-                                    elev_hash,
-                                    revision: rev,
-                                    mesh: Arc::clone(&built),
-                                },
-                            );
-                            built
-                        }
-                    } else if allow_ancestor_mesh_fallback
+                    let use_ancestor_mesh = allow_ancestor_mesh_fallback
                         && elev_res.is_err()
-                        && has_resident_ancestor(&self.meshes, leaf, grid, with_skirts)
-                    {
+                        && !self
+                            .meshes
+                            .get(&(key_id, grid, with_skirts))
+                            .is_some_and(|c| c.elev_hash == elev_hash && c.morph_sig == morph_sig)
+                        && has_resident_ancestor(&self.meshes, leaf, grid, with_skirts);
+
+                    if use_ancestor_mesh {
                         if let Some((anc_key, anc_mesh)) =
                             find_resident_ancestor(&self.meshes, leaf, grid, with_skirts)
                         {
@@ -415,26 +461,24 @@ impl RetainedTerrainBuilder {
                             }
                             continue;
                         }
-                        self.build_and_insert_leaf(
-                            leaf,
-                            key_id,
-                            grid,
-                            with_skirts,
-                            elev,
-                            elev_hash,
-                            &mut stats,
-                        )
-                    } else {
-                        self.build_and_insert_leaf(
-                            leaf,
-                            key_id,
-                            grid,
-                            with_skirts,
-                            elev,
-                            elev_hash,
-                            &mut stats,
-                        )
+                    }
+
+                    let bounds = match input.tile_projection {
+                        TileProjection::WebMercator => tile_bounds_mercator(leaf),
+                        TileProjection::Geographic4326 => tile_bounds(leaf),
                     };
+                    let mesh = self.ensure_tile_mesh(
+                        leaf,
+                        key_id,
+                        bounds,
+                        grid,
+                        with_skirts,
+                        elev,
+                        elev_hash,
+                        morph,
+                        morph_sig,
+                        &mut stats,
+                    );
 
                     if seen_mesh_keys.insert(mesh.key) {
                         meshes_out.push(Arc::clone(&mesh));
@@ -466,13 +510,20 @@ impl RetainedTerrainBuilder {
                 }
             }
             SurfaceMode::FlatPatches | SurfaceMode::SphericalGlobe => {
+                let morph = SurfaceMorphParams {
+                    focus: input.camera.focus,
+                    flat_blend: ll.map_2d_morph as f64,
+                    map_2d_morph: ll.map_2d_morph as f64,
+                    projection: TileProjection::Geographic4326,
+                };
+                let morph_sig = mesh_morph_signature(morph);
                 let frustum = Frustum6::from_camera(
                     &input.camera,
                     input.viewport.width.max(1.0) as f64,
                     input.viewport.height.max(1.0) as f64,
                 );
                 let mut patch_specs: Vec<(TileKey, PatchBounds, TileKeyId)> = Vec::new();
-                if input.surface_mode == SurfaceMode::SphericalGlobe {
+                if effective_mode == SurfaceMode::SphericalGlobe {
                     let level = level_for_altitude(input.camera.altitude_m(), 2);
                     let per_axis = 1u32 << level;
                     let lon_span = 360.0 / per_axis as f64;
@@ -515,7 +566,9 @@ impl RetainedTerrainBuilder {
                     let patch_center: DVec3 = crate::geodesy::geodetic_to_ecef(
                         crate::geodesy::Geodetic::new(mid_lat.clamp(-89.9, 89.9), mid_lon, 0.0),
                     );
-                    if !frustum.intersects_sphere(patch_center, radius.max(50_000.0) * 1.25) {
+                    if ll.map_2d_morph <= 0.05
+                        && !frustum.intersects_sphere(patch_center, radius.max(50_000.0) * 1.25)
+                    {
                         continue;
                     }
 
@@ -523,67 +576,18 @@ impl RetainedTerrainBuilder {
                     let elev = elev_res.as_ref().ok().and_then(|o| o.as_ref());
                     let elev_hash = hash_elevation_64(elev);
 
-                    let mesh = if let Some(cached) = self.meshes.get(&(key_id, grid, with_skirts)) {
-                        if cached.elev_hash == elev_hash {
-                            stats.mesh_cache_hits += 1;
-                            Arc::clone(&cached.mesh)
-                        } else {
-                            stats.mesh_cache_misses += 1;
-                            let rev = cached.revision + 1;
-                            let skirt_depth =
-                                compute_adaptive_skirt_depth(bounds, elevation_range(elev));
-                            let mut built = build_tile_local_rtc_mesh(
-                                tile,
-                                bounds,
-                                grid,
-                                elev,
-                                tile,
-                                with_skirts,
-                                skirt_depth,
-                                rev,
-                                key_id.face,
-                            );
-                            built.key = key_id;
-                            let arc = Arc::new(built);
-                            self.meshes.insert(
-                                (key_id, grid, with_skirts),
-                                CachedMeshEntry {
-                                    elev_hash,
-                                    revision: rev,
-                                    mesh: Arc::clone(&arc),
-                                },
-                            );
-                            arc
-                        }
-                    } else {
-                        stats.mesh_cache_misses += 1;
-                        let rev = self.next_revision;
-                        self.next_revision += 1;
-                        let skirt_depth =
-                            compute_adaptive_skirt_depth(bounds, elevation_range(elev));
-                        let mut built = build_tile_local_rtc_mesh(
-                            tile,
-                            bounds,
-                            grid,
-                            elev,
-                            tile,
-                            with_skirts,
-                            skirt_depth,
-                            rev,
-                            key_id.face,
-                        );
-                        built.key = key_id;
-                        let arc = Arc::new(built);
-                        self.meshes.insert(
-                            (key_id, grid, with_skirts),
-                            CachedMeshEntry {
-                                elev_hash,
-                                revision: rev,
-                                mesh: Arc::clone(&arc),
-                            },
-                        );
-                        arc
-                    };
+                    let mesh = self.ensure_tile_mesh(
+                        tile,
+                        key_id,
+                        bounds,
+                        grid,
+                        with_skirts,
+                        elev,
+                        elev_hash,
+                        morph,
+                        morph_sig,
+                        &mut stats,
+                    );
 
                     if seen_mesh_keys.insert(mesh.key) {
                         meshes_out.push(Arc::clone(&mesh));
@@ -631,41 +635,59 @@ impl RetainedTerrainBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_and_insert_leaf(
+    fn ensure_tile_mesh(
         &mut self,
-        leaf: TileKey,
+        tile: TileKey,
         key_id: TileKeyId,
+        bounds: PatchBounds,
         grid: u32,
         with_skirts: bool,
         elev: Option<&TileElevation>,
         elev_hash: u64,
+        morph: SurfaceMorphParams,
+        morph_sig: u64,
         stats: &mut RetainedBuildStats,
     ) -> Arc<RetainedTileMesh> {
+        if let Some(cached) = self.meshes.get(&(key_id, grid, with_skirts)) {
+            if cached.elev_hash == elev_hash && cached.morph_sig == morph_sig {
+                stats.mesh_cache_hits += 1;
+                return Arc::clone(&cached.mesh);
+            }
+        }
         stats.mesh_cache_misses += 1;
-        let rev = self.next_revision;
-        self.next_revision += 1;
-        let bounds = tile_bounds(leaf);
+        let rev = match self.meshes.get(&(key_id, grid, with_skirts)) {
+            Some(c) => c.revision + 1,
+            None => {
+                let r = self.next_revision;
+                self.next_revision += 1;
+                r
+            }
+        };
         let skirt_depth = compute_adaptive_skirt_depth(bounds, elevation_range(elev));
-        let built = Arc::new(build_tile_local_rtc_mesh(
-            leaf,
+        let mut built = build_tile_local_rtc_mesh_morphed(
+            tile,
             bounds,
             grid,
             elev,
-            leaf,
+            tile,
             with_skirts,
             skirt_depth,
             rev,
-            0,
-        ));
+            key_id.face,
+            morph,
+        );
+        built.key = key_id;
+        let arc = Arc::new(built);
         self.meshes.insert(
             (key_id, grid, with_skirts),
             CachedMeshEntry {
                 elev_hash,
+                morph_sig,
                 revision: rev,
-                mesh: Arc::clone(&built),
+                mesh: Arc::clone(&arc),
             },
         );
-        built
+        arc
     }
 }
 
@@ -848,11 +870,15 @@ impl Drop for EarthTileWorker {
     }
 }
 
-/// High-frequency retained 3D globe controller pairing O(1) GPU camera updates with background LOD streaming.
+/// High-frequency retained 3D/2D globe controller pairing O(1) GPU camera updates with
+/// background LOD streaming, seamless ground-proximity 2.5D flattening, and smooth 3D/2D morphs.
 pub struct EarthViewport {
     retained: RetainedScene3D,
     worker: EarthTileWorker,
     input: EarthInput,
+    target_morph: f32,
+    linear_morph: f32,
+    transition_duration_s: f64,
     stopped: Arc<AtomicBool>,
 }
 
@@ -867,6 +893,7 @@ impl EarthViewport {
         source: Box<dyn TileSource + Send>,
         wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
+        let initial_morph = input.low_level_state().map_2d_morph;
         let cam_uniforms = RetainedTerrainBuilder::camera_from_input(input);
         let retained = RetainedScene3D::new(cam_uniforms);
         let mut worker = EarthTileWorker::spawn(retained.clone(), source, wakeup);
@@ -875,6 +902,9 @@ impl EarthViewport {
             retained,
             worker,
             input: input.clone(),
+            target_morph: initial_morph,
+            linear_morph: initial_morph,
+            transition_duration_s: 0.45,
             stopped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -882,6 +912,86 @@ impl EarthViewport {
     #[inline]
     pub fn retained_scene(&self) -> RetainedScene3D {
         self.retained.clone()
+    }
+
+    /// Returns the high-level view mode (`Mode3D` or `Mode2D`).
+    #[inline]
+    pub fn view_mode(&self) -> EarthViewMode {
+        self.input.view_mode
+    }
+
+    /// Returns the low-level internal surface regime and blend weights (`local_25d_blend`, `map_2d_morph`).
+    #[inline]
+    pub fn low_level_state(&self) -> EarthLowLevelState {
+        self.input.low_level_state()
+    }
+
+    /// Programmatically initiates a smooth animated transition between `Mode3D` (with automatic
+    /// seamless 2.5D ground transition) and `Mode2D`.
+    pub fn set_view_mode(&mut self, mode: EarthViewMode) {
+        self.input.view_mode = mode;
+        self.target_morph = match mode {
+            EarthViewMode::Mode3D => 0.0,
+            EarthViewMode::Mode2D => 1.0,
+        };
+    }
+
+    /// Programmatically switches between `Mode3D` and `Mode2D` immediately without animation.
+    pub fn set_view_mode_immediate(&mut self, mode: EarthViewMode) {
+        self.input.view_mode = mode;
+        let val = match mode {
+            EarthViewMode::Mode3D => 0.0,
+            EarthViewMode::Mode2D => 1.0,
+        };
+        self.target_morph = val;
+        self.linear_morph = val;
+        self.input.view_morph = val;
+        let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+        self.retained.update_camera(cam_u);
+        if !self.stopped.load(Ordering::Relaxed) {
+            self.worker.request_update(self.input.clone());
+        }
+    }
+
+    /// Returns `true` while a programmatic 3D <-> 2D morph transition is still in progress.
+    #[inline]
+    pub fn is_transitioning(&self) -> bool {
+        (self.linear_morph - self.target_morph).abs() > 1e-4
+    }
+
+    /// Advances any active programmatic 3D <-> 2D transition by `dt_s` seconds.
+    ///
+    /// Returns `true` if a frame update was produced.
+    pub fn step_transition(&mut self, dt_s: f64) -> bool {
+        let diff = self.target_morph - self.linear_morph;
+        if diff.abs() <= 1e-4 {
+            if (self.input.view_morph - self.target_morph).abs() > 1e-4 {
+                self.linear_morph = self.target_morph;
+                self.input.view_morph = self.target_morph;
+                let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+                self.retained.update_camera(cam_u);
+                if !self.stopped.load(Ordering::Relaxed) {
+                    self.worker.request_update(self.input.clone());
+                }
+                return true;
+            }
+            return false;
+        }
+        let step = (dt_s.max(0.001) / self.transition_duration_s.max(0.05)) as f32;
+        if diff > 0.0 {
+            self.linear_morph = (self.linear_morph + step).min(self.target_morph);
+        } else {
+            self.linear_morph = (self.linear_morph - step).max(self.target_morph);
+        }
+        let t = self.linear_morph.clamp(0.0, 1.0);
+        // Cubic Hermite ease-in-out
+        self.input.view_morph = t * t * (3.0 - 2.0 * t);
+        let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
+        self.retained.update_camera(cam_u);
+        if !self.stopped.load(Ordering::Relaxed) {
+            self.worker.request_update(self.input.clone());
+        }
+        true
     }
 
     /// Updates camera uniforms in O(1) (`camera_generation += 1`) with zero mesh/DOM/layout rebuild,
@@ -900,6 +1010,9 @@ impl EarthViewport {
     /// Updates full [`EarthInput`] configuration (`layers`, `surface_mode`, `camera`, `viewport`, etc.).
     pub fn update_input(&mut self, input: &EarthInput) {
         self.input = input.clone();
+        let target = self.input.low_level_state().map_2d_morph;
+        self.target_morph = target;
+        self.linear_morph = target;
         let cam_u = RetainedTerrainBuilder::camera_from_input(&self.input);
         self.retained.update_camera(cam_u);
         if !self.stopped.load(Ordering::Relaxed) {

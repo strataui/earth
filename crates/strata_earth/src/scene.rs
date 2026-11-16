@@ -1,8 +1,7 @@
 //! Frame assembly: turn an [`EarthInput`] into a renderer-ready scene.
 
 use crate::geodesy::{
-    geodetic_to_ecef, resolve_tile_imagery, traverse_quadtree_lod, EarthCamera, Geodetic, TileKey,
-    TileTextureResolution,
+    geodetic_to_ecef, resolve_tile_imagery, EarthCamera, Geodetic, TileKey, TileTextureResolution,
 };
 pub use crate::geodesy::{tile_bounds, PatchBounds};
 use crate::tiles::{TextureSlot, TileRegistry, TileSource};
@@ -53,7 +52,33 @@ pub struct EntityMarker {
     pub color: Color,
 }
 
-/// Surface geometry mode.
+/// High-level view mode exposed to application callers.
+///
+/// Inside [`EarthViewMode::Mode3D`], `strata_earth` seamlessly blends from curved
+/// WGS84 globe geometry down to a flat local 2.5D tangent plane when approaching
+/// the ground; inspectable via the low-level attribute ([`EarthLowLevelState`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EarthViewMode {
+    /// 3D WGS84 globe with automatic seamless 2.5D flattening near ground level.
+    #[default]
+    Mode3D,
+    /// Flat 2D map plane (programmatically morphed smoothly from/to 3D).
+    Mode2D,
+}
+
+/// Low-level internal surface state inside 3D/2D rendering.
+///
+/// Exposed for diagnostics or explicit low-level override via [`EarthInput::low_level_surface_override`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EarthLowLevelState {
+    pub active_surface_mode: SurfaceMode,
+    /// Seamless 3D-to-2.5D ground-proximity flatness blend (`0.0` = curved 3D, `1.0` = local 2.5D plane).
+    pub local_25d_blend: f32,
+    /// Smooth 3D-to-2D map morph progress (`0.0` = 3D/2.5D, `1.0` = flattened 2D map).
+    pub map_2d_morph: f32,
+}
+
+/// Low-level surface geometry mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SurfaceMode {
     /// 3x3 planar terrain patches tangential to the camera focus point (default).
@@ -70,6 +95,14 @@ pub enum SurfaceMode {
 pub struct EarthInput {
     pub camera: EarthCamera,
     pub viewport: Rect,
+    /// High-level view mode (`Mode3D` or `Mode2D`).
+    pub view_mode: EarthViewMode,
+    /// Programmatic transition morph factor (`0.0` = 3D, `1.0` = 2D map).
+    pub view_morph: f32,
+    /// Enables seamless transition between curved 3D globe and flat 2.5D tangent plane near ground.
+    pub seamless_25d: bool,
+    /// Tile latitude projection (`WebMercator` default for standard Slippy/XYZ tiles).
+    pub tile_projection: crate::geodesy::TileProjection,
     /// Simulation time in Unix seconds, used for sun and moon direction.
     pub sim_time_unix_s: f64,
     /// Cloud coverage, 0..=1.
@@ -88,6 +121,8 @@ pub struct EarthInput {
     pub markers: Vec<EntityMarker>,
     /// Geometry mode for surface rendering.
     pub surface_mode: SurfaceMode,
+    /// Low-level attribute allowing explicit internal surface regime override/inspection.
+    pub low_level_surface_override: Option<SurfaceMode>,
     /// Target Screen-Space Error threshold in pixels for quadtree subdivision.
     pub sse_threshold: f64,
     /// Whether to generate adaptive terrain skirts around tile borders to eliminate LOD cracks.
@@ -101,11 +136,50 @@ pub struct EarthInput {
     pub fallback_tint: Color,
 }
 
+impl EarthInput {
+    /// Returns the effective internal [`SurfaceMode`] respecting [`Self::low_level_surface_override`].
+    #[inline]
+    pub fn effective_surface_mode(&self) -> SurfaceMode {
+        self.low_level_surface_override.unwrap_or(self.surface_mode)
+    }
+
+    /// Computes the current low-level internal surface state (3D vs seamless 2.5D vs 2D morph).
+    pub fn low_level_state(&self) -> EarthLowLevelState {
+        let mode = self.effective_surface_mode();
+        let map_2d_morph = if self.view_morph > 0.0 {
+            self.view_morph.clamp(0.0, 1.0)
+        } else {
+            match self.view_mode {
+                EarthViewMode::Mode3D => 0.0,
+                EarthViewMode::Mode2D => 1.0,
+            }
+        };
+        let local_25d_blend = if !self.seamless_25d {
+            if mode == SurfaceMode::FlatPatches {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            crate::geodesy::compute_seamless_25d_blend(self.camera.altitude_m())
+        };
+        EarthLowLevelState {
+            active_surface_mode: mode,
+            local_25d_blend,
+            map_2d_morph,
+        }
+    }
+}
+
 impl Default for EarthInput {
     fn default() -> Self {
         Self {
             camera: EarthCamera::default(),
             viewport: Rect::new(0.0, 0.0, 1440.0, 900.0),
+            view_mode: EarthViewMode::Mode3D,
+            view_morph: 0.0,
+            seamless_25d: true,
+            tile_projection: crate::geodesy::TileProjection::WebMercator,
             sim_time_unix_s: 0.0,
             cloud_cover: 0.0,
             daylight: 1.0,
@@ -116,6 +190,7 @@ impl Default for EarthInput {
             patch_scale: 0.25,
             markers: Vec::new(),
             surface_mode: SurfaceMode::default(),
+            low_level_surface_override: None,
             sse_threshold: 4.0,
             terrain_skirts: None,
             fallback_tint: Color::rgba(128, 128, 128, 255),
@@ -137,6 +212,20 @@ pub struct FrameStats {
     pub draw_calls: usize,
 }
 
+type RetainedLeafSig = (
+    SurfaceMode,
+    u32,
+    u8,
+    f64,
+    bool,
+    crate::geodesy::TileProjection,
+    u32,
+    u32,
+    i64,
+    i64,
+    Vec<TileKey>,
+);
+
 /// The plugin's reusable frame builder.
 ///
 /// One instance is held by the host and reused every frame so mesh buffers and
@@ -157,7 +246,7 @@ pub struct EarthScene {
     retained_handle: strata_render::scene3d::RetainedScene3D,
     retained_geom_rev: u64,
     last_retained_stats: crate::worker::RetainedBuildStats,
-    last_retained_leaves: Option<(SurfaceMode, u32, u8, f64, bool, Vec<TileKey>)>,
+    last_retained_leaves: Option<RetainedLeafSig>,
 }
 
 impl Default for EarthScene {
@@ -319,20 +408,36 @@ impl EarthScene {
         self.buildings.set_origin(origin);
 
         if input.layers.terrain {
+            let effective_mode = input.effective_surface_mode();
             let with_skirts = input
                 .terrain_skirts
-                .unwrap_or(input.surface_mode == SurfaceMode::QuadtreeLod);
+                .unwrap_or(effective_mode == SurfaceMode::QuadtreeLod);
 
-            match input.surface_mode {
+            fn resolve_non_flooding(
+                requested: TileKey,
+                src: &mut dyn TileSource,
+            ) -> Option<TileTextureResolution> {
+                if matches!(src.imagery(requested), Ok(Some(_))) {
+                    Some(TileTextureResolution {
+                        source: requested,
+                        exact: true,
+                        uv_rect: (0.0, 0.0, 1.0, 1.0),
+                    })
+                } else {
+                    resolve_tile_imagery(requested, |candidate| {
+                        src.peek_cached_imagery(candidate).is_some()
+                    })
+                }
+            }
+
+            match effective_mode {
                 SurfaceMode::FlatPatches => {
                     let span_deg = tile_patch_span_deg(&input.camera, input.patch_scale);
                     let bounds = surrounding_patches(input.camera.focus, span_deg);
                     for mut patch in bounds {
                         stats.tiles_requested += 1;
                         let requested = patch.requested;
-                        let resolution = resolve_tile_imagery(requested, |candidate| {
-                            matches!(source.imagery(candidate), Ok(Some(_)))
-                        });
+                        let resolution = resolve_non_flooding(requested, source);
                         if let Some(resolution) = resolution {
                             if resolution.exact {
                                 stats.tiles_exact += 1;
@@ -379,17 +484,21 @@ impl EarthScene {
                             let lon0 = -180.0 + x as f64 * lon_span;
                             let lon1 = lon0 + lon_span;
                             let key = TileKey::new(level, x, y);
-                            let bounds = PatchBounds {
-                                lon0,
-                                lon1,
-                                lat0,
-                                lat1,
+                            let bounds = if input.tile_projection
+                                == crate::geodesy::TileProjection::WebMercator
+                            {
+                                crate::geodesy::tile_bounds_mercator(key)
+                            } else {
+                                PatchBounds {
+                                    lon0,
+                                    lon1,
+                                    lat0,
+                                    lat1,
+                                }
                             };
                             stats.tiles_requested += 1;
                             let requested = key;
-                            let resolution = resolve_tile_imagery(requested, |candidate| {
-                                matches!(source.imagery(candidate), Ok(Some(_)))
-                            });
+                            let resolution = resolve_non_flooding(requested, source);
                             if let Some(resolution) = resolution {
                                 if resolution.exact {
                                     stats.tiles_exact += 1;
@@ -420,26 +529,32 @@ impl EarthScene {
                 }
                 SurfaceMode::QuadtreeLod => {
                     let mut leaves = Vec::new();
-                    traverse_quadtree_lod(
-                        placement.eye,
-                        placement.aim,
-                        placement.fov_y_deg,
-                        aspect as f64,
-                        input.viewport.height as f64,
+                    let horizon_cull = input.low_level_state().map_2d_morph < 0.15;
+                    let raw_leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_options(
+                        &input.camera,
+                        input.viewport.width.max(1.0) as f64,
+                        input.viewport.height.max(1.0) as f64,
                         input.sse_threshold.max(0.5),
                         input.max_tile_level,
-                        input.tile_grid,
-                        |key, bounds| {
-                            leaves.push((key, bounds));
-                        },
+                        input.tile_grid.max(2),
+                        horizon_cull,
+                        crate::geodesy::MAX_QUADTREE_LEAVES,
                     );
+                    for key in raw_leaves {
+                        let bounds = if input.tile_projection
+                            == crate::geodesy::TileProjection::WebMercator
+                        {
+                            crate::geodesy::tile_bounds_mercator(key)
+                        } else {
+                            tile_bounds(key)
+                        };
+                        leaves.push((key, bounds));
+                    }
 
                     for (key, bounds) in leaves {
                         stats.tiles_requested += 1;
                         let requested = key;
-                        let resolution = resolve_tile_imagery(requested, |candidate| {
-                            matches!(source.imagery(candidate), Ok(Some(_)))
-                        });
+                        let resolution = resolve_non_flooding(requested, source);
                         if let Some(res) = resolution {
                             if res.exact {
                                 stats.tiles_exact += 1;
@@ -616,33 +731,53 @@ impl EarthScene {
     /// remain identical, and skips CPU [`MeshBuilder`] construction altogether.
     pub fn build_retained(&mut self, input: &EarthInput, source: &mut dyn TileSource) {
         let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
-        if input.layers.terrain && input.surface_mode == SurfaceMode::QuadtreeLod {
-            let leaves = crate::geodesy::traverse_quadtree_lod_frustum6(
+        let effective_mode = input.effective_surface_mode();
+        let low_state = input.low_level_state();
+        let flat_q = (low_state.local_25d_blend * 1024.0).round() as u32;
+        let morph_q = (low_state.map_2d_morph * 1024.0).round() as u32;
+        let (focus_lat_q, focus_lon_q) = if flat_q > 0 {
+            (
+                (input.camera.focus.lat_deg * 1e5).round() as i64,
+                (input.camera.focus.lon_deg * 1e5).round() as i64,
+            )
+        } else {
+            (0, 0)
+        };
+        if input.layers.terrain && effective_mode == SurfaceMode::QuadtreeLod {
+            let leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_options(
                 &input.camera,
                 input.viewport.width.max(1.0) as f64,
                 input.viewport.height.max(1.0) as f64,
                 input.sse_threshold,
                 input.max_tile_level,
                 input.tile_grid.max(2),
+                low_state.map_2d_morph < 0.15,
+                crate::geodesy::MAX_QUADTREE_LEAVES,
             );
             let with_skirts = input.terrain_skirts.unwrap_or(true);
             let sig = (
-                input.surface_mode,
+                effective_mode,
                 input.tile_grid.max(2),
                 input.max_tile_level,
                 input.sse_threshold,
                 with_skirts,
+                input.tile_projection,
+                flat_q,
+                morph_q,
+                focus_lat_q,
+                focus_lon_q,
                 leaves,
             );
             if self.last_retained_leaves.as_ref() == Some(&sig)
+                && self.last_retained_stats.ancestor_fallbacks == 0
                 && self.retained_handle.snapshot_terrain().is_some()
             {
                 self.retained_handle.update_camera(cam_u);
                 self.last_retained_stats = crate::worker::RetainedBuildStats {
-                    visible_tiles: sig.5.len(),
-                    mesh_cache_hits: sig.5.len(),
+                    visible_tiles: sig.10.len(),
+                    mesh_cache_hits: sig.10.len(),
                     mesh_cache_misses: 0,
-                    texture_cache_hits: sig.5.len(),
+                    texture_cache_hits: sig.10.len(),
                     texture_cache_misses: 0,
                     ancestor_fallbacks: 0,
                 };
@@ -1324,6 +1459,270 @@ impl BuildingSource for MemoryBuildingSource {
             .filter(|f| f.lat >= lat_lo && f.lat < lat_hi && f.lon >= lon_lo && f.lon < lon_hi)
             .collect()
     }
+}
+
+/// Asynchronous non-blocking [`BuildingSource`] streaming real-world 3D building footprints
+/// from OpenStreetMap Overpass JSON endpoints (with pluggable [`crate::tiles::HttpTransport`]).
+pub struct NetworkBuildingSource {
+    endpoint_url: String,
+    min_fetch_level: u8,
+    transport: std::sync::Arc<dyn crate::tiles::HttpTransport>,
+    cache: std::collections::HashMap<TileKey, Vec<BuildingFootprint>>,
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<TileKey>>>,
+    results_rx: std::sync::mpsc::Receiver<(TileKey, Vec<BuildingFootprint>)>,
+    task_tx: std::sync::mpsc::Sender<(TileKey, PatchBounds, String)>,
+}
+
+impl std::fmt::Debug for NetworkBuildingSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkBuildingSource")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("min_fetch_level", &self.min_fetch_level)
+            .field("cached_tiles", &self.cache.len())
+            .finish()
+    }
+}
+
+impl Default for NetworkBuildingSource {
+    fn default() -> Self {
+        Self::overpass()
+    }
+}
+
+impl NetworkBuildingSource {
+    /// Creates a building streamer querying the public OpenStreetMap Overpass API.
+    pub fn overpass() -> Self {
+        Self::with_endpoint(
+            "https://overpass-api.de/api/interpreter",
+            std::sync::Arc::new(crate::tiles::StandardHttpTransport::new()),
+        )
+    }
+
+    /// Creates a building streamer targeting a custom Overpass-compatible endpoint and transport.
+    pub fn with_endpoint(
+        endpoint_url: impl Into<String>,
+        transport: std::sync::Arc<dyn crate::tiles::HttpTransport>,
+    ) -> Self {
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<(TileKey, PatchBounds, String)>();
+        let (results_tx, results_rx) =
+            std::sync::mpsc::channel::<(TileKey, Vec<BuildingFootprint>)>();
+        let worker_transport = std::sync::Arc::clone(&transport);
+        std::thread::Builder::new()
+            .name("strata-building-fetcher".to_string())
+            .spawn(move || {
+                while let Ok((key, bounds, endpoint)) = task_rx.recv() {
+                    let buildings =
+                        Self::fetch_for_bounds(worker_transport.as_ref(), &endpoint, bounds);
+                    let _ = results_tx.send((key, buildings));
+                }
+            })
+            .expect("failed to spawn strata-building-fetcher thread");
+
+        Self {
+            endpoint_url: endpoint_url.into(),
+            min_fetch_level: 14,
+            transport,
+            cache: std::collections::HashMap::new(),
+            pending: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            results_rx,
+            task_tx,
+        }
+    }
+
+    pub fn with_min_fetch_level(mut self, level: u8) -> Self {
+        self.min_fetch_level = level;
+        self
+    }
+
+    pub fn cached_tile_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Synchronously fetches and caches building footprints for `key` / `bounds`.
+    pub fn fetch_sync(&mut self, key: TileKey, bounds: PatchBounds) -> Vec<BuildingFootprint> {
+        let list = Self::fetch_for_bounds(self.transport.as_ref(), &self.endpoint_url, bounds);
+        self.cache.insert(key, list.clone());
+        list
+    }
+
+    fn build_query_url(endpoint: &str, bounds: PatchBounds) -> String {
+        let s = bounds.lat0.min(bounds.lat1);
+        let n = bounds.lat0.max(bounds.lat1);
+        let w = bounds.lon0.min(bounds.lon1);
+        let e = bounds.lon0.max(bounds.lon1);
+        let query = format!(
+            "[out:json][timeout:10];(way[\"building\"]({s:.5},{w:.5},{n:.5},{e:.5}););out body;>;out skel qt;"
+        );
+        let mut encoded = String::with_capacity(query.len() * 2);
+        for b in query.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    encoded.push(b as char);
+                }
+                _ => {
+                    use std::fmt::Write;
+                    let _ = write!(encoded, "%{b:02X}");
+                }
+            }
+        }
+        if endpoint.contains('?') {
+            format!("{endpoint}&data={encoded}")
+        } else {
+            format!("{endpoint}?data={encoded}")
+        }
+    }
+
+    fn fetch_for_bounds(
+        transport: &dyn crate::tiles::HttpTransport,
+        endpoint: &str,
+        bounds: PatchBounds,
+    ) -> Vec<BuildingFootprint> {
+        let url = Self::build_query_url(endpoint, bounds);
+        let Ok(bytes) = transport.fetch(&url) else {
+            return Vec::new();
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Vec::new();
+        };
+        parse_overpass_buildings(text)
+    }
+
+    fn poll_completed(&mut self) {
+        while let Ok((key, buildings)) = self.results_rx.try_recv() {
+            if let Ok(mut guard) = self.pending.lock() {
+                guard.remove(&key);
+            }
+            if self.cache.len() > 256 {
+                self.cache.clear();
+            }
+            self.cache.insert(key, buildings);
+        }
+    }
+}
+
+impl BuildingSource for NetworkBuildingSource {
+    fn buildings(&mut self, key: TileKey, bounds: PatchBounds) -> Vec<BuildingFootprint> {
+        self.poll_completed();
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+        if key.level < self.min_fetch_level {
+            return Vec::new();
+        }
+        let mut enqueue = false;
+        if let Ok(mut pending) = self.pending.lock() {
+            if !pending.contains(&key) {
+                pending.insert(key);
+                enqueue = true;
+            }
+        }
+        if enqueue {
+            let _ = self.task_tx.send((key, bounds, self.endpoint_url.clone()));
+        }
+        Vec::new()
+    }
+}
+
+/// Parses OpenStreetMap Overpass API JSON (`elements` array of nodes and building ways)
+/// into extruded [`BuildingFootprint`] entries.
+pub fn parse_overpass_buildings(json_text: &str) -> Vec<BuildingFootprint> {
+    use crate::json::Json;
+    let Ok(root) = Json::parse(json_text) else {
+        return Vec::new();
+    };
+    let Json::Object(top) = root else {
+        return Vec::new();
+    };
+    let Some(Json::Array(elements)) = top.iter().find(|(k, _)| k == "elements").map(|(_, v)| v)
+    else {
+        return Vec::new();
+    };
+
+    fn get_field<'a>(
+        entries: &'a [(String, crate::json::Json)],
+        key: &str,
+    ) -> Option<&'a crate::json::Json> {
+        entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+    let as_f64 = |val: &Json| -> Option<f64> {
+        match val {
+            Json::Number(n) => Some(*n),
+            Json::String(s) => s.trim().trim_end_matches('m').trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+
+    let mut nodes: std::collections::HashMap<i64, (f64, f64)> = std::collections::HashMap::new();
+    for el in elements {
+        let Json::Object(obj) = el else { continue };
+        if matches!(get_field(obj, "type"), Some(Json::String(t)) if t == "node") {
+            if let (Some(Json::Number(id)), Some(Json::Number(lat)), Some(Json::Number(lon))) = (
+                get_field(obj, "id"),
+                get_field(obj, "lat"),
+                get_field(obj, "lon"),
+            ) {
+                nodes.insert(*id as i64, (*lat, *lon));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for el in elements {
+        let Json::Object(obj) = el else { continue };
+        if !matches!(get_field(obj, "type"), Some(Json::String(t)) if t == "way") {
+            continue;
+        }
+        let Some(Json::Object(tags)) = get_field(obj, "tags") else {
+            continue;
+        };
+        if get_field(tags, "building").is_none() {
+            continue;
+        }
+        let Some(Json::Array(node_refs)) = get_field(obj, "nodes") else {
+            continue;
+        };
+        let mut lat_min = f64::INFINITY;
+        let mut lat_max = f64::NEG_INFINITY;
+        let mut lon_min = f64::INFINITY;
+        let mut lon_max = f64::NEG_INFINITY;
+        let mut count = 0usize;
+        for nr in node_refs {
+            if let Json::Number(nid) = nr {
+                if let Some(&(lat, lon)) = nodes.get(&(*nid as i64)) {
+                    lat_min = lat_min.min(lat);
+                    lat_max = lat_max.max(lat);
+                    lon_min = lon_min.min(lon);
+                    lon_max = lon_max.max(lon);
+                    count += 1;
+                }
+            }
+        }
+        if count < 3 || !lat_min.is_finite() || !lon_min.is_finite() {
+            continue;
+        }
+        let center_lat = (lat_min + lat_max) * 0.5;
+        let center_lon = (lon_min + lon_max) * 0.5;
+        let meters_per_deg_lat = 111_320.0;
+        let meters_per_deg_lon = 111_320.0 * center_lat.to_radians().cos().abs().max(0.2);
+        let size_e_m = ((lon_max - lon_min) * meters_per_deg_lon).clamp(4.0, 250.0) as f32;
+        let size_n_m = ((lat_max - lat_min) * meters_per_deg_lat).clamp(4.0, 250.0) as f32;
+        let height_m = get_field(tags, "height")
+            .and_then(as_f64)
+            .or_else(|| {
+                get_field(tags, "building:levels")
+                    .and_then(as_f64)
+                    .map(|lv| lv * 3.2)
+            })
+            .unwrap_or(12.0)
+            .clamp(3.0, 600.0) as f32;
+        out.push(BuildingFootprint::new(
+            center_lat,
+            center_lon,
+            (size_e_m, size_n_m),
+            height_m,
+        ));
+    }
+    out
 }
 
 fn push_footprints(

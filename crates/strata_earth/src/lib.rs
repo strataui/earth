@@ -15,6 +15,7 @@
 //! - Mesh rebuilds reuse buffers; steady-state frames do not allocate.
 
 pub mod acceptance;
+pub mod basemap;
 pub mod descriptor;
 pub mod geodesy;
 pub mod json;
@@ -25,6 +26,7 @@ pub mod worker;
 pub use acceptance::{
     evaluate as evaluate_acceptance, AcceptanceCriteria, AcceptanceReport, PixelDelta,
 };
+pub use basemap::{embedded_base_tile, EarthDefaultTileSource, EmbeddedBaseMapSource};
 pub use descriptor::{
     compare, replay, CameraDelta, DeltaSummary, DescriptorCamera, DescriptorCelestial,
     DescriptorClouds, DescriptorDelta, DescriptorMarker, DescriptorPatch, DescriptorRing,
@@ -32,28 +34,32 @@ pub use descriptor::{
     TileSupply, DESCRIPTOR_FORMAT, DESCRIPTOR_VERSION, DESCRIPTOR_VERSION_V1,
 };
 pub use geodesy::{
-    build_tile_local_rtc_mesh, clamp_latitude, compute_tile_sse, depth_range, ecef_to_geodetic,
-    geodetic_to_ecef, horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum,
-    level_for_altitude, pick_geodetic, raycast_ellipsoid, resolve_tile_imagery,
+    build_tile_local_rtc_mesh, build_tile_local_rtc_mesh_morphed, clamp_latitude,
+    compute_seamless_25d_blend, compute_tile_sse, depth_range, ecef_to_geodetic, geodetic_to_ecef,
+    horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum, level_for_altitude,
+    mercator_gy_to_lat_deg, pick_geodetic, raycast_ellipsoid, resolve_tile_imagery,
     retained_camera_uniforms, rte_gpu_relative_position, rte_relative_position_f32, screen_to_ray,
     split_dvec3_to_high_low, split_f64_to_high_low, tile_bounding_sphere, tile_bounds,
-    traverse_quadtree_lod, traverse_quadtree_lod_frustum6, wrap_longitude, CameraPlacement,
-    EarthCamera, Frustum6, Geodetic, LocalFrame, RteEyeUniforms, TileKey, TileTextureResolution,
-    GLOBE_ALTITUDE_M,
+    tile_bounds_mercator, traverse_quadtree_lod, traverse_quadtree_lod_frustum6, wrap_longitude,
+    CameraPlacement, EarthCamera, Frustum6, Geodetic, LocalFrame, RteEyeUniforms,
+    SurfaceMorphParams, TileKey, TileProjection, TileTextureResolution, GLOBE_ALTITUDE_M,
+    MAX_QUADTREE_LEAVES,
 };
 pub use scene::{
-    building_triangle_count, celestial_bodies, compute_adaptive_skirt_depth, requested_tile,
-    sky_gradient, surrounding_patches, surrounding_tiles, terrain_skirt_triangle_count,
-    terrain_triangle_count, terrain_triangle_count_with_skirts, tile_patch_span_deg,
-    BuildingFootprint, BuildingSource, EarthInput, EarthScene, EntityMarker, FrameStats,
-    LayerToggles, MemoryBuildingSource, PatchBounds, PatchFrame, SurfaceMode,
+    building_triangle_count, celestial_bodies, compute_adaptive_skirt_depth,
+    parse_overpass_buildings, requested_tile, sky_gradient, surrounding_patches, surrounding_tiles,
+    terrain_skirt_triangle_count, terrain_triangle_count, terrain_triangle_count_with_skirts,
+    tile_patch_span_deg, BuildingFootprint, BuildingSource, EarthInput, EarthLowLevelState,
+    EarthScene, EarthViewMode, EntityMarker, FrameStats, LayerToggles, MemoryBuildingSource,
+    NetworkBuildingSource, PatchBounds, PatchFrame, SurfaceMode,
 };
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{
-    decode_png_to_rgba, decode_terrain_rgb, format_slippy_url, tile_sampler, DirectoryTileSource,
-    HttpTransport, LruTileCache, LruTileCacheSource, MemoryTileSource, MockHttpTransport,
-    NetworkTileSource, NetworkTileStats, StandardHttpTransport, TextureSlot, TileElevation,
-    TileError, TileImage, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
+    decode_png_to_rgba, decode_terrain_rgb, decode_terrarium, format_slippy_url, tile_sampler,
+    DirectoryTileSource, ElevationEncoding, HttpTransport, LruTileCache, LruTileCacheSource,
+    MemoryTileSource, MockHttpTransport, NetworkTileSource, NetworkTileStats,
+    StandardHttpTransport, TextureSlot, TileElevation, TileError, TileImage, TileRegistry,
+    TileSource, DEFAULT_MAX_CACHE_BYTES,
 };
 pub use worker::{
     EarthTileWorker, EarthViewport, EarthViewportStats, RetainedBuildStats, RetainedTerrainBuilder,

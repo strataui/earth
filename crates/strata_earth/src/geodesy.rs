@@ -515,6 +515,36 @@ pub struct PatchBounds {
 }
 
 /// Geographic bounds of a tile at its own level.
+/// Tile latitude projection scheme for quadtree tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TileProjection {
+    /// Standard Slippy/XYZ Web Mercator (`EPSG:3857`) used by OSM, ArcGIS, Mapbox, NASA GIBS 3857, and Terrarium DEM.
+    #[default]
+    WebMercator,
+    /// Equirectangular geographic degrees (`EPSG:4326`).
+    Geographic4326,
+}
+
+/// Converts normalized global Web Mercator Y (`0.0` north .. `1.0` south) into latitude in degrees.
+///
+/// Polar world edges (`gy <= 0` or `gy >= 1`) close smoothly to `±89.9°` so the WGS84 globe has
+/// no open polar holes while all interior rows follow exact inverse Web Mercator latitude.
+#[inline]
+pub fn mercator_gy_to_lat_deg(gy: f64) -> f64 {
+    if gy <= 0.0 {
+        return 89.9;
+    }
+    if gy >= 1.0 {
+        return -89.9;
+    }
+    (std::f64::consts::PI * (1.0 - 2.0 * gy))
+        .sinh()
+        .atan()
+        .to_degrees()
+        .clamp(-89.9, 89.9)
+}
+
+/// Returns the geographic bounds of `key` under Plate Carree (`EPSG:4326`) subdivision.
 pub fn tile_bounds(key: TileKey) -> PatchBounds {
     let per_axis = key.tiles_per_axis() as f64;
     let lon_span = 360.0 / per_axis;
@@ -526,6 +556,57 @@ pub fn tile_bounds(key: TileKey) -> PatchBounds {
         lon1: lon0 + lon_span,
         lat0: lat1 - lat_span,
         lat1,
+    }
+}
+
+/// Returns the geographic bounds of `key` under standard Web Mercator (`EPSG:3857`) subdivision.
+pub fn tile_bounds_mercator(key: TileKey) -> PatchBounds {
+    let per_axis = key.tiles_per_axis() as f64;
+    let lon_span = 360.0 / per_axis;
+    let lon0 = key.x as f64 * lon_span - 180.0;
+    let gy0 = (key.y as f64) / per_axis;
+    let gy1 = ((key.y + 1) as f64) / per_axis;
+    PatchBounds {
+        lon0,
+        lon1: lon0 + lon_span,
+        lat0: mercator_gy_to_lat_deg(gy1),
+        lat1: mercator_gy_to_lat_deg(gy0),
+    }
+}
+
+/// Computes the seamless 3D-globe -> 2.5D-ground-plane blend (`0.0..=1.0`) from camera altitude.
+///
+/// Above 250 km: pure curved WGS84 globe (`0.0`).
+/// Between 250 km and 20 km: smooth C1 Hermite ramp.
+/// Below 20 km: local 2.5D tangent plane (`1.0`).
+#[inline]
+pub fn compute_seamless_25d_blend(altitude_m: f64) -> f32 {
+    const START_M: f64 = 250_000.0;
+    const END_M: f64 = 20_000.0;
+    let u = ((START_M - altitude_m) / (START_M - END_M)).clamp(0.0, 1.0);
+    (u * u * (3.0 - 2.0 * u)) as f32
+}
+
+/// Parameters controlling continuous vertex morphing across 3D globe, local 2.5D ground plane,
+/// and flattened 2D map projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceMorphParams {
+    pub focus: Geodetic,
+    /// `0.0` = curved WGS84 ellipsoid, `1.0` = local/map flat plane.
+    pub flat_blend: f64,
+    /// `0.0` = preserve 3D relief & local cosine metric (2.5D), `1.0` = flat 2D map plane.
+    pub map_2d_morph: f64,
+    pub projection: TileProjection,
+}
+
+impl Default for SurfaceMorphParams {
+    fn default() -> Self {
+        Self {
+            focus: Geodetic::new(0.0, 0.0, 0.0),
+            flat_blend: 0.0,
+            map_2d_morph: 0.0,
+            projection: TileProjection::WebMercator,
+        }
     }
 }
 
@@ -935,8 +1016,39 @@ impl Frustum6 {
     }
 }
 
+/// Default hard ceiling on visible quadtree leaves emitted per frame so GPU texture atlas capacity is never exceeded.
+pub const MAX_QUADTREE_LEAVES: usize = 144;
+
+#[derive(Clone, Copy)]
+struct LodCandidate {
+    sse: f64,
+    key: TileKey,
+}
+
+impl PartialEq for LodCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for LodCandidate {}
+
+impl Ord for LodCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sse
+            .total_cmp(&other.sse)
+            .then_with(|| other.key.level.cmp(&self.key.level))
+    }
+}
+
+impl PartialOrd for LodCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Traverses the planetary quadtree using exact 6-plane frustum culling, horizon occlusion,
-/// and SSE threshold subdivision.
+/// and SSE-prioritized subdivision capped safely to [`MAX_QUADTREE_LEAVES`].
 pub fn traverse_quadtree_lod_frustum6(
     camera: &EarthCamera,
     viewport_width_px: f64,
@@ -945,41 +1057,86 @@ pub fn traverse_quadtree_lod_frustum6(
     max_level: u8,
     tile_grid: u32,
 ) -> Vec<TileKey> {
+    traverse_quadtree_lod_frustum6_with_options(
+        camera,
+        viewport_width_px,
+        viewport_height_px,
+        sse_threshold_px,
+        max_level,
+        tile_grid,
+        true,
+        MAX_QUADTREE_LEAVES,
+    )
+}
+
+/// Extended quadtree traversal with explicit horizon-cull toggle (for 2D map morph) and leaf budget.
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod_frustum6_with_options(
+    camera: &EarthCamera,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+    horizon_cull: bool,
+    max_leaves: usize,
+) -> Vec<TileKey> {
     let placement = camera.placement();
     let frustum = Frustum6::from_camera(camera, viewport_width_px, viewport_height_px);
-    let mut leaves = Vec::new();
-    let mut stack = vec![TileKey::new(0, 0, 0)];
     let threshold = sse_threshold_px.max(0.5);
+    let leaf_cap = max_leaves.max(16);
 
-    while let Some(key) = stack.pop() {
+    let eval_candidate = |key: TileKey| -> Option<LodCandidate> {
         let (center, radius) = tile_bounding_sphere(key);
-        if is_tile_horizon_culled(center, radius, placement.eye) {
-            continue;
+        if horizon_cull && is_tile_horizon_culled(center, radius, placement.eye) {
+            return None;
         }
-        if !frustum.intersects_sphere(center, radius * 1.15) {
-            continue;
+        if horizon_cull && !frustum.intersects_sphere(center, radius * 1.15) {
+            return None;
         }
-        if key.level < max_level {
-            let dist_to_eye = (center.sub(placement.eye).length() - radius).max(1.0);
-            let per_axis = key.tiles_per_axis() as f64;
-            let ground_span_m = (2.0 * std::f64::consts::PI * wgs84::A) / per_axis;
-            let sse = compute_tile_sse(
+        let dist_to_eye = (center.sub(placement.eye).length() - radius).max(1.0);
+        let per_axis = key.tiles_per_axis() as f64;
+        let ground_span_m = (2.0 * std::f64::consts::PI * wgs84::A) / per_axis;
+        let sse = if key.level < max_level {
+            compute_tile_sse(
                 ground_span_m,
                 tile_grid,
                 dist_to_eye,
                 viewport_height_px,
                 placement.fov_y_deg,
-            );
-            if sse > threshold {
-                for q in 0..4 {
-                    if let Some(child) = key.child(q) {
-                        stack.push(child);
+            )
+        } else {
+            0.0
+        };
+        Some(LodCandidate { sse, key })
+    };
+
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut leaves = Vec::new();
+    if let Some(root) = eval_candidate(TileKey::new(0, 0, 0)) {
+        heap.push(root);
+    }
+
+    while let Some(top) = heap.pop() {
+        let can_subdivide = top.key.level < max_level
+            && top.sse > threshold
+            && (leaves.len() + heap.len() + 4 <= leaf_cap || top.key.level < 2);
+        if can_subdivide {
+            let mut pushed = 0usize;
+            for q in 0..4 {
+                if let Some(child) = top.key.child(q) {
+                    if let Some(cand) = eval_candidate(child) {
+                        heap.push(cand);
+                        pushed += 1;
                     }
                 }
-                continue;
             }
+            if pushed == 0 && !horizon_cull {
+                leaves.push(top.key);
+            }
+        } else {
+            leaves.push(top.key);
         }
-        leaves.push(key);
     }
 
     leaves.sort_by(|a, b| {
@@ -1064,10 +1221,80 @@ pub fn build_tile_local_rtc_mesh(
     revision: u64,
     face: u8,
 ) -> strata_render::scene3d::RetainedTileMesh {
+    build_tile_local_rtc_mesh_morphed(
+        key,
+        bounds,
+        grid,
+        elevation,
+        elevation_tile,
+        generate_skirts,
+        skirt_depth_m,
+        revision,
+        face,
+        SurfaceMorphParams {
+            projection: TileProjection::Geographic4326,
+            ..SurfaceMorphParams::default()
+        },
+    )
+}
+
+/// Builds a tile-local RTC mesh with configurable tile projection (`WebMercator` or `Geographic4326`)
+/// and continuous vertex morphing across 3D globe, local 2.5D ground plane, and flattened 2D map.
+#[allow(clippy::too_many_arguments)]
+pub fn build_tile_local_rtc_mesh_morphed(
+    key: TileKey,
+    bounds: PatchBounds,
+    grid: u32,
+    elevation: Option<&crate::tiles::TileElevation>,
+    elevation_tile: TileKey,
+    generate_skirts: bool,
+    skirt_depth_m: f64,
+    revision: u64,
+    face: u8,
+    morph: SurfaceMorphParams,
+) -> strata_render::scene3d::RetainedTileMesh {
     let n = grid.max(2) as usize;
+    let flat_t = morph.flat_blend.clamp(0.0, 1.0);
+    let map_2d = morph.map_2d_morph.clamp(0.0, 1.0);
+    let per_axis = key.tiles_per_axis() as f64;
+    let tile_mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
+    let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
+    let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
+    let focus_ecef = geodetic_to_ecef(focus_surface);
+    let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
+    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+
+    let project_point = |lat: f64, lon: f64, height: f64| -> (DVec3, DVec3) {
+        let p_curved = geodetic_to_ecef(Geodetic::new(lat, lon, height));
+        let radial_curved = p_curved.normalize();
+        if flat_t <= 1e-6 {
+            return (p_curved, radial_curved);
+        }
+        let dlon_deg = wrap_longitude(tile_mid_lon - morph.focus.lon_deg) + (lon - tile_mid_lon);
+        let dlat_deg = lat - morph.focus.lat_deg;
+        let east_m = dlon_deg.to_radians() * wgs84::A * cos_scale;
+        let north_m = dlat_deg.to_radians() * wgs84::A;
+        let up_h = height * (1.0 - map_2d);
+        let p_flat = focus_ecef
+            .add(focus_frame.east.scale(east_m))
+            .add(focus_frame.north.scale(north_m))
+            .add(focus_frame.up.scale(up_h));
+        let p_morphed = DVec3::new(
+            p_curved.x + (p_flat.x - p_curved.x) * flat_t,
+            p_curved.y + (p_flat.y - p_curved.y) * flat_t,
+            p_curved.z + (p_flat.z - p_curved.z) * flat_t,
+        );
+        let up_morphed = DVec3::new(
+            radial_curved.x + (focus_frame.up.x - radial_curved.x) * flat_t,
+            radial_curved.y + (focus_frame.up.y - radial_curved.y) * flat_t,
+            radial_curved.z + (focus_frame.up.z - radial_curved.z) * flat_t,
+        )
+        .normalize();
+        (p_morphed, up_morphed)
+    };
+
     let mid_lat = (bounds.lat0 + bounds.lat1) * 0.5;
-    let mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
-    let center_dvec = geodetic_to_ecef(Geodetic::new(mid_lat.clamp(-89.9, 89.9), mid_lon, 0.0));
+    let (center_dvec, _) = project_point(mid_lat.clamp(-89.9, 89.9), tile_mid_lon, 0.0);
 
     let mut positions = Vec::with_capacity(n * n);
     let mut radials = Vec::with_capacity(n * n);
@@ -1075,20 +1302,39 @@ pub fn build_tile_local_rtc_mesh(
 
     for row in 0..n {
         let v = row as f64 / (n - 1) as f64;
+        let v_tex = 1.0 - v;
+        let lat_row = match morph.projection {
+            TileProjection::WebMercator if face == 0 => {
+                let gy_top = (key.y as f64 + v_tex) / per_axis;
+                mercator_gy_to_lat_deg(gy_top)
+            }
+            _ => (bounds.lat0 + (bounds.lat1 - bounds.lat0) * v).clamp(-89.9, 89.9),
+        };
         for col in 0..n {
             let u = col as f64 / (n - 1) as f64;
             let lon = bounds.lon0 + (bounds.lon1 - bounds.lon0) * u;
-            let lat = (bounds.lat0 + (bounds.lat1 - bounds.lat0) * v).clamp(-89.9, 89.9);
             let height = elevation
-                .map(|grid| {
-                    let (tu, tv) = crate::scene::uv_in_tile(elevation_tile, lat, lon);
-                    grid.sample_bilinear(tu, tv) as f64
+                .map(|elev_grid| {
+                    let (tu, tv) = if morph.projection == TileProjection::WebMercator
+                        && face == 0
+                        && key.level >= elevation_tile.level
+                    {
+                        let dl = key.level - elevation_tile.level;
+                        let scale = (1u32 << dl.min(20)) as f64;
+                        let dx = (key.x - (elevation_tile.x << dl)) as f64;
+                        let dy = (key.y - (elevation_tile.y << dl)) as f64;
+                        (((dx + u) / scale) as f32, ((dy + v_tex) / scale) as f32)
+                    } else {
+                        crate::scene::uv_in_tile(elevation_tile, lat_row, lon)
+                    };
+                    elev_grid.sample_bilinear(tu, tv) as f64
                 })
                 .unwrap_or(0.0);
-            let p = geodetic_to_ecef(Geodetic::new(lat, lon, height));
+            let (p, radial) = project_point(lat_row, lon, height);
             positions.push(p);
-            radials.push(p.normalize());
-            uvs.push([u as f32, v as f32]);
+            radials.push(radial);
+            // Texture row 0 is North (lat1 -> v = 1.0 in mesh), row H-1 is South (lat0 -> v = 0.0).
+            uvs.push([u as f32, v_tex as f32]);
         }
     }
 
