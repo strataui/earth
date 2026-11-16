@@ -158,6 +158,12 @@ pub trait TileSource {
     /// Returns the imagery for a tile, if available right now.
     fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError>;
 
+    /// Non-mutating lookup of imagery already resident in memory/embedded defaults
+    /// (must never initiate network I/O). Used when resolving loaded ancestor fallbacks.
+    fn peek_cached_imagery(&self, _key: TileKey) -> Option<TileImage> {
+        None
+    }
+
     /// Returns the elevation for a tile, if available right now.
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError>;
 }
@@ -306,6 +312,10 @@ impl MemoryTileSource {
 impl TileSource for MemoryTileSource {
     fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
         Ok(self.imagery.get(&key).cloned())
+    }
+
+    fn peek_cached_imagery(&self, key: TileKey) -> Option<TileImage> {
+        self.imagery.get(&key).cloned()
     }
 
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
@@ -742,6 +752,15 @@ impl LruTileCache {
         }
     }
 
+    /// Peeks cached imagery without updating LRU order or needing mutable access.
+    pub fn peek_imagery(&self, key: TileKey) -> Option<TileImage> {
+        let &idx = self.map.get(&TileDataKey::Imagery(key))?;
+        match self.nodes.get(idx).and_then(|n| n.as_ref())?.value {
+            CachedTileData::Imagery(ref img) => Some(img.clone()),
+            CachedTileData::Elevation(_) => None,
+        }
+    }
+
     /// Inserts imagery for `key`, evicting older entries if exceeding the byte budget.
     pub fn insert_imagery(&mut self, key: TileKey, image: TileImage) {
         self.insert(TileDataKey::Imagery(key), CachedTileData::Imagery(image));
@@ -945,6 +964,12 @@ impl<S: TileSource> TileSource for LruTileCacheSource<S> {
             self.cache.insert_imagery(key, image.clone());
         }
         Ok(result)
+    }
+
+    fn peek_cached_imagery(&self, key: TileKey) -> Option<TileImage> {
+        self.cache
+            .peek_imagery(key)
+            .or_else(|| self.inner.peek_cached_imagery(key))
     }
 
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
@@ -1228,24 +1253,53 @@ pub fn decode_terrain_rgb(width: u32, height: u32, rgba_pixels: &[u8]) -> TileEl
     }
 }
 
+/// Decodes Mapzen/AWS Terrarium PNG pixels into metric elevations.
+///
+/// Uses the standard Terrarium equation:
+/// `height = (R * 256.0 + G + B / 256.0) - 32768.0`
+pub fn decode_terrarium(width: u32, height: u32, rgba_pixels: &[u8]) -> TileElevation {
+    let count = width as usize * height as usize;
+    let mut heights_m = Vec::with_capacity(count);
+    for i in 0..count {
+        let r = rgba_pixels[i * 4] as f32;
+        let g = rgba_pixels[i * 4 + 1] as f32;
+        let b = rgba_pixels[i * 4 + 2] as f32;
+        let h = (r * 256.0 + g + b / 256.0) - 32768.0;
+        heights_m.push(h);
+    }
+    TileElevation {
+        width,
+        height,
+        heights_m,
+    }
+}
+
 /// Pluggable HTTP transport interface for tile fetching.
 pub trait HttpTransport: Send + Sync + 'static {
     fn fetch(&self, url: &str) -> Result<Vec<u8>, TileError>;
 }
 
-/// Standard production HTTP transport using system transport with curl and TCP sockets.
+/// Standard production HTTP/HTTPS transport using pure-Rust `ureq` + `rustls`.
 #[derive(Debug, Clone)]
 pub struct StandardHttpTransport {
     user_agent: String,
     timeout_ms: u64,
+    agent: ureq::Agent,
 }
 
 impl Default for StandardHttpTransport {
     fn default() -> Self {
+        let timeout_ms = 10_000;
+        let user_agent =
+            "StrataEarth/0.1 (SlippyTileStreaming; https://github.com/strataui)".to_string();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .user_agent(&user_agent)
+            .build();
         Self {
-            user_agent: "StrataEarth/0.1 (SlippyTileStreaming; https://github.com/strataui)"
-                .to_string(),
-            timeout_ms: 10_000,
+            user_agent,
+            timeout_ms,
+            agent,
         }
     }
 }
@@ -1257,67 +1311,42 @@ impl StandardHttpTransport {
 
     pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
         self.user_agent = ua.into();
+        self.agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(self.timeout_ms))
+            .user_agent(&self.user_agent)
+            .build();
         self
     }
 
     pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = timeout_ms;
+        self.agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(self.timeout_ms))
+            .user_agent(&self.user_agent)
+            .build();
         self
     }
 }
 
 impl HttpTransport for StandardHttpTransport {
     fn fetch(&self, url: &str) -> Result<Vec<u8>, TileError> {
-        // 2. Direct socket fallback for HTTP URLs
-        if let Some(stripped) = url.strip_prefix("http://") {
-            let (host_port, path) = match stripped.split_once('/') {
-                Some((h, p)) => (h, format!("/{p}")),
-                None => (stripped, "/".to_string()),
-            };
-            let addr = if host_port.contains(':') {
-                host_port.to_string()
-            } else {
-                format!("{host_port}:80")
-            };
+        let resp = self
+            .agent
+            .get(url)
+            .set(
+                "Accept",
+                "image/png,image/jpeg,image/webp,application/json,*/*",
+            )
+            .call()
+            .map_err(|e| TileError::Transport(format!("HTTP/HTTPS fetch failed for {url}: {e}")))?;
 
-            use std::io::{Read, Write};
-            use std::net::TcpStream;
-            use std::time::Duration;
-
-            let mut stream = TcpStream::connect(&addr).map_err(|e| {
-                TileError::Transport(format!("HTTP connection failed to {addr}: {e}"))
-            })?;
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(self.timeout_ms)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(self.timeout_ms)));
-
-            let req = format!(
-                "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: image/png,image/*,*/*\r\nConnection: close\r\n\r\n",
-                path, host_port, self.user_agent
-            );
-            stream
-                .write_all(req.as_bytes())
-                .map_err(|e| TileError::Transport(format!("HTTP write failed: {e}")))?;
-
-            let mut resp = Vec::new();
-            stream
-                .read_to_end(&mut resp)
-                .map_err(|e| TileError::Transport(format!("HTTP read failed: {e}")))?;
-
-            if let Some(header_end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&resp[..header_end]);
-                let status_line = headers.lines().next().unwrap_or("");
-                if !status_line.contains("200") {
-                    return Err(TileError::Transport(format!(
-                        "HTTP status not 200: {status_line}"
-                    )));
-                }
-                return Ok(resp[header_end + 4..].to_vec());
-            }
-        }
-
-        Err(TileError::Transport(format!(
-            "failed to fetch tile from {url}"
-        )))
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(32 * 1024);
+        resp.into_reader()
+            .take(32 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .map_err(|e| TileError::Transport(format!("HTTP read body failed for {url}: {e}")))?;
+        Ok(bytes)
     }
 }
 
@@ -1372,20 +1401,30 @@ pub struct NetworkTileStats {
     pub decode_errors: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElevationEncoding {
+    RawF32,
+    TerrainRgb,
+    Terrarium,
+}
+
 struct FetchTask {
     key: TileDataKey,
     url: String,
     is_elevation: bool,
-    is_terrain_rgb: bool,
+    elevation_encoding: ElevationEncoding,
     disk_cache_path: Option<PathBuf>,
 }
+
+type TileReadyCallback = Arc<dyn Fn() + Send + Sync>;
+type TileReadySlot = Arc<Mutex<Option<TileReadyCallback>>>;
 
 /// Non-blocking asynchronous network tile streaming source supporting Slippy XYZ
 /// and WMTS raster tile protocols with memory and disk LRU caching.
 pub struct NetworkTileSource {
     imagery_url_template: String,
     elevation_url_template: Option<String>,
-    elevation_is_terrain_rgb: bool,
+    elevation_encoding: ElevationEncoding,
     subdomains: Vec<String>,
     subdomain_counter: usize,
     cache: LruTileCache,
@@ -1394,6 +1433,7 @@ pub struct NetworkTileSource {
     pending: Arc<Mutex<HashSet<TileDataKey>>>,
     results_rx: Receiver<(TileDataKey, Result<CachedTileData, TileError>)>,
     task_tx: Sender<FetchTask>,
+    on_tile_ready: TileReadySlot,
     stats: NetworkTileStats,
     default_tile_size: u32,
 }
@@ -1414,6 +1454,13 @@ impl NetworkTileSource {
     /// Convenience constructor targeting standard OpenStreetMap tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`).
     pub fn osm() -> Self {
         Self::new("https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+    }
+
+    /// Convenience constructor targeting open satellite world imagery (ArcGIS World Imagery)
+    /// paired with global AWS Terrarium DEM heightmaps.
+    pub fn world_satellite_with_terrain() -> Self {
+        Self::new("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}")
+            .with_terrarium_elevation()
     }
 
     /// Convenience constructor targeting Mapbox satellite imagery and Terrain-RGB elevation.
@@ -1446,14 +1493,24 @@ impl NetworkTileSource {
         let (task_tx, task_rx) = channel::<FetchTask>();
         let (results_tx, results_rx) =
             channel::<(TileDataKey, Result<CachedTileData, TileError>)>();
+        let on_tile_ready: TileReadySlot = Arc::new(Mutex::new(None));
 
         let worker_transport = Arc::clone(&transport);
+        let worker_ready = Arc::clone(&on_tile_ready);
         std::thread::Builder::new()
             .name("strata-tile-fetcher".to_string())
             .spawn(move || {
                 while let Ok(task) = task_rx.recv() {
                     let result = Self::process_fetch_task(&worker_transport, &task);
+                    let ok = result.is_ok();
                     let _ = results_tx.send((task.key, result));
+                    if ok {
+                        if let Ok(guard) = worker_ready.lock() {
+                            if let Some(ref cb) = *guard {
+                                cb();
+                            }
+                        }
+                    }
                 }
             })
             .expect("failed to spawn strata-tile-fetcher thread");
@@ -1461,7 +1518,11 @@ impl NetworkTileSource {
         Self {
             imagery_url_template: imagery_url_template.into(),
             elevation_url_template,
-            elevation_is_terrain_rgb,
+            elevation_encoding: if elevation_is_terrain_rgb {
+                ElevationEncoding::TerrainRgb
+            } else {
+                ElevationEncoding::RawF32
+            },
             subdomains: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             subdomain_counter: 0,
             cache: LruTileCache::new(max_cache_bytes),
@@ -1470,8 +1531,16 @@ impl NetworkTileSource {
             pending: Arc::new(Mutex::new(HashSet::new())),
             results_rx,
             task_tx,
+            on_tile_ready,
             stats: NetworkTileStats::default(),
             default_tile_size: 256,
+        }
+    }
+
+    /// Registers a wakeup callback invoked whenever a downloaded tile finishes decoding.
+    pub fn set_on_tile_ready(&mut self, cb: Option<Arc<dyn Fn() + Send + Sync>>) {
+        if let Ok(mut guard) = self.on_tile_ready.lock() {
+            *guard = cb;
         }
     }
 
@@ -1484,12 +1553,21 @@ impl NetworkTileSource {
         let (results_tx, results_rx) =
             channel::<(TileDataKey, Result<CachedTileData, TileError>)>();
         let worker_transport = Arc::clone(&transport);
+        let worker_ready = Arc::clone(&self.on_tile_ready);
         std::thread::Builder::new()
             .name("strata-tile-fetcher".to_string())
             .spawn(move || {
                 while let Ok(task) = task_rx.recv() {
                     let result = Self::process_fetch_task(&worker_transport, &task);
+                    let ok = result.is_ok();
                     let _ = results_tx.send((task.key, result));
+                    if ok {
+                        if let Ok(guard) = worker_ready.lock() {
+                            if let Some(ref cb) = *guard {
+                                cb();
+                            }
+                        }
+                    }
                 }
             })
             .expect("failed to spawn strata-tile-fetcher thread");
@@ -1514,7 +1592,20 @@ impl NetworkTileSource {
     /// Sets the elevation URL template.
     pub fn with_elevation(mut self, template: impl Into<String>, is_terrain_rgb: bool) -> Self {
         self.elevation_url_template = Some(template.into());
-        self.elevation_is_terrain_rgb = is_terrain_rgb;
+        self.elevation_encoding = if is_terrain_rgb {
+            ElevationEncoding::TerrainRgb
+        } else {
+            ElevationEncoding::RawF32
+        };
+        self
+    }
+
+    /// Enables public-domain global AWS Terrarium DEM heightmaps (`z=0..15`).
+    pub fn with_terrarium_elevation(mut self) -> Self {
+        self.elevation_url_template = Some(
+            "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png".to_string(),
+        );
+        self.elevation_encoding = ElevationEncoding::Terrarium;
         self
     }
 
@@ -1598,7 +1689,7 @@ impl NetworkTileSource {
             }
             let _ = std::fs::write(path, &bytes);
         }
-        let elev = Self::decode_elevation_bytes(&bytes, self.elevation_is_terrain_rgb)?;
+        let elev = Self::decode_elevation_bytes(&bytes, self.elevation_encoding)?;
         self.cache.insert_elevation(key, elev.clone());
         Ok(Some(elev))
     }
@@ -1615,7 +1706,7 @@ impl NetworkTileSource {
             let _ = std::fs::write(path, &bytes);
         }
         if task.is_elevation {
-            let elev = Self::decode_elevation_bytes(&bytes, task.is_terrain_rgb)?;
+            let elev = Self::decode_elevation_bytes(&bytes, task.elevation_encoding)?;
             Ok(CachedTileData::Elevation(elev))
         } else {
             let img = Self::decode_imagery_bytes(&bytes, 256)?;
@@ -1625,11 +1716,20 @@ impl NetworkTileSource {
 
     fn decode_imagery_bytes(bytes: &[u8], default_size: u32) -> Result<TileImage, TileError> {
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            let (w, h, rgba) = decode_png_to_rgba(bytes)?;
+            if let Ok((w, h, rgba)) = decode_png_to_rgba(bytes) {
+                return Ok(TileImage {
+                    width: w,
+                    height: h,
+                    pixels: rgba,
+                });
+            }
+        }
+        if let Ok(dyn_img) = image::load_from_memory(bytes) {
+            let rgba = dyn_img.to_rgba8();
             return Ok(TileImage {
-                width: w,
-                height: h,
-                pixels: rgba,
+                width: rgba.width(),
+                height: rgba.height(),
+                pixels: rgba.into_raw(),
             });
         }
         if bytes.len() >= 8 {
@@ -1669,11 +1769,23 @@ impl NetworkTileSource {
 
     fn decode_elevation_bytes(
         bytes: &[u8],
-        is_terrain_rgb: bool,
+        encoding: ElevationEncoding,
     ) -> Result<TileElevation, TileError> {
-        if is_terrain_rgb || bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            let (w, h, rgba) = decode_png_to_rgba(bytes)?;
-            return Ok(decode_terrain_rgb(w, h, &rgba));
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            let (w, h, rgba) = decode_png_to_rgba(bytes).or_else(|_| {
+                image::load_from_memory(bytes)
+                    .map(|img| {
+                        let r = img.to_rgba8();
+                        (r.width(), r.height(), r.into_raw())
+                    })
+                    .map_err(|e| TileError::Decode(format!("elevation png decode failed: {e}")))
+            })?;
+            return Ok(match encoding {
+                ElevationEncoding::Terrarium => decode_terrarium(w, h, &rgba),
+                ElevationEncoding::TerrainRgb | ElevationEncoding::RawF32 => {
+                    decode_terrain_rgb(w, h, &rgba)
+                }
+            });
         }
         if bytes.len() >= 8 {
             let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -1750,7 +1862,7 @@ impl TileSource for NetworkTileSource {
                 key: data_key,
                 url,
                 is_elevation: false,
-                is_terrain_rgb: false,
+                elevation_encoding: ElevationEncoding::RawF32,
                 disk_cache_path,
             });
             self.stats.network_requests += 1;
@@ -1758,6 +1870,10 @@ impl TileSource for NetworkTileSource {
 
         // Return None non-blockingly so the scene renderer falls back to an ancestor tile
         Ok(None)
+    }
+
+    fn peek_cached_imagery(&self, key: TileKey) -> Option<TileImage> {
+        self.cache.peek_imagery(key)
     }
 
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
@@ -1777,8 +1893,7 @@ impl TileSource for NetworkTileSource {
             let path = dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y));
             if path.is_file() {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(elev) =
-                        Self::decode_elevation_bytes(&bytes, self.elevation_is_terrain_rgb)
+                    if let Ok(elev) = Self::decode_elevation_bytes(&bytes, self.elevation_encoding)
                     {
                         self.cache.insert_elevation(key, elev.clone());
                         self.stats.disk_cache_hits += 1;
@@ -1814,7 +1929,7 @@ impl TileSource for NetworkTileSource {
                 key: data_key,
                 url,
                 is_elevation: true,
-                is_terrain_rgb: self.elevation_is_terrain_rgb,
+                elevation_encoding: self.elevation_encoding,
                 disk_cache_path,
             });
             self.stats.network_requests += 1;

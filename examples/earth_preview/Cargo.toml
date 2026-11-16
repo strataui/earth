@@ -1,0 +1,15 @@
+[package]
+name = "earth_preview"
+version.workspace = true
+publish = false
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Interactive GPU preview window rendering only the strata_earth Canvas3D component"
+
+[dependencies]
+strata_earth = { workspace = true }
+strata_layout = { workspace = true }
+strata_render = { workspace = true }
+strata = { package = "strata-ui", path = "../../../strata/crates/strata" }
+strata_platform = { package = "strata-ui-platform", path = "../../../strata/crates/render/strata_platform" }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/strata_earth",
     "examples/strata_earth_golden",
+    "examples/earth_preview",
 ]
 
 [workspace.package]
