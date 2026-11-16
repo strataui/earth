@@ -348,8 +348,9 @@ impl RetainedTerrainBuilder {
         u.moon_angular_radius_rad = input.space.moon_angular_radius_rad.max(1e-4);
         u.stars_visible = input.space.stars_visible;
         u.stars_intensity = input.space.stars_intensity.max(0.0);
+        let cloud_alt_fade = smoothstep_f32(450_000.0, 2_000_000.0, cam.altitude_m() as f32);
         u.cloud_layer_opacity = if input.weather.global_cloud_map && input.layers.clouds {
-            input.weather.global_cloud_opacity.clamp(0.0, 1.0) * space_factor
+            input.weather.global_cloud_opacity.clamp(0.0, 1.0) * space_factor * cloud_alt_fade
         } else {
             0.0
         };
@@ -1306,6 +1307,16 @@ impl EarthViewport {
     #[inline]
     pub fn elevation_enabled(&self) -> bool {
         self.input.elevation_enabled
+    }
+
+    #[inline]
+    pub fn labels_enabled(&self) -> bool {
+        self.input.layers.labels
+    }
+
+    /// Toggles geographic map labels in O(1) without rebuilding terrain geometry.
+    pub fn set_labels_enabled(&mut self, enabled: bool) {
+        self.input.layers.labels = enabled;
     }
 
     /// Toggles live heightmap (DEM) fetching and terrain relief displacement cleanly.

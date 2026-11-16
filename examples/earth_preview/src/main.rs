@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use strata::prelude::*;
 use strata_earth::{
-    EarthCamera, EarthDefaultTileSource, EarthInput, EarthViewMode, EarthViewport, Geodetic,
-    LayerToggles, SpaceEnvironmentConfig, SunDirectionMode, SurfaceMode, TileProjection,
-    WeatherConfig,
+    builtin_world_labels, project_earth_labels, EarthCamera, EarthDefaultTileSource, EarthInput,
+    EarthLabelIcon, EarthLabelKind, EarthMapLabel, EarthViewMode, EarthViewport, Geodetic,
+    LayerToggles, LiveMapLabelStore, ProjectedEarthLabel, SpaceEnvironmentConfig, SunDirectionMode,
+    SurfaceMode, TileProjection, WeatherConfig,
 };
 use strata_layout::Rect;
 use strata_render::scene3d::Canvas3D;
@@ -196,7 +197,7 @@ impl OrbitState {
                 terrain: true,
                 buildings: false,
                 graticule: false,
-                labels: false,
+                labels: true,
                 clouds: true,
                 celestial: true,
             },
@@ -214,7 +215,136 @@ impl OrbitState {
 struct PreviewState {
     viewport: EarthViewport,
     orbit: OrbitState,
+    builtin_labels: Vec<EarthMapLabel>,
+    live_labels: LiveMapLabelStore,
     last_is_25d_ui: bool,
+    last_label_sig: u64,
+}
+
+impl PreviewState {
+    fn label_state_signature(&self) -> u64 {
+        let inp = self.viewport.input();
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let parts = [
+            inp.layers.labels as u64,
+            (self.orbit.lat_deg * 10_000.0).round() as i64 as u64,
+            (self.orbit.lon_deg * 10_000.0).round() as i64 as u64,
+            (self.orbit.range_m.ln() * 250.0).round() as u64,
+            (self.orbit.heading_deg * 10.0).round() as u64,
+            (self.orbit.tilt_deg * 10.0).round() as u64,
+            (inp.view_morph * 200.0).round() as u64,
+            self.live_labels
+                .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg)
+                .len() as u64,
+        ];
+        for p in parts {
+            h ^= p;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+        h
+    }
+
+    fn compute_projected_labels(&self) -> Vec<ProjectedEarthLabel> {
+        let inp = self.viewport.input();
+        if !inp.layers.labels {
+            return Vec::new();
+        }
+        let nearby = self
+            .live_labels
+            .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg);
+        if nearby.is_empty() {
+            project_earth_labels(inp, &self.builtin_labels, 36)
+        } else {
+            let mut combined = Vec::with_capacity(self.builtin_labels.len() + nearby.len());
+            combined.extend_from_slice(&self.builtin_labels);
+            combined.extend(nearby);
+            project_earth_labels(inp, &combined, 38)
+        }
+    }
+}
+
+fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
+    let x = lbl.screen_x;
+    let y = lbl.screen_y;
+    let op = format!("{:.3}", lbl.alpha.clamp(0.0, 1.0));
+    let [r, g, b] = lbl.rgb;
+
+    match lbl.icon {
+        EarthLabelIcon::HighwayShield => {
+            let is_interstate = lbl.text.starts_with("I-");
+            let is_us_route = lbl.text.starts_with("US-") || lbl.text.starts_with("CA-");
+            let shield_cls = if is_interstate {
+                "bg-blue-950/90 border-blue-400/80 text-white"
+            } else if is_us_route {
+                "bg-neutral-900/90 border-neutral-300/85 text-white"
+            } else {
+                // Regional/global highway codes such as CT05, E40, A1, M25
+                "bg-emerald-950/90 border-emerald-400/80 text-emerald-100"
+            };
+            rsx! {
+                <div
+                    class={format!("absolute px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide select-none shadow-md {}", shield_cls)}
+                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {};", x - 18.0, y - 9.0, op)}
+                >
+                    {lbl.text.clone()}
+                </div>
+            }
+        }
+        EarthLabelIcon::MountainRight => {
+            // Light green mountain text with mountain symbol on the right
+            rsx! {
+                <div
+                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
+                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, op, r, g, b, lbl.font_px)}
+                >
+                    <span class="font-medium">{lbl.text.clone()}</span>
+                    <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22L14 6z" />
+                    </svg>
+                </div>
+            }
+        }
+        EarthLabelIcon::ParkLeafRight => {
+            rsx! {
+                <div
+                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
+                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, op, r, g, b, lbl.font_px)}
+                >
+                    <span class="font-medium">{lbl.text.clone()}</span>
+                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M17 8C8 10 5.9 16.17 3.82 21.34l1.89.66l.95-2.3c.48.17.98.3 1.34.3C19 20 22 3 22 3c-1 2-8 2.25-13 3.25S2 11.5 2 13.5s1.75 3.75 1.75 3.75C7 8 17 8 17 8z" />
+                    </svg>
+                </div>
+            }
+        }
+        EarthLabelIcon::CityDot => {
+            rsx! {
+                <div
+                    class="absolute flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
+                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, op, r, g, b, lbl.font_px)}
+                >
+                    <div class="w-1.5 h-1.5 rounded-full bg-white/95" />
+                    <span class="font-medium">{lbl.text.clone()}</span>
+                </div>
+            }
+        }
+        EarthLabelIcon::None => {
+            let extra_cls = match lbl.kind {
+                EarthLabelKind::Continent => "font-semibold tracking-widest",
+                EarthLabelKind::Ocean => "italic tracking-wider",
+                EarthLabelKind::Country => "font-medium tracking-wide",
+                _ => "font-normal",
+            };
+            rsx! {
+                <div
+                    class={format!("absolute px-1 py-0.5 rounded bg-black/25 select-none whitespace-nowrap {}", extra_cls)}
+                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, op, r, g, b, lbl.font_px)}
+                >
+                    {lbl.text.clone()}
+                </div>
+            }
+        }
+    }
 }
 
 fn control_btn<F>(label: String, active: bool, on_click: F) -> View
@@ -277,10 +407,18 @@ fn main() -> Result<(), String> {
     viewport.sync_now();
 
     let retained = viewport.retained_scene();
+    let labels_ready = Arc::new(AtomicBool::new(false));
+    let labels_ready_cb = Arc::clone(&labels_ready);
+    let live_labels = LiveMapLabelStore::new(Some(Arc::new(move || {
+        labels_ready_cb.store(true, Ordering::Release);
+    })));
     let state = Arc::new(Mutex::new(PreviewState {
         viewport,
         orbit,
+        builtin_labels: builtin_world_labels(),
+        live_labels,
         last_is_25d_ui: false,
+        last_label_sig: 0,
     }));
 
     let config = WindowConfig {
@@ -297,18 +435,24 @@ fn main() -> Result<(), String> {
     let state_events = Arc::clone(&state);
     let state_frame = Arc::clone(&state);
     let tile_ready_frame = Arc::clone(&tile_ready);
+    let labels_ready_frame = Arc::clone(&labels_ready);
 
     launch_with_frame(
         move || {
-            let (is_2d, is_25d_view, sp, w, elev_on, sun_mode) = {
-                let guard = state_view.lock().unwrap();
+            let (is_2d, is_25d_view, sp, w, elev_on, labels_on, sun_mode, label_views) = {
+                let mut guard = state_view.lock().unwrap();
+                guard.last_label_sig = guard.label_state_signature();
+                let projected = guard.compute_projected_labels();
+                let views: Vec<View> = projected.iter().map(render_earth_label).collect();
                 (
                     guard.viewport.view_mode() == EarthViewMode::Mode2D,
                     guard.orbit.range_m < 100_000.0,
                     guard.viewport.space_config().clone(),
                     guard.viewport.weather_config().clone(),
                     guard.viewport.elevation_enabled(),
+                    guard.viewport.labels_enabled(),
                     guard.orbit.sun_demo_mode,
+                    views,
                 )
             };
 
@@ -439,6 +583,13 @@ fn main() -> Result<(), String> {
                 st.viewport.set_elevation_enabled(next);
             });
 
+            let s_labels = Arc::clone(&state_view);
+            let btn_labels = control_btn("Labels".to_string(), labels_on, move |_| {
+                let mut st = s_labels.lock().unwrap();
+                let next = !st.viewport.labels_enabled();
+                st.viewport.set_labels_enabled(next);
+            });
+
             let s_gcloud = Arc::clone(&state_view);
             let btn_gcloud = control_btn("3D Clouds".to_string(), w.global_cloud_map, move |_| {
                 let mut st = s_gcloud.lock().unwrap();
@@ -479,9 +630,12 @@ fn main() -> Result<(), String> {
             rsx! {
                 <div class="relative w-full h-full bg-black overflow-hidden">
                     {canvas}
+                    <div class="absolute inset-0 z-10 pointer-events-none">
+                        {label_views}
+                    </div>
                     <div
                         data-earth-controls="true"
-                        class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[420px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
+                        class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
                     >
                         {btn_mode}
                         {btn_jump}
@@ -491,6 +645,7 @@ fn main() -> Result<(), String> {
                         {btn_stars}
                         {btn_sats}
                         {btn_elev}
+                        {btn_labels}
                         {btn_gcloud}
                         {btn_wclouds}
                         {btn_rain}
@@ -571,13 +726,8 @@ fn main() -> Result<(), String> {
                 PlatformEvent::Scroll { delta_y, .. } => {
                     let (mx, my) = rt.last_mouse_pos;
                     if !is_over_controls(rt, mx, my) {
-                        // Normalize GTK 110px wheel notch vs +/-1 wheel click units; scroll up (<0) zooms IN.
-                        let raw_notches = if delta_y.abs() > 8.0 {
-                            (*delta_y as f64) / 110.0
-                        } else {
-                            *delta_y as f64
-                        };
-                        let notches = raw_notches.clamp(-3.0, 3.0);
+                        // GTK always scales both wheel clicks (+/-110) and smooth touchpad deltas by 110.0.
+                        let notches = ((*delta_y as f64) / 110.0).clamp(-2.5, 2.5);
                         let zoom_factor = 1.075f64.powf(notches);
                         st.orbit.target_range_m =
                             (st.orbit.target_range_m * zoom_factor).clamp(1_200.0, 18_000_000.0);
@@ -618,9 +768,19 @@ fn main() -> Result<(), String> {
             let tick_satellites = st.orbit.sun_demo_mode != SunDemoMode::FixedSunset;
             let _ = st.viewport.step_dynamic_overlays(dt, tick_satellites);
 
+            if st.viewport.labels_enabled() {
+                let lat = st.orbit.lat_deg;
+                let lon = st.orbit.lon_deg;
+                let rng = st.orbit.range_m;
+                st.live_labels.ensure_local_sector(lat, lon, rng);
+            }
+
             let is_25d_ui = st.orbit.range_m < 100_000.0;
-            if is_25d_ui != st.last_is_25d_ui {
+            let label_sig = st.label_state_signature();
+            let labels_arrived = labels_ready_frame.swap(false, Ordering::AcqRel);
+            if is_25d_ui != st.last_is_25d_ui || label_sig != st.last_label_sig || labels_arrived {
                 st.last_is_25d_ui = is_25d_ui;
+                st.last_label_sig = label_sig;
                 FrameOutcome::Dirty
             } else {
                 FrameOutcome::Unchanged

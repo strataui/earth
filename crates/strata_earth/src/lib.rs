@@ -21,10 +21,16 @@ pub mod descriptor;
 pub mod geodesy;
 pub mod gltf;
 pub mod json;
+pub mod labels;
 pub mod satellites;
 pub mod scene;
 pub mod tiles;
 pub mod worker;
+
+pub use labels::{
+    builtin_world_labels, label_style, parse_overpass_labels_json, project_earth_labels,
+    EarthLabelIcon, EarthLabelKind, EarthMapLabel, LiveMapLabelStore, ProjectedEarthLabel,
+};
 
 pub use acceptance::{
     evaluate as evaluate_acceptance, AcceptanceCriteria, AcceptanceReport, PixelDelta,
