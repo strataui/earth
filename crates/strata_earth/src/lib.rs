@@ -21,6 +21,7 @@ pub mod descriptor;
 pub mod geodesy;
 pub mod gltf;
 pub mod json;
+pub mod satellites;
 pub mod scene;
 pub mod tiles;
 pub mod worker;
@@ -36,7 +37,9 @@ pub use astro::{
     sun_direction_from_unix_utc, system_clock_time, unix_to_julian_date, GlobalCloudMapStore,
     LocalClockTime, DEFAULT_CLOUD_MAP_URL,
 };
-pub use basemap::{embedded_base_tile, EarthDefaultTileSource, EmbeddedBaseMapSource};
+pub use basemap::{
+    embedded_base_tile, EarthDefaultTileSource, EmbeddedBaseMapSource, MAX_EMBEDDED_BASE_LEVEL,
+};
 pub use descriptor::{
     compare, replay, CameraDelta, DeltaSummary, DescriptorCamera, DescriptorCelestial,
     DescriptorClouds, DescriptorDelta, DescriptorMarker, DescriptorPatch, DescriptorRing,
@@ -59,6 +62,11 @@ pub use geodesy::{
 pub use gltf::{
     build_25d_weather_meshes, cc0_cloud_mesh, cc0_rain_mesh, cc0_snow_mesh, parse_glb_mesh,
     CustomWeatherMeshes, WeatherConfig, WeatherMesh,
+};
+pub use satellites::{
+    build_3d_satellites_meshes, embedded_satellite_elements, parse_celestrak_gp_json,
+    propagate_satellite_ecef, PropagatedSatellite, SatelliteCatalogStore, SatelliteElement,
+    DEFAULT_CELESTRAK_STATIONS_URL, DEFAULT_CELESTRAK_VISUAL_URL,
 };
 pub use scene::{
     building_triangle_count, celestial_bodies, compute_adaptive_skirt_depth,

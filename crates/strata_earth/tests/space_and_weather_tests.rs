@@ -329,10 +329,30 @@ fn transitions_fade_terminator_city_lights_and_clouds_in_25d_and_toggles_work() 
         true,
     );
     assert!(frame_3d.environment.is_some());
-    assert!(frame_3d.dynamic_meshes.is_empty());
+    assert!(
+        frame_3d
+            .dynamic_meshes
+            .iter()
+            .all(|m| !(0x9E47_0001..=0x9E47_0003).contains(&m.id)),
+        "2.5D weather meshes must remain absent in 3D"
+    );
+    assert!(
+        frame_3d
+            .dynamic_meshes
+            .iter()
+            .any(|m| (0x9E47_1001..=0x9E47_1003).contains(&m.id)),
+        "orbital satellite meshes should appear in 3D space"
+    );
 
     let (frame_25d, _) = builder.build_frame(&input_25d, &mut src, 2, true);
     assert_eq!(frame_25d.dynamic_meshes.len(), 3);
+    assert!(
+        frame_25d
+            .dynamic_meshes
+            .iter()
+            .all(|m| (0x9E47_0001..=0x9E47_0003).contains(&m.id)),
+        "only 2.5D weather meshes should remain after orbital satellites fade away in 2.5D"
+    );
 
     // Verify all toggles can disable cleanly even in 3D space.
     input_3d.camera.eye_offset_m = [0.0, 0.0, 10_200_000.0];
@@ -440,4 +460,122 @@ fn terrain_tiles_project_on_screen_in_25d_mode() {
         on_screen_vertices > 20,
         "expected terrain vertices inside NDC clip volume"
     );
+}
+
+#[test]
+fn embedded_basemap_provides_all_z0_to_z4_highres_tiles() {
+    let mut total = 0usize;
+    for level in 0..=4u8 {
+        let n = 1u32 << level;
+        for y in 0..n {
+            for x in 0..n {
+                let tile =
+                    strata_earth::embedded_base_tile(strata_earth::TileKey::new(level, x, y))
+                        .expect("z=0..4 NASA Blue Marble tile must be built in");
+                assert_eq!(tile.width, 256);
+                assert_eq!(tile.height, 256);
+                total += 1;
+            }
+        }
+    }
+    assert_eq!(total, 1 + 4 + 16 + 64 + 256);
+}
+
+#[test]
+fn real_orbital_satellites_parse_propagate_and_fade_in_25d() {
+    let sample_gp = r#"[{"OBJECT_NAME":"ISS (ZARYA)","EPOCH":"2026-11-16T06:00:00.000000","MEAN_MOTION":15.498,"ECCENTRICITY":0.00051,"INCLINATION":51.64,"RA_OF_ASC_NODE":120.0,"ARG_OF_PERICENTER":70.0,"MEAN_ANOMALY":40.0}]"#;
+    let elems = strata_earth::parse_celestrak_gp_json(sample_gp, true);
+    assert_eq!(elems.len(), 1);
+    let iss = strata_earth::propagate_satellite_ecef(&elems[0], 1_767_225_600.0, [1.0, 0.0, 0.0]);
+    assert!(
+        iss.altitude_m > 350_000.0 && iss.altitude_m < 500_000.0,
+        "ISS orbital altitude should sit in LEO (~420 km), got {}",
+        iss.altitude_m
+    );
+
+    let embedded = strata_earth::embedded_satellite_elements();
+    assert!(embedded.len() >= 30);
+    let meshes_3d = strata_earth::build_3d_satellites_meshes(
+        1_767_225_600.0,
+        [1.0, 0.0, 0.0],
+        12_000_000.0,
+        0.0,
+        true,
+        true,
+        95_000.0,
+        &embedded,
+        1,
+    );
+    assert!(!meshes_3d.is_empty());
+
+    let meshes_25d = strata_earth::build_3d_satellites_meshes(
+        1_767_225_600.0,
+        [1.0, 0.0, 0.0],
+        9_500.0,
+        1.0,
+        true,
+        true,
+        95_000.0,
+        &embedded,
+        2,
+    );
+    assert!(
+        meshes_25d.is_empty(),
+        "satellites must completely fade out in 2.5D"
+    );
+}
+
+#[test]
+fn panning_in_25d_reuses_tile_meshes_and_ancestor_elevation_prevents_cliff_drops() {
+    let mut src = MemoryTileSource::new();
+    let img = strata_earth::TileImage {
+        width: 4,
+        height: 4,
+        pixels: [120, 150, 120, 255].repeat(16),
+    };
+    let parent_tile = strata_earth::TileKey::new(11, 327, 791);
+    src.insert_imagery(strata_earth::TileKey::new(0, 0, 0), img);
+    src.insert_elevation(
+        parent_tile,
+        strata_earth::TileElevation {
+            width: 4,
+            height: 4,
+            heights_m: vec![420.0; 16],
+        },
+    );
+
+    let cam_a = EarthCamera {
+        focus: Geodetic::new(37.7749, -122.4194, 0.0),
+        aim_offset_m: [0.0, 0.0, 0.0],
+        eye_offset_m: [0.0, -5_000.0, 8_000.0],
+        fov_y_deg: 55.0,
+        near_m: 10.0,
+    };
+    let mut input = EarthInput {
+        camera: cam_a,
+        surface_mode: SurfaceMode::QuadtreeLod,
+        tile_projection: TileProjection::WebMercator,
+        elevation_enabled: true,
+        max_tile_level: 14,
+        tile_grid: 5,
+        sse_threshold: 8.0,
+        ..EarthInput::default()
+    };
+
+    let mut builder = RetainedTerrainBuilder::new();
+    let (frame_a, _) = builder.build_frame(&input, &mut src, 1, true);
+    assert!(!frame_a.meshes.is_empty());
+
+    // Pan slightly (~300 m) inside 2.5D: cached meshes should all hit without full rebuild.
+    input.camera.focus = Geodetic::new(37.7775, -122.4165, 0.0);
+    let (_frame_b, stats_b) = builder.build_frame(&input, &mut src, 2, true);
+    assert!(
+        stats_b.mesh_cache_hits > 0,
+        "2.5D small pan must reuse cached tile meshes"
+    );
+
+    // Toggling heightmap off drops relief cleanly back to ellipsoid.
+    input.elevation_enabled = false;
+    let (frame_flat, _) = builder.build_frame(&input, &mut src, 3, true);
+    assert!(!frame_flat.meshes.is_empty());
 }

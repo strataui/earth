@@ -125,9 +125,9 @@ fn default_source_zoom_keeps_base_ancestor_smoothly_until_highres_tile_arrives()
         let fallback = resolve_tile_imagery(target_z8, |candidate| {
             default_src.peek_cached_imagery(candidate).is_some()
         })
-        .expect("should smoothly fall back to z=2 embedded world basemap");
+        .expect("should smoothly fall back to embedded world basemap");
         assert!(!fallback.exact);
-        assert_eq!(fallback.source.level, 2);
+        assert_eq!(fallback.source.level, strata_earth::MAX_EMBEDDED_BASE_LEVEL);
         assert!(fallback.uv_rect.0 >= 0.0 && fallback.uv_rect.2 <= 1.0);
         assert!(fallback.uv_rect.1 >= 0.0 && fallback.uv_rect.3 <= 1.0);
     }
