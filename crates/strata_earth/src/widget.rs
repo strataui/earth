@@ -349,12 +349,13 @@ impl EarthViewState {
         let new_sig = self.label_state_signature();
         let labels_changed = new_sig != self.last_label_sig;
         let now = Instant::now();
+        let camera_moving = self.orbit.is_dragging() || orbit_dirty || trans_dirty;
         let refresh_due = toggled_labels
             || label_dirty
             || (labels_changed
                 && (labels_enabled || overlay_plugins_active)
-                && (!self.orbit.is_dragging()
-                    || now.duration_since(self.last_label_refresh) >= Duration::from_millis(50)));
+                && (!camera_moving
+                    || now.duration_since(self.last_label_refresh) >= Duration::from_millis(66)));
 
         if refresh_due {
             self.last_label_sig = new_sig;
@@ -948,6 +949,90 @@ mod tests {
         assert!((new_w - 1600.0).abs() < 0.5 && (new_h - 920.0).abs() < 0.5);
         assert!((new_vp_w - 1600.0).abs() < 0.5 && (new_vp_h - 920.0).abs() < 0.5);
     }
-}
 
+    #[test]
+    fn bench_earth_view_end_to_end_cpu_and_dom_reconcile() {
+        let mut input = EarthInput::globe();
+        input.elevation_enabled = false;
+        input.layers.labels = true;
+        let source = Box::new(MemoryTileSource::default());
+        let earth = EarthView::new(&input, source);
+
+        let earth_view = earth.clone();
+        let build_root = move || {
+            rsx! {
+                <div class="relative w-full h-full bg-black overflow-hidden">
+                    {earth_view.view()}
+                    <div class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80">
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Mode: 3D"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Map: Satellite"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"View: Space"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Sun Light: On"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"City Lights"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Ocean Waves"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Sun: OS Clock"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Stars/Moon"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Sky: Composite"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Res: 2K"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Satellites"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Heightmap"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Labels"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Clouds"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Clouds: 2K"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Rain"</button>
+                        <button class="px-2.5 py-1 rounded-lg border text-[11px] font-medium">"Snow"</button>
+                    </div>
+                </div>
+            }
+        };
+
+        let mut runtime = AppRuntime::new(build_root(), 1440.0, 900.0, 1.0);
+        // Warm up 5 frames
+        for _ in 0..5 {
+            let _ = earth.step_frame(1.0 / 60.0);
+            runtime.update_view(build_root());
+        }
+
+        // 1. Benchmark 500 pure 3D camera drag/step frames
+        let t_step0 = Instant::now();
+        earth.with_state_mut(|st| {
+            st.orbit.handle_mouse_down(0, 720.0, 450.0);
+        });
+        for i in 0..500 {
+            let x = 720.0 + ((i as f64) * 0.1).sin() * 80.0;
+            let y = 450.0 + ((i as f64) * 0.1).cos() * 40.0;
+            earth.with_state_mut(|st| {
+                if st.orbit.handle_mouse_move(x, y) {
+                    st.sync_camera();
+                }
+            });
+            let _ = earth.step_frame(1.0 / 60.0);
+        }
+        earth.with_state_mut(|st| {
+            st.orbit.handle_mouse_up(0);
+        });
+        let step_ms = t_step0.elapsed().as_secs_f64() * 1000.0;
+
+        // 2. Benchmark 200 full 2D HUD + 36 projected label DOM update_view passes with incremental reconciliation
+        let t_dom0 = Instant::now();
+        for i in 0..200 {
+            earth.with_state_mut(|st| {
+                st.orbit.lon_deg += 0.25;
+                st.orbit.lat_deg = ((i as f64) * 0.05).sin() * 20.0;
+                st.sync_camera();
+            });
+            runtime.update_view(build_root());
+        }
+        let dom_ms = t_dom0.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "[bench EarthView 1440x900] 500 3D drag+step_frame ticks: {:.2} ms ({:.3} ms/frame, {:.0} FPS) | 200 2D HUD+36-label DOM reconcile passes: {:.2} ms ({:.3} ms/pass)",
+            step_ms,
+            step_ms / 500.0,
+            500_000.0 / step_ms,
+            dom_ms,
+            dom_ms / 200.0,
+        );
+    }
+}
 
