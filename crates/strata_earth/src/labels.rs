@@ -2184,7 +2184,21 @@ impl EarthScreenProjector {
         let map_2d = ll.map_2d_morph as f64;
         let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
         let eye = DVec3::new(cam_u.eye_ecef[0], cam_u.eye_ecef[1], cam_u.eye_ecef[2]);
-        let focus_surface = Geodetic::new(cam.focus.lat_deg, cam.focus.lon_deg, 0.0);
+        let focus_surface = if flat_t >= 0.99 && map_2d <= 1e-4 {
+            Geodetic::new(
+                (cam.focus.lat_deg * 50.0).round() / 50.0,
+                (cam.focus.lon_deg * 50.0).round() / 50.0,
+                0.0,
+            )
+        } else if flat_t > 1e-6 {
+            Geodetic::new(
+                (cam.focus.lat_deg * 200.0).round() / 200.0,
+                (cam.focus.lon_deg * 200.0).round() / 200.0,
+                0.0,
+            )
+        } else {
+            Geodetic::new(cam.focus.lat_deg, cam.focus.lon_deg, 0.0)
+        };
         let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
         let focus_ecef = geodetic_to_ecef(focus_surface);
         let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
@@ -2192,8 +2206,8 @@ impl EarthScreenProjector {
         Self {
             eye,
             vp: cam_u.view_proj_rte,
-            focus_lat: cam.focus.lat_deg,
-            focus_lon: cam.focus.lon_deg,
+            focus_lat: focus_surface.lat_deg,
+            focus_lon: focus_surface.lon_deg,
             focus_frame,
             focus_ecef,
             cos_scale,
@@ -2348,11 +2362,7 @@ pub fn project_earth_labels(
         ));
     }
 
-    candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.total_cmp(&a.1))
-            .then_with(|| a.2.id.cmp(&b.2.id))
-    });
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.id.cmp(&b.2.id)));
 
     // Screen-space collision decluttering so labels never stack noisily
     let mut accepted: Vec<ProjectedEarthLabel> =
