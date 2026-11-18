@@ -452,7 +452,7 @@ impl RetainedTerrainBuilder {
         }
         let ll = input.low_level_state();
         let active_25d = ll.local_25d_blend.max(ll.map_2d_morph) > 0.02
-            && (input.weather.clouds_25d || input.weather.rain || input.weather.snow);
+            && (input.weather.rain || input.weather.snow);
         if !active_25d {
             return self.last_built_weather.is_none();
         }
@@ -1506,8 +1506,7 @@ impl RetainedTerrainBuilder {
         }
 
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
-        let active_25d =
-            flat_t > 0.02 && (input.weather.clouds_25d || input.weather.rain || input.weather.snow);
+        let active_25d = flat_t > 0.02 && (input.weather.rain || input.weather.snow);
         self.last_built_weather = if active_25d {
             let lat_q = (input.camera.focus.lat_deg * 1e5).round() as i64;
             let lon_q = (input.camera.focus.lon_deg * 1e5).round() as i64;
@@ -2225,9 +2224,7 @@ impl EarthViewport {
             && flat_t < 0.85
             && w.global_cloud_spin_rad_s.abs() > 1e-9;
         let weather_25d = flat_t > 0.02
-            && ((w.clouds_25d && w.cloud_count > 0)
-                || (w.rain && w.rain_density > 0)
-                || (w.snow && w.snow_density > 0));
+            && ((w.rain && w.rain_density > 0) || (w.snow && w.snow_density > 0));
         spin_3d || weather_25d
     }
 

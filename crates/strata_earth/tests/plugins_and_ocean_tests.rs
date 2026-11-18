@@ -426,8 +426,8 @@ fn empty_plugin_registry_starts_clean_and_allows_selective_composition() {
         inp.space.stars_visible = true;
         inp.space.city_lights = true;
         inp.weather = WeatherConfig {
-            clouds_25d: true,
-            cloud_count: 8,
+            rain: true,
+            rain_density: 32,
             ..WeatherConfig::default()
         };
         inp.ocean_waves = OceanWavesConfig::enabled();
@@ -441,6 +441,7 @@ fn empty_plugin_registry_starts_clean_and_allows_selective_composition() {
     let (bare_frame, _) = bare_builder.build_frame(&input, &mut source, 1, true);
     assert_eq!(bare_frame.camera.day_night_strength, 0.0);
     assert_eq!(bare_frame.camera.city_lights_intensity, 0.0);
+    assert_eq!(bare_frame.camera.local_cloud_opacity, 0.0);
     assert!(!bare_frame.camera.stars_visible);
     assert!(bare_frame.dynamic_meshes.is_empty());
 
@@ -453,8 +454,12 @@ fn empty_plugin_registry_starts_clean_and_allows_selective_composition() {
     assert!(composed.camera.stars_visible);
     assert_eq!(composed.camera.city_lights_intensity, 0.0);
     assert!(
+        composed.camera.local_cloud_opacity > 0.5,
+        "WeatherPlugin should activate 2.5D cloud texture layer when selectively plugged"
+    );
+    assert!(
         !composed.dynamic_meshes.is_empty(),
-        "WeatherPlugin should emit 2.5D clouds when selectively plugged"
+        "WeatherPlugin should emit 2.5D rain meshes when selectively plugged"
     );
 }
 

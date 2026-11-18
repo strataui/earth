@@ -274,7 +274,6 @@ fn main() -> Result<(), String> {
             e12.with_state_mut(|st| {
                 let mut w = st.viewport.weather_config().clone();
                 w.global_cloud_map = !w.global_cloud_map;
-                w.clouds_25d = w.global_cloud_map;
                 st.viewport.set_weather_config(w);
                 st.notify_ui_changed();
             });

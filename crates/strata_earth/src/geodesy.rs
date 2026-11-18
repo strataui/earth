@@ -1692,6 +1692,8 @@ pub fn build_tile_local_rtc_mesh_morphed(
 
     let mut positions = Vec::with_capacity(n * n);
     let mut radials = Vec::with_capacity(n * n);
+    let mut heights = Vec::with_capacity(n * n);
+    let mut lat_rows = Vec::with_capacity(n);
     let mut uvs = Vec::with_capacity(n * n);
 
     for row in 0..n {
@@ -1704,6 +1706,7 @@ pub fn build_tile_local_rtc_mesh_morphed(
             }
             _ => (bounds.lat0 + (bounds.lat1 - bounds.lat0) * v).clamp(-89.9, 89.9),
         };
+        lat_rows.push(lat_row);
         for col in 0..n {
             let u = col as f64 / (n - 1) as f64;
             let lon = bounds.lon0 + (bounds.lon1 - bounds.lon0) * u;
@@ -1727,32 +1730,59 @@ pub fn build_tile_local_rtc_mesh_morphed(
             let (p, radial) = project_point(lat_row, lon, height);
             positions.push(p);
             radials.push(radial);
+            heights.push(height * (1.0 - map_2d));
             // Texture row 0 is North (lat1 -> v = 1.0 in mesh), row H-1 is South (lat0 -> v = 0.0).
             uvs.push([u as f32, v_tex as f32]);
         }
     }
 
     let mut normals = Vec::with_capacity(n * n);
-    for row in 0..n {
-        for col in 0..n {
-            let idx = row * n + col;
-            let radial = radials[idx];
-            let east = positions[row * n + (col + 1).min(n - 1)]
-                .sub(positions[row * n + col.saturating_sub(1)]);
-            let north = positions[(row + 1).min(n - 1) * n + col]
-                .sub(positions[row.saturating_sub(1) * n + col]);
-            let cross = east.cross(north);
-            let normal = if cross.length() < 1e-9 {
-                radial
-            } else {
-                let nrm = cross.normalize();
-                if nrm.dot(radial) < 0.0 {
-                    nrm.scale(-1.0)
+    if elevation.is_none() || map_2d >= 0.999 {
+        for radial in &radials {
+            normals.push(radial.as_f32());
+        }
+    } else {
+        let lon_span_rad = (bounds.lon1 - bounds.lon0).to_radians().abs().max(1e-9);
+        for row in 0..n {
+            let lat_row = lat_rows[row];
+            let cos_lat = lat_row.to_radians().cos().abs().max(0.1);
+            let r0 = row.saturating_sub(1);
+            let r1 = (row + 1).min(n - 1);
+            let dn_m = ((lat_rows[r1] - lat_rows[r0]).to_radians().abs() * wgs84::A).max(1.0);
+            for col in 0..n {
+                let idx = row * n + col;
+                let radial = radials[idx];
+                let c0 = col.saturating_sub(1);
+                let c1 = (col + 1).min(n - 1);
+                let de_m = (((c1 - c0) as f64 / (n - 1) as f64) * lon_span_rad * wgs84::A * cos_lat)
+                    .max(1.0);
+                let dh_e = heights[row * n + c1] - heights[row * n + c0];
+                let dh_n = heights[r1 * n + col] - heights[r0 * n + col];
+                if dh_e.abs() < 1e-4 && dh_n.abs() < 1e-4 {
+                    normals.push(radial.as_f32());
                 } else {
-                    nrm
+                    let u = col as f64 / (n - 1) as f64;
+                    let lon = bounds.lon0 + (bounds.lon1 - bounds.lon0) * u;
+                    let lf = LocalFrame::at(lat_row, lon);
+                    let east_dir = DVec3::new(
+                        lf.east.x + (focus_frame.east.x - lf.east.x) * flat_t,
+                        lf.east.y + (focus_frame.east.y - lf.east.y) * flat_t,
+                        lf.east.z + (focus_frame.east.z - lf.east.z) * flat_t,
+                    )
+                    .normalize();
+                    let north_dir = DVec3::new(
+                        lf.north.x + (focus_frame.north.x - lf.north.x) * flat_t,
+                        lf.north.y + (focus_frame.north.y - lf.north.y) * flat_t,
+                        lf.north.z + (focus_frame.north.z - lf.north.z) * flat_t,
+                    )
+                    .normalize();
+                    let nrm = radial
+                        .sub(east_dir.scale(dh_e / de_m))
+                        .sub(north_dir.scale(dh_n / dn_m))
+                        .normalize();
+                    normals.push(nrm.as_f32());
                 }
-            };
-            normals.push(normal.as_f32());
+            }
         }
     }
 

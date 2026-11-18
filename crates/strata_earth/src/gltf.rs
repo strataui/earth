@@ -324,8 +324,8 @@ impl Default for WeatherConfig {
             cloud_resolution,
             cloud_map_url: cloud_resolution.url().to_string(),
             global_cloud_spin_rad_s: 0.0,
-            clouds_25d: true,
-            cloud_count: 14,
+            clouds_25d: false,
+            cloud_count: 0,
             cloud_altitude_m: 1_800.0,
             cloud_scale_m: 1_200.0,
             cloud_wind_mps: [22.0, 8.0],
@@ -451,9 +451,8 @@ pub fn build_25d_weather_meshes(
     let frame = LocalFrame::at(focus.lat_deg, focus.lon_deg);
     let anchor_ecef = crate::geodesy::geodetic_to_ecef(focus);
     let anchor = [anchor_ecef.x, anchor_ecef.y, anchor_ecef.z];
-    let span_m = (camera_range_m * 0.95).clamp(1_200.0, 65_000.0);
     let t = weather.weather_time_s;
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(2);
 
     #[inline]
     fn pick_mesh<'a>(
@@ -463,55 +462,7 @@ pub fn build_25d_weather_meshes(
         custom.map(Arc::as_ref).unwrap_or(default)
     }
 
-    // 1. 2.5D 3D CC0 Clouds
-    if weather.clouds_25d && weather.cloud_count > 0 {
-        let mesh = pick_mesh(custom.and_then(|c| c.cloud.as_ref()), cc0_cloud_mesh());
-        let count = weather.cloud_count.min(64);
-        let mut verts = Vec::with_capacity(count * mesh.positions.len());
-        let mut inds = Vec::with_capacity(count * mesh.indices.len());
-        let half_box = span_m * 1.4;
-        for i in 0..count as u32 {
-            let h0 = det_hash(i * 13 + 1);
-            let h1 = det_hash(i * 13 + 2);
-            let h2 = det_hash(i * 13 + 3);
-            let h3 = det_hash(i * 13 + 4);
-            let east =
-                ((h0 - 0.5) * 2.0 * half_box + weather.cloud_wind_mps[0] as f64 * t + half_box)
-                    .rem_euclid(half_box * 2.0)
-                    - half_box;
-            let north =
-                ((h1 - 0.5) * 2.0 * half_box + weather.cloud_wind_mps[1] as f64 * t + half_box)
-                    .rem_euclid(half_box * 2.0)
-                    - half_box;
-            let alt = (weather.cloud_altitude_m as f64) * (0.75 + 0.55 * h2);
-            let s = (weather.cloud_scale_m as f64)
-                * (0.65 + 0.85 * h3)
-                * ((camera_range_m / 12_000.0).clamp(0.35, 3.2))
-                * (alpha_fade as f64);
-            batch_instance_into_local_enu(
-                &frame,
-                mesh,
-                [east, north, alt],
-                [s, s * 0.85, s * 0.55],
-                h2 * std::f64::consts::TAU,
-                &mut verts,
-                &mut inds,
-            );
-        }
-        let mut col = weather.cloud_color;
-        col[3] *= alpha_fade;
-        out.push(RetainedDynamicMesh {
-            id: 0x9E47_0001,
-            revision,
-            anchor_ecef: anchor,
-            vertices: Arc::new(verts),
-            indices: Arc::new(inds),
-            color: col,
-            unlit: false,
-        });
-    }
-
-    // 2. 2.5D 3D CC0 Raindrops
+    // 1. 2.5D 3D CC0 Raindrops (clouds use the continuous cloud texture layer in fs_cloud, never 3D cloud models)
     if weather.rain && weather.rain_density > 0 {
         let mesh = pick_mesh(custom.and_then(|c| c.rain.as_ref()), cc0_rain_mesh());
         let count = weather.rain_density.min(1_000);

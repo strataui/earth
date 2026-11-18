@@ -1029,9 +1029,7 @@ impl WeatherPlugin {
             && flat_t < 0.85
             && w.global_cloud_spin_rad_s.abs() > 1e-9;
         let weather_25d = flat_t > 0.02
-            && ((w.clouds_25d && w.cloud_count > 0)
-                || (w.rain && w.rain_density > 0)
-                || (w.snow && w.snow_density > 0));
+            && ((w.rain && w.rain_density > 0) || (w.snow && w.snow_density > 0));
         spin_3d || weather_25d
     }
 }
