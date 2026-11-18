@@ -70,11 +70,13 @@ fn main() -> Result<(), String> {
     let sun_demo_mode = Rc::new(RefCell::new(SunDemoMode::SystemClock));
     let sun_cycle_sim_s = Rc::new(RefCell::new(1_735_689_600.0f64));
     let active_preset = Rc::new(RefCell::new(TileProviderPreset::ArcGisWorldImagery));
+    let fps_readout = Rc::new(RefCell::new((60u32, 16.7f64)));
 
     let earth_for_view = earth.clone();
     let mode_for_view = Rc::clone(&sun_demo_mode);
     let sim_for_view = Rc::clone(&sun_cycle_sim_s);
     let preset_for_view = Rc::clone(&active_preset);
+    let fps_for_view = Rc::clone(&fps_readout);
 
     let build_root = move || -> View {
         let (is_2d, at_local_25d, sp, elev_on, labels_on, w, ocean_on) =
@@ -92,6 +94,7 @@ fn main() -> Result<(), String> {
             });
         let cur_sun_mode = *mode_for_view.borrow();
         let cur_preset = *preset_for_view.borrow();
+        let (cur_fps, cur_ms) = *fps_for_view.borrow();
 
         let e1 = earth_for_view.clone();
         let btn_mode = control_btn(
@@ -333,12 +336,20 @@ fn main() -> Result<(), String> {
             e17.set_ocean_waves_enabled(!ocean_on);
         });
 
+        let fps_text = format!("{cur_fps} FPS · {cur_ms:.1} ms");
+
         rsx! {
             <div class="relative w-full h-full bg-black overflow-hidden">
                 {earth_for_view.view()}
                 <div
+                    data-earth-fps="true"
+                    class="absolute top-3 left-3 z-20 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-neutral-950/85 border border-neutral-800/85 text-emerald-400 text-[11px] font-mono font-semibold select-none pointer-events-none"
+                >
+                    <span>{fps_text}</span>
+                </div>
+                <div
                     data-earth-controls="true"
-                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
+                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/85 border border-neutral-800/85"
                 >
                     {btn_mode}
                     {btn_provider}
@@ -373,6 +384,9 @@ fn main() -> Result<(), String> {
     let earth_for_frame = earth;
     let mode_for_frame = sun_demo_mode;
     let sim_for_frame = sun_cycle_sim_s;
+    let fps_for_frame = fps_readout;
+    let mut fps_frames = 0u32;
+    let mut fps_window_start = std::time::Instant::now();
 
     launch_with_frame(
         build_root,
@@ -381,6 +395,21 @@ fn main() -> Result<(), String> {
         Some(Duration::from_millis(16)),
         move |info: AppFrameInfo, _rt: &mut AppRuntime| -> FrameOutcome {
             let dt = info.dt.as_secs_f64();
+            fps_frames += 1;
+            let mut fps_dirty = false;
+            let elapsed_s = fps_window_start.elapsed().as_secs_f64();
+            if elapsed_s >= 0.45 {
+                let fps = ((fps_frames as f64) / elapsed_s).round().clamp(1.0, 999.0) as u32;
+                let ms = (elapsed_s * 1000.0) / (fps_frames.max(1) as f64);
+                let prev = *fps_for_frame.borrow();
+                if prev.0 != fps || (prev.1 - ms).abs() >= 0.3 {
+                    *fps_for_frame.borrow_mut() = (fps, ms);
+                    fps_dirty = true;
+                }
+                fps_frames = 0;
+                fps_window_start = std::time::Instant::now();
+            }
+
             if *mode_for_frame.borrow() == SunDemoMode::OrbitalCycle {
                 *sim_for_frame.borrow_mut() += dt * 3_600.0;
                 let sim_s = *sim_for_frame.borrow();
@@ -388,7 +417,12 @@ fn main() -> Result<(), String> {
                     st.viewport.set_sim_time_unix_s(sim_s);
                 });
             }
-            earth_for_frame.step_frame(dt)
+            let outcome = earth_for_frame.step_frame(dt);
+            if fps_dirty {
+                FrameOutcome::Dirty
+            } else {
+                outcome
+            }
         },
     )
 }
