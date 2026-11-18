@@ -6,13 +6,67 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use strata_render::scene3d::{RetainedEnvironmentAssets, RetainedStar, RetainedTileTexture};
+use strata_render::scene3d::{
+    RetainedCubemapTexture, RetainedEnvironmentAssets, RetainedStar, RetainedTileTexture,
+};
 
 use crate::tiles::{HttpTransport, StandardHttpTransport};
 
-/// Default open live global cloud-map URL (3-hourly EUMETSAT/NOAA satellite mosaic).
-pub const DEFAULT_CLOUD_MAP_URL: &str =
-    "https://clouds.matteason.co.uk/images/1024x512/clouds-alpha.png";
+/// Resolution tier for live global cloud maps (`https://clouds.matteason.co.uk/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CloudMapResolution {
+    /// 1024×512 (~517 KB PNG, fast load).
+    Low,
+    /// 2048×1024 (~1.87 MB PNG, crisp default).
+    #[default]
+    Medium,
+    /// 4096×2048 (~6.65 MB PNG, high detail).
+    High,
+    /// 8192×4096 (~22.88 MB PNG, ultra detail).
+    Ultra,
+}
+
+impl CloudMapResolution {
+    pub const fn url(self) -> &'static str {
+        match self {
+            Self::Low => "https://clouds.matteason.co.uk/images/1024x512/clouds-alpha.png",
+            Self::Medium => "https://clouds.matteason.co.uk/images/2048x1024/clouds-alpha.png",
+            Self::High => "https://clouds.matteason.co.uk/images/4096x2048/clouds-alpha.png",
+            Self::Ultra => "https://clouds.matteason.co.uk/images/8192x4096/clouds-alpha.png",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Low => "1K",
+            Self::Medium => "2K",
+            Self::High => "4K",
+            Self::Ultra => "8K",
+        }
+    }
+
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Ultra,
+            Self::Ultra => Self::Low,
+        }
+    }
+
+    pub fn is_preset_url(url: &str) -> bool {
+        matches!(
+            url.trim(),
+            "https://clouds.matteason.co.uk/images/1024x512/clouds-alpha.png"
+                | "https://clouds.matteason.co.uk/images/2048x1024/clouds-alpha.png"
+                | "https://clouds.matteason.co.uk/images/4096x2048/clouds-alpha.png"
+                | "https://clouds.matteason.co.uk/images/8192x4096/clouds-alpha.png"
+        )
+    }
+}
+
+/// Default open live global cloud-map URL (2048×1024 EUMETSAT/NOAA satellite mosaic).
+pub const DEFAULT_CLOUD_MAP_URL: &str = CloudMapResolution::Medium.url();
 
 const BSC5_STARS_BIN: &[u8] = include_bytes!("../assets/bsc5_stars.bin");
 const LAND_MASK_PNG: &[u8] = include_bytes!("../assets/land_mask.png");
@@ -270,7 +324,23 @@ pub fn embedded_land_mask() -> Arc<RetainedTileTexture> {
             });
         if let Ok(night_img) = image::load_from_memory(NIGHT_LIGHTS_JPG) {
             let luma = night_img.to_luma8();
-            if luma.width() == tex.width && luma.height() == tex.height {
+            let (nw, nh) = (luma.width(), luma.height());
+            if (nw, nh) != (tex.width, tex.height) && tex.width > 1 {
+                if let Some(land_img) =
+                    image::RgbaImage::from_raw(tex.width, tex.height, tex.rgba8.to_vec())
+                {
+                    let resized = image::imageops::resize(
+                        &land_img,
+                        nw,
+                        nh,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    tex.width = nw;
+                    tex.height = nh;
+                    tex.rgba8 = Arc::new(resized.into_raw());
+                }
+            }
+            if nw == tex.width && nh == tex.height {
                 let raw = Arc::make_mut(&mut tex.rgba8);
                 let (chunks, _) = raw.as_chunks_mut::<4>();
                 for (px, &lum) in chunks.iter_mut().zip(luma.as_raw().iter()) {
@@ -317,10 +387,22 @@ pub fn embedded_clouds_fallback() -> Arc<RetainedTileTexture> {
     }))
 }
 
+fn cloud_url_hash(url: &str) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in url.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 /// Asynchronous live global cloud-map manager (serves embedded cloud map immediately,
-/// then upgrades smoothly when the live internet cloud map finishes downloading).
+/// then upgrades smoothly when the live internet cloud map finishes downloading and
+/// caches multiple cloud resolutions independently).
 pub struct GlobalCloudMapStore {
     current: Arc<RwLock<(u64, Arc<RetainedTileTexture>)>>,
+    cached_by_url: Arc<RwLock<HashMap<String, Arc<RetainedTileTexture>>>>,
+    active_url: Arc<RwLock<String>>,
     started_urls: Mutex<HashMap<String, bool>>,
     cache_dir: Option<PathBuf>,
     wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -340,6 +422,8 @@ impl GlobalCloudMapStore {
         let initial = embedded_clouds_fallback();
         Self {
             current: Arc::new(RwLock::new((1, initial))),
+            cached_by_url: Arc::new(RwLock::new(HashMap::new())),
+            active_url: Arc::new(RwLock::new(String::new())),
             started_urls: Mutex::new(HashMap::new()),
             cache_dir,
             wakeup,
@@ -350,6 +434,41 @@ impl GlobalCloudMapStore {
         if url.trim().is_empty() {
             return;
         }
+        let changed_active = self
+            .active_url
+            .write()
+            .map(|mut a| {
+                if *a == url {
+                    false
+                } else {
+                    *a = url.to_string();
+                    true
+                }
+            })
+            .unwrap_or(false);
+
+        if changed_active {
+            if let Ok(cached_map) = self.cached_by_url.read() {
+                if let Some(cached_tex) = cached_map.get(url) {
+                    if let Ok(mut cur) = self.current.write() {
+                        let next_rev = cur.0 + 1;
+                        let swapped = Arc::new(RetainedTileTexture {
+                            id: 0xE47A_0003,
+                            revision: next_rev,
+                            width: cached_tex.width,
+                            height: cached_tex.height,
+                            rgba8: Arc::clone(&cached_tex.rgba8),
+                        });
+                        *cur = (next_rev, swapped);
+                    }
+                    if let Some(ref cb) = self.wakeup {
+                        cb();
+                    }
+                    return;
+                }
+            }
+        }
+
         if let Ok(mut guard) = self.started_urls.lock() {
             if guard.contains_key(url) {
                 return;
@@ -360,6 +479,8 @@ impl GlobalCloudMapStore {
         }
 
         let target = Arc::clone(&self.current);
+        let cached_by_url = Arc::clone(&self.cached_by_url);
+        let active_url = Arc::clone(&self.active_url);
         let url_owned = url.to_string();
         let cache_dir = self.cache_dir.clone();
         let wakeup = self.wakeup.clone();
@@ -367,8 +488,11 @@ impl GlobalCloudMapStore {
         std::thread::Builder::new()
             .name("strata-cloudmap-fetch".to_string())
             .spawn(move || {
-                let cache_file = cache_dir.as_ref().map(|d| d.join("global_clouds_live.bin"));
-                let transport = StandardHttpTransport::new().with_timeout_ms(12_000);
+                let h = cloud_url_hash(&url_owned);
+                let cache_file = cache_dir
+                    .as_ref()
+                    .map(|d| d.join(format!("global_clouds_{h:016x}.bin")));
+                let transport = StandardHttpTransport::new().with_timeout_ms(20_000);
                 let bytes = match transport.fetch(&url_owned) {
                     Ok(b) if !b.is_empty() => {
                         if let Some(ref cf) = cache_file {
@@ -386,15 +510,33 @@ impl GlobalCloudMapStore {
                 };
 
                 if let Some(raw) = bytes {
-                    if let Ok(mut guard) = target.write() {
-                        let next_rev = guard.0 + 1;
-                        if let Some(tex) = decode_image_to_retained_tex(0xE47A_0003, next_rev, &raw)
-                        {
-                            *guard = (next_rev, Arc::new(tex));
+                    if let Some(tex) = decode_image_to_retained_tex(0xE47A_0003, 1, &raw) {
+                        let tex_arc = Arc::new(tex);
+                        if let Ok(mut cmap) = cached_by_url.write() {
+                            cmap.insert(url_owned.clone(), Arc::clone(&tex_arc));
                         }
-                    }
-                    if let Some(cb) = wakeup {
-                        cb();
+                        let still_active = active_url
+                            .read()
+                            .map(|a| *a == url_owned)
+                            .unwrap_or(false);
+                        if still_active {
+                            if let Ok(mut guard) = target.write() {
+                                let next_rev = guard.0 + 1;
+                                *guard = (
+                                    next_rev,
+                                    Arc::new(RetainedTileTexture {
+                                        id: 0xE47A_0003,
+                                        revision: next_rev,
+                                        width: tex_arc.width,
+                                        height: tex_arc.height,
+                                        rgba8: Arc::clone(&tex_arc.rgba8),
+                                    }),
+                                );
+                            }
+                            if let Some(cb) = wakeup {
+                                cb();
+                            }
+                        }
                     }
                 }
             })
@@ -410,9 +552,10 @@ impl GlobalCloudMapStore {
 }
 
 /// Builds the complete [`RetainedEnvironmentAssets`] packet with BSC5 stars,
-/// NASA Moon albedo, Natural Earth land mask, and the current global cloud map.
-pub fn build_environment_assets(
+/// NASA Moon albedo, Natural Earth land mask, global cloud map, and optional skybox cubemap.
+pub fn build_environment_assets_with_skybox(
     cloud_tex: Option<Arc<RetainedTileTexture>>,
+    skybox_cubemap: Option<Arc<RetainedCubemapTexture>>,
     revision: u64,
 ) -> Arc<RetainedEnvironmentAssets> {
     Arc::new(RetainedEnvironmentAssets {
@@ -421,5 +564,14 @@ pub fn build_environment_assets(
         cloud_map: Some(cloud_tex.unwrap_or_else(embedded_clouds_fallback)),
         moon_texture: Some(embedded_moon_texture()),
         stars: Some(embedded_bsc5_stars()),
+        skybox_cubemap,
     })
+}
+
+/// Builds [`RetainedEnvironmentAssets`] without a custom skybox cubemap.
+pub fn build_environment_assets(
+    cloud_tex: Option<Arc<RetainedTileTexture>>,
+    revision: u64,
+) -> Arc<RetainedEnvironmentAssets> {
+    build_environment_assets_with_skybox(cloud_tex, None, revision)
 }

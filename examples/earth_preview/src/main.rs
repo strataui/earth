@@ -1,43 +1,17 @@
-// Interactive Earth window example using `strata_earth` and `strata::Canvas3D`.
-//
-// Opens a single native GPU window featuring the full-viewport Earth scene
-// (smooth damped pan, orbit/tilt around Earth's center in 3D, gentle scroll zoom
-// with seamless 3D <-> 2.5D ground transition) and floating top-right control
-// buttons that programmatically drive [`EarthViewport`] modes, lighting, ephemeris,
-// heightmap fetching, orbital satellites, global clouds, and 2.5D weather.
+// Interactive Earth preview embedding `strata_earth::EarthView` alongside floating
+// top-right Strata HUD controls, with zero global window event hooks.
 
-use std::f64::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use strata::prelude::*;
+use strata::WindowConfig;
+use strata::{launch_with_frame, AppFrameInfo, FrameOutcome};
 use strata_earth::{
-    builtin_world_labels, project_earth_labels, EarthCamera, EarthDefaultTileSource, EarthInput,
-    EarthLabelIcon, EarthLabelKind, EarthMapLabel, EarthViewMode, EarthViewport, Geodetic,
-    LayerToggles, LiveMapLabelStore, ProjectedEarthLabel, SpaceEnvironmentConfig, SunDirectionMode,
-    SurfaceMode, TileProjection, WeatherConfig,
+    EarthDefaultTileSource, EarthInput, EarthOrbitController, EarthView, EarthViewMode,
+    SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig,
 };
-use strata_layout::Rect;
-use strata_render::scene3d::Canvas3D;
-
-const EARTH_RADIUS_M: f64 = 6_378_137.0;
-
-#[inline]
-fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-#[inline]
-fn wrap_lon_delta_deg(delta: f64) -> f64 {
-    ((delta + 180.0).rem_euclid(360.0)) - 180.0
-}
-
-#[inline]
-fn wrap_deg_360_delta(target: f64, current: f64) -> f64 {
-    ((target - current + 180.0).rem_euclid(360.0)) - 180.0
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SunDemoMode {
@@ -46,310 +20,9 @@ enum SunDemoMode {
     FixedSunset,
 }
 
-struct OrbitState {
-    lat_deg: f64,
-    lon_deg: f64,
-    heading_deg: f64,
-    tilt_deg: f64,
-    range_m: f64,
-
-    target_lat_deg: f64,
-    target_lon_deg: f64,
-    target_heading_deg: f64,
-    target_tilt_deg: f64,
-    target_range_m: f64,
-
-    left_down: bool,
-    right_down: bool,
-    last_pos: Option<(f32, f32)>,
-    viewport_w: f64,
-    viewport_h: f64,
-    sun_demo_mode: SunDemoMode,
-}
-
-impl OrbitState {
-    fn new(
-        lat_deg: f64,
-        lon_deg: f64,
-        heading_deg: f64,
-        tilt_deg: f64,
-        range_m: f64,
-        w: u32,
-        h: u32,
-    ) -> Self {
-        Self {
-            lat_deg,
-            lon_deg,
-            heading_deg,
-            tilt_deg,
-            range_m,
-            target_lat_deg: lat_deg,
-            target_lon_deg: lon_deg,
-            target_heading_deg: heading_deg,
-            target_tilt_deg: tilt_deg,
-            target_range_m: range_m,
-            left_down: false,
-            right_down: false,
-            last_pos: None,
-            viewport_w: w as f64,
-            viewport_h: h as f64,
-            sun_demo_mode: SunDemoMode::SystemClock,
-        }
-    }
-
-    fn snap_targets(&mut self) {
-        self.lat_deg = self.target_lat_deg;
-        self.lon_deg = self.target_lon_deg;
-        self.heading_deg = self.target_heading_deg;
-        self.tilt_deg = self.target_tilt_deg;
-        self.range_m = self.target_range_m;
-    }
-
-    fn has_pending_motion(&self) -> bool {
-        (self.range_m.ln() - self.target_range_m.ln()).abs() > 2e-4
-            || (self.lat_deg - self.target_lat_deg).abs() > 1e-4
-            || wrap_lon_delta_deg(self.target_lon_deg - self.lon_deg).abs() > 1e-4
-            || wrap_deg_360_delta(self.target_heading_deg, self.heading_deg).abs() > 1e-3
-            || (self.tilt_deg - self.target_tilt_deg).abs() > 1e-3
-    }
-
-    fn step_damping(&mut self, dt_s: f64) -> bool {
-        if !self.has_pending_motion() {
-            return false;
-        }
-        let alpha_zoom = 1.0 - (-dt_s * 10.5).exp();
-        let alpha_orbit = 1.0 - (-dt_s * 18.0).exp();
-
-        let log_cur = self.range_m.ln();
-        let log_tgt = self.target_range_m.ln();
-        if (log_tgt - log_cur).abs() <= 2e-4 {
-            self.range_m = self.target_range_m;
-        } else {
-            self.range_m = (log_cur + (log_tgt - log_cur) * alpha_zoom).exp();
-        }
-
-        let dlat = self.target_lat_deg - self.lat_deg;
-        self.lat_deg = if dlat.abs() <= 1e-4 {
-            self.target_lat_deg
-        } else {
-            self.lat_deg + dlat * alpha_orbit
-        };
-
-        let dlon = wrap_lon_delta_deg(self.target_lon_deg - self.lon_deg);
-        self.lon_deg = if dlon.abs() <= 1e-4 {
-            self.target_lon_deg
-        } else {
-            wrap_lon_delta_deg(self.lon_deg + dlon * alpha_orbit)
-        };
-
-        let dhead = wrap_deg_360_delta(self.target_heading_deg, self.heading_deg);
-        self.heading_deg = if dhead.abs() <= 1e-3 {
-            self.target_heading_deg
-        } else {
-            (self.heading_deg + dhead * alpha_orbit).rem_euclid(360.0)
-        };
-
-        let dtilt = self.target_tilt_deg - self.tilt_deg;
-        self.tilt_deg = if dtilt.abs() <= 1e-3 {
-            self.target_tilt_deg
-        } else {
-            self.tilt_deg + dtilt * alpha_orbit
-        };
-
-        true
-    }
-
-    fn to_camera(&self) -> EarthCamera {
-        // In 3D space (>1,200 km), always aim straight at the center of Earth so the full
-        // globe stays centered from every orbit angle; blend smoothly to angled ground 2.5D near surface.
-        let ground_weight = 1.0 - smoothstep(95_000.0, 1_150_000.0, self.range_m);
-        let eff_tilt_deg = (self.tilt_deg * ground_weight).max(0.05);
-        let tilt_rad = eff_tilt_deg.to_radians();
-        let head_rad = self.heading_deg.to_radians();
-        let horiz = self.range_m * tilt_rad.sin();
-        let up = self.range_m * tilt_rad.cos();
-        let center_aim_drop = -EARTH_RADIUS_M * (1.0 - ground_weight);
-        EarthCamera {
-            focus: Geodetic::new(self.lat_deg, self.lon_deg, 0.0),
-            aim_offset_m: [0.0, 0.0, center_aim_drop],
-            eye_offset_m: [-head_rad.sin() * horiz, -head_rad.cos() * horiz, up],
-            fov_y_deg: 55.0,
-            near_m: (self.range_m * 0.002).clamp(2.0, 20_000.0),
-        }
-    }
-
-    fn to_initial_input(
-        &self,
-        view_mode: EarthViewMode,
-        space: SpaceEnvironmentConfig,
-        weather: WeatherConfig,
-    ) -> EarthInput {
-        EarthInput {
-            camera: self.to_camera(),
-            viewport: Rect::new(0.0, 0.0, self.viewport_w as f32, self.viewport_h as f32),
-            view_mode,
-            seamless_25d: true,
-            tile_projection: TileProjection::WebMercator,
-            daylight: 0.96,
-            cloud_cover: 0.0,
-            surface_mode: SurfaceMode::QuadtreeLod,
-            layers: LayerToggles {
-                terrain: true,
-                buildings: false,
-                graticule: false,
-                labels: true,
-                clouds: true,
-                celestial: true,
-            },
-            elevation_enabled: true,
-            space,
-            weather,
-            tile_grid: 9,
-            max_tile_level: 16,
-            sse_threshold: 4.5,
-            ..EarthInput::default()
-        }
-    }
-}
-
-struct PreviewState {
-    viewport: EarthViewport,
-    orbit: OrbitState,
-    builtin_labels: Vec<EarthMapLabel>,
-    live_labels: LiveMapLabelStore,
-    last_is_25d_ui: bool,
-    last_label_sig: u64,
-}
-
-impl PreviewState {
-    fn label_state_signature(&self) -> u64 {
-        let inp = self.viewport.input();
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        let parts = [
-            inp.layers.labels as u64,
-            (self.orbit.lat_deg * 10_000.0).round() as i64 as u64,
-            (self.orbit.lon_deg * 10_000.0).round() as i64 as u64,
-            (self.orbit.range_m.ln() * 250.0).round() as u64,
-            (self.orbit.heading_deg * 10.0).round() as u64,
-            (self.orbit.tilt_deg * 10.0).round() as u64,
-            (inp.view_morph * 200.0).round() as u64,
-            self.live_labels
-                .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg)
-                .len() as u64,
-        ];
-        for p in parts {
-            h ^= p;
-            h = h.wrapping_mul(0x100_0000_01b3);
-        }
-        h
-    }
-
-    fn compute_projected_labels(&self) -> Vec<ProjectedEarthLabel> {
-        let inp = self.viewport.input();
-        if !inp.layers.labels {
-            return Vec::new();
-        }
-        let nearby = self
-            .live_labels
-            .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg);
-        if nearby.is_empty() {
-            project_earth_labels(inp, &self.builtin_labels, 36)
-        } else {
-            let mut combined = Vec::with_capacity(self.builtin_labels.len() + nearby.len());
-            combined.extend_from_slice(&self.builtin_labels);
-            combined.extend(nearby);
-            project_earth_labels(inp, &combined, 38)
-        }
-    }
-}
-
-fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
-    let x = lbl.screen_x;
-    let y = lbl.screen_y;
-    let op = format!("{:.3}", lbl.alpha.clamp(0.0, 1.0));
-    let [r, g, b] = lbl.rgb;
-
-    match lbl.icon {
-        EarthLabelIcon::HighwayShield => {
-            let is_interstate = lbl.text.starts_with("I-");
-            let is_us_route = lbl.text.starts_with("US-") || lbl.text.starts_with("CA-");
-            let shield_cls = if is_interstate {
-                "bg-blue-950/90 border-blue-400/80 text-white"
-            } else if is_us_route {
-                "bg-neutral-900/90 border-neutral-300/85 text-white"
-            } else {
-                // Regional/global highway codes such as CT05, E40, A1, M25
-                "bg-emerald-950/90 border-emerald-400/80 text-emerald-100"
-            };
-            rsx! {
-                <div
-                    class={format!("absolute px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide select-none shadow-md {}", shield_cls)}
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {};", x - 18.0, y - 9.0, op)}
-                >
-                    {lbl.text.clone()}
-                </div>
-            }
-        }
-        EarthLabelIcon::MountainRight => {
-            // Light green mountain text with mountain symbol on the right
-            rsx! {
-                <div
-                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, op, r, g, b, lbl.font_px)}
-                >
-                    <span class="font-medium">{lbl.text.clone()}</span>
-                    <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22L14 6z" />
-                    </svg>
-                </div>
-            }
-        }
-        EarthLabelIcon::ParkLeafRight => {
-            rsx! {
-                <div
-                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, op, r, g, b, lbl.font_px)}
-                >
-                    <span class="font-medium">{lbl.text.clone()}</span>
-                    <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                        <path d="M17 8C8 10 5.9 16.17 3.82 21.34l1.89.66l.95-2.3c.48.17.98.3 1.34.3C19 20 22 3 22 3c-1 2-8 2.25-13 3.25S2 11.5 2 13.5s1.75 3.75 1.75 3.75C7 8 17 8 17 8z" />
-                    </svg>
-                </div>
-            }
-        }
-        EarthLabelIcon::CityDot => {
-            rsx! {
-                <div
-                    class="absolute flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, op, r, g, b, lbl.font_px)}
-                >
-                    <div class="w-1.5 h-1.5 rounded-full bg-white/95" />
-                    <span class="font-medium">{lbl.text.clone()}</span>
-                </div>
-            }
-        }
-        EarthLabelIcon::None => {
-            let extra_cls = match lbl.kind {
-                EarthLabelKind::Continent => "font-semibold tracking-widest",
-                EarthLabelKind::Ocean => "italic tracking-wider",
-                EarthLabelKind::Country => "font-medium tracking-wide",
-                _ => "font-normal",
-            };
-            rsx! {
-                <div
-                    class={format!("absolute px-1 py-0.5 rounded bg-black/25 select-none whitespace-nowrap {}", extra_cls)}
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, op, r, g, b, lbl.font_px)}
-                >
-                    {lbl.text.clone()}
-                </div>
-            }
-        }
-    }
-}
-
 fn control_btn<F>(label: String, active: bool, on_click: F) -> View
 where
-    F: Fn(Event) + 'static,
+    F: Fn(strata_dom::Event) + 'static,
 {
     let tone = if active {
         "bg-indigo-600/90 border-indigo-400/70 text-white"
@@ -361,430 +34,450 @@ where
             class={format!("px-2.5 py-1 rounded-lg border text-[11px] font-medium cursor-pointer select-none whitespace-nowrap transition-colors {}", tone)}
             onclick={on_click}
         >
-            {label}
+            <span>{label}</span>
         </button>
     }
 }
 
-fn is_over_controls(rt: &AppRuntime, x: f32, y: f32) -> bool {
-    AppRuntime::hit_test_property(
-        &rt.root_blueprint,
-        &rt.layout_root,
-        x,
-        y,
-        "data-earth-controls",
-    )
-    .is_some()
-}
-
 fn main() -> Result<(), String> {
-    let initial_w = 1280u32;
-    let initial_h = 800u32;
-
-    let orbit = OrbitState::new(22.0, 12.0, 0.0, 42.0, 13_200_000.0, initial_w, initial_h);
-
-    let space = SpaceEnvironmentConfig::default().with_system_clock();
-    let weather = WeatherConfig {
-        global_cloud_spin_rad_s: 0.0022,
-        ..WeatherConfig::default()
-    };
-    let input = orbit.to_initial_input(EarthViewMode::Mode3D, space, weather);
-
-    let tile_ready = Arc::new(AtomicBool::new(false));
-    let tile_ready_cb = Arc::clone(&tile_ready);
     let cache_dir = std::env::temp_dir().join("strata_earth_preview_cache");
-
-    let mut source = if std::env::var_os("STRATA_EARTH_OFFLINE").is_some() {
+    let source = if std::env::var_os("STRATA_EARTH_OFFLINE").is_some() {
         EarthDefaultTileSource::offline_basemap()
     } else {
         EarthDefaultTileSource::world_satellite().with_disk_cache(&cache_dir)
     };
-    source.set_on_tile_ready(Some(Arc::new(move || {
-        tile_ready_cb.store(true, Ordering::Release);
-    })));
 
-    let viewport = EarthViewport::with_wakeup(&input, Box::new(source), None);
-    viewport.sync_now();
+    let mut orbit = EarthOrbitController::new();
+    orbit.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
+    orbit.set_viewport_size(1440.0, 900.0);
 
-    let retained = viewport.retained_scene();
-    let labels_ready = Arc::new(AtomicBool::new(false));
-    let labels_ready_cb = Arc::clone(&labels_ready);
-    let live_labels = LiveMapLabelStore::new(Some(Arc::new(move || {
-        labels_ready_cb.store(true, Ordering::Release);
-    })));
-    let state = Arc::new(Mutex::new(PreviewState {
-        viewport,
-        orbit,
-        builtin_labels: builtin_world_labels(),
-        live_labels,
-        last_is_25d_ui: false,
-        last_label_sig: 0,
-    }));
-
-    let config = WindowConfig {
-        title: "Strata Earth".to_string(),
-        width: initial_w,
-        height: initial_h,
-        present_mode: PresentMode::Fifo,
-        resizable: true,
-        ..WindowConfig::default()
+    let (init_cam, init_up) = orbit.to_camera_and_up(false, 0.0);
+    let mut input = EarthInput::globe();
+    input.camera = init_cam;
+    input.camera_up_ecef = init_up;
+    input.viewport = strata::layout::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 1440.0,
+        height: 900.0,
     };
+    input.view_mode = EarthViewMode::Mode3D;
+    input.elevation_enabled = true;
+    input.space = SpaceEnvironmentConfig::default().with_system_clock();
+    input.weather = WeatherConfig::default();
 
-    let retained_for_view = retained;
-    let state_view = Arc::clone(&state);
-    let state_events = Arc::clone(&state);
-    let state_frame = Arc::clone(&state);
-    let tile_ready_frame = Arc::clone(&tile_ready);
-    let labels_ready_frame = Arc::clone(&labels_ready);
+    let earth = EarthView::with_orbit(&input, Box::new(source), orbit);
+    let sun_demo_mode = Rc::new(RefCell::new(SunDemoMode::SystemClock));
+    let sun_cycle_sim_s = Rc::new(RefCell::new(1_735_689_600.0f64));
+    let active_preset = Rc::new(RefCell::new(TileProviderPreset::ArcGisWorldImagery));
 
-    launch_with_frame(
-        move || {
-            let (is_2d, is_25d_view, sp, w, elev_on, labels_on, sun_mode, label_views) = {
-                let mut guard = state_view.lock().unwrap();
-                guard.last_label_sig = guard.label_state_signature();
-                let projected = guard.compute_projected_labels();
-                let views: Vec<View> = projected.iter().map(render_earth_label).collect();
+    let earth_for_view = earth.clone();
+    let mode_for_view = Rc::clone(&sun_demo_mode);
+    let sim_for_view = Rc::clone(&sun_cycle_sim_s);
+    let preset_for_view = Rc::clone(&active_preset);
+
+    let build_root = move || -> View {
+        let (is_2d, at_local_25d, sp, elev_on, labels_on, w, ocean_on) =
+            earth_for_view.with_state(|st| {
+                let inp = st.viewport.input();
                 (
-                    guard.viewport.view_mode() == EarthViewMode::Mode2D,
-                    guard.orbit.range_m < 100_000.0,
-                    guard.viewport.space_config().clone(),
-                    guard.viewport.weather_config().clone(),
-                    guard.viewport.elevation_enabled(),
-                    guard.viewport.labels_enabled(),
-                    guard.orbit.sun_demo_mode,
-                    views,
+                    st.viewport.view_mode() == EarthViewMode::Mode2D,
+                    st.orbit.range_m < 20_000.0,
+                    inp.space.clone(),
+                    inp.elevation_enabled,
+                    inp.layers.labels,
+                    inp.weather.clone(),
+                    inp.ocean_waves.enabled,
                 )
-            };
+            });
+        let cur_sun_mode = *mode_for_view.borrow();
+        let cur_preset = *preset_for_view.borrow();
 
-            let s_mode = Arc::clone(&state_view);
-            let btn_mode = control_btn(
-                if is_2d { "Mode: 2D" } else { "Mode: 3D" }.to_string(),
-                is_2d,
-                move |_| {
-                    let mut st = s_mode.lock().unwrap();
+        let e1 = earth_for_view.clone();
+        let btn_mode = control_btn(
+            if is_2d { "Mode: 2D" } else { "Mode: 3D" }.to_string(),
+            is_2d,
+            move |_| {
+                e1.with_state_mut(|st| {
                     let next = match st.viewport.view_mode() {
                         EarthViewMode::Mode3D => EarthViewMode::Mode2D,
                         EarthViewMode::Mode2D => EarthViewMode::Mode3D,
                     };
-                    st.viewport.set_view_mode(next);
-                },
-            );
+                    st.set_view_mode(next);
+                });
+            },
+        );
 
-            let s_jump = Arc::clone(&state_view);
-            let btn_jump = control_btn(
-                if is_25d_view {
-                    "View: 2.5D SF"
-                } else {
-                    "View: Space"
-                }
-                .to_string(),
-                is_25d_view,
-                move |_| {
-                    let mut st = s_jump.lock().unwrap();
-                    if st.orbit.range_m > 100_000.0 {
-                        st.orbit.lat_deg = 37.7749;
-                        st.orbit.lon_deg = -122.4194;
-                        st.orbit.tilt_deg = 48.0;
-                        st.orbit.range_m = 9_500.0;
-                        st.orbit.target_lat_deg = 37.7749;
-                        st.orbit.target_lon_deg = -122.4194;
-                        st.orbit.target_tilt_deg = 48.0;
-                        st.orbit.target_range_m = 9_500.0;
+        let e2 = earth_for_view.clone();
+        let btn_view = control_btn(
+            if at_local_25d {
+                "View: 2.5D SF"
+            } else {
+                "View: Space"
+            }
+            .to_string(),
+            at_local_25d,
+            move |_| {
+                e2.with_state_mut(|st| {
+                    if st.orbit.range_m < 20_000.0 {
+                        st.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
                     } else {
-                        st.orbit.lat_deg = 22.0;
-                        st.orbit.lon_deg = 12.0;
-                        st.orbit.tilt_deg = 42.0;
-                        st.orbit.range_m = 13_200_000.0;
-                        st.orbit.target_lat_deg = 22.0;
-                        st.orbit.target_lon_deg = 12.0;
-                        st.orbit.target_tilt_deg = 42.0;
-                        st.orbit.target_range_m = 13_200_000.0;
+                        if st.viewport.view_mode() == EarthViewMode::Mode2D {
+                            st.viewport.set_view_mode(EarthViewMode::Mode3D);
+                            st.orbit.set_is_2d_hint(false);
+                        }
+                        st.jump_to(37.7749, -122.4194, 3_200.0, 22.0, 58.0);
                     }
-                    let cam = st.orbit.to_camera();
-                    let vw = st.orbit.viewport_w;
-                    let vh = st.orbit.viewport_h;
-                    st.viewport.update_camera(&cam, vw, vh);
-                },
-            );
+                });
+            },
+        );
 
-            let s_dn = Arc::clone(&state_view);
-            let btn_dn = control_btn("Day/Night".to_string(), sp.day_night_lighting, move |_| {
-                let mut st = s_dn.lock().unwrap();
-                let mut next = st.viewport.space_config().clone();
-                next.day_night_lighting = !next.day_night_lighting;
-                st.viewport.set_space_config(next);
+        let e3 = earth_for_view.clone();
+        let btn_sun_lit = control_btn(
+            if sp.day_night_lighting {
+                "Sun Light: On"
+            } else {
+                "Sun Light: Unified"
+            }
+            .to_string(),
+            sp.day_night_lighting,
+            move |_| {
+                e3.with_state_mut(|st| {
+                    let mut sp = st.viewport.space_config().clone();
+                    sp.day_night_lighting = !sp.day_night_lighting;
+                    st.viewport.set_space_config(sp);
+                    st.notify_ui_changed();
+                });
+            },
+        );
+
+        let e4 = earth_for_view.clone();
+        let btn_city = control_btn("City Lights".to_string(), sp.city_lights, move |_| {
+            e4.with_state_mut(|st| {
+                let mut sp = st.viewport.space_config().clone();
+                sp.city_lights = !sp.city_lights;
+                st.viewport.set_space_config(sp);
+                st.notify_ui_changed();
             });
+        });
 
-            let s_city = Arc::clone(&state_view);
-            let btn_city = control_btn("City Lights".to_string(), sp.city_lights, move |_| {
-                let mut st = s_city.lock().unwrap();
-                let mut next = st.viewport.space_config().clone();
-                next.city_lights = !next.city_lights;
-                st.viewport.set_space_config(next);
-            });
-
-            let s_sun = Arc::clone(&state_view);
-            let sun_label = match sun_mode {
+        let e5 = earth_for_view.clone();
+        let m5 = Rc::clone(&mode_for_view);
+        let s5 = Rc::clone(&sim_for_view);
+        let btn_sun_mode = control_btn(
+            match cur_sun_mode {
                 SunDemoMode::SystemClock => "Sun: OS Clock",
                 SunDemoMode::OrbitalCycle => "Sun: Cycle",
                 SunDemoMode::FixedSunset => "Sun: Sunset",
-            };
-            let btn_sun = control_btn(
-                sun_label.to_string(),
-                sun_mode != SunDemoMode::SystemClock,
-                move |_| {
-                    let mut st = s_sun.lock().unwrap();
-                    let mut next = st.viewport.space_config().clone();
-                    st.orbit.sun_demo_mode = match st.orbit.sun_demo_mode {
+            }
+            .to_string(),
+            cur_sun_mode != SunDemoMode::FixedSunset,
+            move |_| {
+                let next = match *m5.borrow() {
+                    SunDemoMode::SystemClock => SunDemoMode::OrbitalCycle,
+                    SunDemoMode::OrbitalCycle => SunDemoMode::FixedSunset,
+                    SunDemoMode::FixedSunset => SunDemoMode::SystemClock,
+                };
+                *m5.borrow_mut() = next;
+                e5.with_state_mut(|st| {
+                    let mut sp = st.viewport.space_config().clone();
+                    match next {
                         SunDemoMode::SystemClock => {
-                            next.sun_direction = SunDirectionMode::SimulationTime;
-                            SunDemoMode::OrbitalCycle
+                            sp.sun_direction = SunDirectionMode::SystemClock;
                         }
                         SunDemoMode::OrbitalCycle => {
-                            next.sun_direction = SunDirectionMode::SubsolarPoint {
-                                lat_deg: 20.0,
-                                lon_deg: st.orbit.lon_deg - 52.0,
-                            };
-                            SunDemoMode::FixedSunset
+                            sp.sun_direction = SunDirectionMode::SimulationTime;
+                            st.viewport.set_sim_time_unix_s(*s5.borrow());
                         }
                         SunDemoMode::FixedSunset => {
-                            next.sun_direction = SunDirectionMode::SystemClock;
-                            SunDemoMode::SystemClock
+                            sp.sun_direction = SunDirectionMode::CustomEcef([0.85, 0.48, 0.22]);
                         }
-                    };
-                    st.viewport.set_space_config(next);
-                },
-            );
-
-            let s_space = Arc::clone(&state_view);
-            let btn_stars = control_btn("Stars/Moon".to_string(), sp.stars_visible, move |_| {
-                let mut st = s_space.lock().unwrap();
-                let mut next = st.viewport.space_config().clone();
-                let on = !next.stars_visible;
-                next.stars_visible = on;
-                next.sun_visible = on;
-                next.moon_visible = on;
-                st.viewport.set_space_config(next);
-            });
-
-            let s_sats = Arc::clone(&state_view);
-            let btn_sats =
-                control_btn("Satellites".to_string(), sp.satellites_visible, move |_| {
-                    let mut st = s_sats.lock().unwrap();
-                    let mut next = st.viewport.space_config().clone();
-                    next.satellites_visible = !next.satellites_visible;
-                    st.viewport.set_space_config(next);
+                    }
+                    st.viewport.set_space_config(sp);
+                    st.notify_ui_changed();
                 });
+            },
+        );
 
-            let s_elev = Arc::clone(&state_view);
-            let btn_elev = control_btn("Heightmap".to_string(), elev_on, move |_| {
-                let mut st = s_elev.lock().unwrap();
+        let e6 = earth_for_view.clone();
+        let btn_stars = control_btn("Stars/Moon".to_string(), sp.stars_visible, move |_| {
+            e6.with_state_mut(|st| {
+                let mut sp = st.viewport.space_config().clone();
+                sp.stars_visible = !sp.stars_visible;
+                sp.sun_visible = sp.stars_visible;
+                sp.moon_visible = sp.stars_visible;
+                st.viewport.set_space_config(sp);
+                st.notify_ui_changed();
+            });
+        });
+
+        let e7 = earth_for_view.clone();
+        let btn_survey = control_btn(
+            format!("Sky: {}", sp.skybox_survey.display_label()),
+            sp.stars_visible,
+            move |_| {
+                e7.with_state_mut(|st| {
+                    let mut sp = st.viewport.space_config().clone();
+                    sp.skybox_survey = sp.skybox_survey.next();
+                    st.viewport.set_space_config(sp);
+                    st.notify_ui_changed();
+                });
+            },
+        );
+
+        let e8 = earth_for_view.clone();
+        let btn_sky_res = control_btn(
+            format!("Res: {}", sp.skybox_quality.short_label()),
+            sp.stars_visible,
+            move |_| {
+                e8.with_state_mut(|st| {
+                    let mut sp = st.viewport.space_config().clone();
+                    sp.skybox_quality = sp.skybox_quality.next();
+                    st.viewport.set_space_config(sp);
+                    st.notify_ui_changed();
+                });
+            },
+        );
+
+        let e9 = earth_for_view.clone();
+        let btn_sats = control_btn("Satellites".to_string(), sp.satellites_visible, move |_| {
+            e9.with_state_mut(|st| {
+                let mut sp = st.viewport.space_config().clone();
+                sp.satellites_visible = !sp.satellites_visible;
+                sp.satellite_orbits_visible = sp.satellites_visible;
+                st.viewport.set_space_config(sp);
+                st.notify_ui_changed();
+            });
+        });
+
+        let e10 = earth_for_view.clone();
+        let btn_elev = control_btn("Heightmap".to_string(), elev_on, move |_| {
+            e10.with_state_mut(|st| {
                 let next = !st.viewport.elevation_enabled();
                 st.viewport.set_elevation_enabled(next);
+                st.sync_camera();
+                st.notify_ui_changed();
             });
+        });
 
-            let s_labels = Arc::clone(&state_view);
-            let btn_labels = control_btn("Labels".to_string(), labels_on, move |_| {
-                let mut st = s_labels.lock().unwrap();
+        let e11 = earth_for_view.clone();
+        let btn_labels = control_btn("Labels".to_string(), labels_on, move |_| {
+            e11.with_state_mut(|st| {
                 let next = !st.viewport.labels_enabled();
                 st.viewport.set_labels_enabled(next);
+                st.notify_ui_changed();
             });
+        });
 
-            let s_gcloud = Arc::clone(&state_view);
-            let btn_gcloud = control_btn("3D Clouds".to_string(), w.global_cloud_map, move |_| {
-                let mut st = s_gcloud.lock().unwrap();
-                let mut next = st.viewport.weather_config().clone();
-                next.global_cloud_map = !next.global_cloud_map;
-                st.viewport.set_weather_config(next);
+        let e12 = earth_for_view.clone();
+        let btn_gcloud = control_btn("Clouds".to_string(), w.global_cloud_map, move |_| {
+            e12.with_state_mut(|st| {
+                let mut w = st.viewport.weather_config().clone();
+                w.global_cloud_map = !w.global_cloud_map;
+                w.clouds_25d = w.global_cloud_map;
+                st.viewport.set_weather_config(w);
+                st.notify_ui_changed();
             });
+        });
 
-            let s_wclouds = Arc::clone(&state_view);
-            let btn_wclouds = control_btn("2.5D Clouds".to_string(), w.clouds_25d, move |_| {
-                let mut st = s_wclouds.lock().unwrap();
-                let mut next = st.viewport.weather_config().clone();
-                next.clouds_25d = !next.clouds_25d;
-                st.viewport.set_weather_config(next);
+        let e13 = earth_for_view.clone();
+        let btn_cloud_res = control_btn(
+            format!("Clouds: {}", w.cloud_resolution.short_label()),
+            w.global_cloud_map,
+            move |_| {
+                e13.with_state_mut(|st| {
+                    let mut w = st.viewport.weather_config().clone();
+                    w.cloud_resolution = w.cloud_resolution.next();
+                    st.viewport.set_weather_config(w);
+                    st.notify_ui_changed();
+                });
+            },
+        );
+
+        let e14 = earth_for_view.clone();
+        let btn_rain = control_btn("Rain".to_string(), w.rain, move |_| {
+            e14.with_state_mut(|st| {
+                let mut w = st.viewport.weather_config().clone();
+                w.rain = !w.rain;
+                st.viewport.set_weather_config(w);
+                st.notify_ui_changed();
             });
+        });
 
-            let s_rain = Arc::clone(&state_view);
-            let btn_rain = control_btn("Rain".to_string(), w.rain, move |_| {
-                let mut st = s_rain.lock().unwrap();
-                let mut next = st.viewport.weather_config().clone();
-                next.rain = !next.rain;
-                st.viewport.set_weather_config(next);
+        let e15 = earth_for_view.clone();
+        let btn_snow = control_btn("Snow".to_string(), w.snow, move |_| {
+            e15.with_state_mut(|st| {
+                let mut w = st.viewport.weather_config().clone();
+                w.snow = !w.snow;
+                st.viewport.set_weather_config(w);
+                st.notify_ui_changed();
             });
+        });
 
-            let s_snow = Arc::clone(&state_view);
-            let btn_snow = control_btn("Snow".to_string(), w.snow, move |_| {
-                let mut st = s_snow.lock().unwrap();
-                let mut next = st.viewport.weather_config().clone();
-                next.snow = !next.snow;
-                st.viewport.set_weather_config(next);
-            });
+        let e16 = earth_for_view.clone();
+        let p16 = Rc::clone(&preset_for_view);
+        let btn_provider = control_btn(
+            format!("Map: {}", cur_preset.display_name()),
+            cur_preset != TileProviderPreset::ArcGisWorldImagery,
+            move |_| {
+                let next = p16.borrow().next_public();
+                *p16.borrow_mut() = next;
+                e16.with_state_mut(|st| {
+                    st.viewport.set_tile_preset(next);
+                    st.notify_ui_changed();
+                });
+            },
+        );
 
-            let canvas = Canvas3D::builder()
-                .retained(retained_for_view.clone())
-                .class("absolute inset-0 w-full h-full z-0")
-                .build();
+        let e17 = earth_for_view.clone();
+        let btn_ocean = control_btn("Ocean Waves".to_string(), ocean_on, move |_| {
+            e17.set_ocean_waves_enabled(!ocean_on);
+        });
 
-            rsx! {
-                <div class="relative w-full h-full bg-black overflow-hidden">
-                    {canvas}
-                    <div class="absolute inset-0 z-10 pointer-events-none">
-                        {label_views}
-                    </div>
-                    <div
-                        data-earth-controls="true"
-                        class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
-                    >
-                        {btn_mode}
-                        {btn_jump}
-                        {btn_dn}
-                        {btn_city}
-                        {btn_sun}
-                        {btn_stars}
-                        {btn_sats}
-                        {btn_elev}
-                        {btn_labels}
-                        {btn_gcloud}
-                        {btn_wclouds}
-                        {btn_rain}
-                        {btn_snow}
-                    </div>
+        rsx! {
+            <div class="relative w-full h-full bg-black overflow-hidden">
+                {earth_for_view.view()}
+                <div
+                    data-earth-controls="true"
+                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/75 border border-neutral-800/80 backdrop-blur-md shadow-2xl"
+                >
+                    {btn_mode}
+                    {btn_provider}
+                    {btn_view}
+                    {btn_sun_lit}
+                    {btn_city}
+                    {btn_ocean}
+                    {btn_sun_mode}
+                    {btn_stars}
+                    {btn_survey}
+                    {btn_sky_res}
+                    {btn_sats}
+                    {btn_elev}
+                    {btn_labels}
+                    {btn_gcloud}
+                    {btn_cloud_res}
+                    {btn_rain}
+                    {btn_snow}
                 </div>
-            }
-        },
+            </div>
+        }
+    };
+
+    let config = WindowConfig {
+        title: "Strata Earth".to_string(),
+        width: 1440,
+        height: 900,
+        resizable: true,
+        ..Default::default()
+    };
+
+    let earth_for_frame = earth;
+    let mode_for_frame = sun_demo_mode;
+    let sim_for_frame = sun_cycle_sim_s;
+
+    launch_with_frame(
+        build_root,
         config,
-        move |ev, rt| {
-            let mut st = state_events.lock().unwrap();
-            let rw = rt.viewport_width.max(1.0) as f64;
-            let rh = rt.viewport_height.max(1.0) as f64;
-            if (rw - st.orbit.viewport_w).abs() > 0.5 || (rh - st.orbit.viewport_h).abs() > 0.5 {
-                st.orbit.viewport_w = rw;
-                st.orbit.viewport_h = rh;
-                let cam = st.orbit.to_camera();
-                st.viewport.update_camera(&cam, rw, rh);
-            }
-
-            match ev {
-                PlatformEvent::MouseDown { button, x, y } => {
-                    st.orbit.last_pos = Some((*x, *y));
-                    if !is_over_controls(rt, *x, *y) {
-                        match button {
-                            MouseButton::Left => st.orbit.left_down = true,
-                            MouseButton::Right | MouseButton::Middle => st.orbit.right_down = true,
-                            MouseButton::Other(_) => {}
-                        }
-                    }
-                }
-                PlatformEvent::MouseUp { button, .. } => match button {
-                    MouseButton::Left => st.orbit.left_down = false,
-                    MouseButton::Right | MouseButton::Middle => st.orbit.right_down = false,
-                    MouseButton::Other(_) => {}
-                },
-                PlatformEvent::CursorLeft => {
-                    st.orbit.left_down = false;
-                    st.orbit.right_down = false;
-                }
-                PlatformEvent::MouseMove { x, y } => {
-                    if let Some((lx, ly)) = st.orbit.last_pos {
-                        let dx = (*x - lx) as f64;
-                        let dy = (*y - ly) as f64;
-                        if st.orbit.left_down {
-                            let meters_per_px =
-                                (st.orbit.target_range_m * 1.05) / st.orbit.viewport_h.max(1.0);
-                            let deg_per_m = 180.0 / (PI * EARTH_RADIUS_M);
-                            let cos_lat = st.orbit.target_lat_deg.to_radians().cos().abs().max(0.2);
-                            let h_rad = st.orbit.target_heading_deg.to_radians();
-                            let north_m = dy * h_rad.cos() - dx * h_rad.sin();
-                            let east_m = -dx * h_rad.cos() - dy * h_rad.sin();
-                            st.orbit.target_lat_deg = (st.orbit.target_lat_deg
-                                + north_m * meters_per_px * deg_per_m)
-                                .clamp(-85.0, 85.0);
-                            let next_lon = st.orbit.target_lon_deg
-                                + east_m * meters_per_px * deg_per_m / cos_lat;
-                            st.orbit.target_lon_deg = wrap_lon_delta_deg(next_lon);
-                            st.orbit.snap_targets();
-                            let cam = st.orbit.to_camera();
-                            let vw = st.orbit.viewport_w;
-                            let vh = st.orbit.viewport_h;
-                            st.viewport.update_camera(&cam, vw, vh);
-                        } else if st.orbit.right_down {
-                            st.orbit.target_heading_deg =
-                                (st.orbit.target_heading_deg + dx * 0.25).rem_euclid(360.0);
-                            st.orbit.target_tilt_deg =
-                                (st.orbit.target_tilt_deg + dy * 0.25).clamp(0.0, 72.0);
-                            st.orbit.snap_targets();
-                            let cam = st.orbit.to_camera();
-                            let vw = st.orbit.viewport_w;
-                            let vh = st.orbit.viewport_h;
-                            st.viewport.update_camera(&cam, vw, vh);
-                        }
-                    }
-                    st.orbit.last_pos = Some((*x, *y));
-                }
-                PlatformEvent::Scroll { delta_y, .. } => {
-                    let (mx, my) = rt.last_mouse_pos;
-                    if !is_over_controls(rt, mx, my) {
-                        // GTK always scales both wheel clicks (+/-110) and smooth touchpad deltas by 110.0.
-                        let notches = ((*delta_y as f64) / 110.0).clamp(-2.5, 2.5);
-                        let zoom_factor = 1.075f64.powf(notches);
-                        st.orbit.target_range_m =
-                            (st.orbit.target_range_m * zoom_factor).clamp(1_200.0, 18_000_000.0);
-                    }
-                }
-                _ => {}
-            }
-            false
-        },
+        |_, _| false,
         Some(Duration::from_millis(16)),
-        move |info, _rt| {
-            let mut st = state_frame.lock().unwrap();
-            let dt = info.dt.as_secs_f64().clamp(0.0, 0.05);
-
-            if tile_ready_frame.swap(false, Ordering::AcqRel) {
-                let cam = st.orbit.to_camera();
-                let vw = st.orbit.viewport_w;
-                let vh = st.orbit.viewport_h;
-                st.viewport.update_camera(&cam, vw, vh);
+        move |info: AppFrameInfo, _rt: &mut AppRuntime| -> FrameOutcome {
+            let dt = info.dt.as_secs_f64();
+            if *mode_for_frame.borrow() == SunDemoMode::OrbitalCycle {
+                *sim_for_frame.borrow_mut() += dt * 3_600.0;
+                let sim_s = *sim_for_frame.borrow();
+                earth_for_frame.with_state_mut(|st| {
+                    st.viewport.set_sim_time_unix_s(sim_s);
+                });
             }
-
-            if st.orbit.step_damping(dt) {
-                let cam = st.orbit.to_camera();
-                let vw = st.orbit.viewport_w;
-                let vh = st.orbit.viewport_h;
-                st.viewport.update_camera(&cam, vw, vh);
-            }
-
-            if st.viewport.is_transitioning() {
-                st.viewport.step_transition(dt);
-            }
-
-            if st.orbit.sun_demo_mode == SunDemoMode::OrbitalCycle {
-                let next_t = st.viewport.input().sim_time_unix_s + dt * 3_600.0;
-                st.viewport.set_sim_time_unix_s(next_t);
-            }
-
-            let tick_satellites = st.orbit.sun_demo_mode != SunDemoMode::FixedSunset;
-            let _ = st.viewport.step_dynamic_overlays(dt, tick_satellites);
-
-            if st.viewport.labels_enabled() {
-                let lat = st.orbit.lat_deg;
-                let lon = st.orbit.lon_deg;
-                let rng = st.orbit.range_m;
-                st.live_labels.ensure_local_sector(lat, lon, rng);
-            }
-
-            let is_25d_ui = st.orbit.range_m < 100_000.0;
-            let label_sig = st.label_state_signature();
-            let labels_arrived = labels_ready_frame.swap(false, Ordering::AcqRel);
-            if is_25d_ui != st.last_is_25d_ui || label_sig != st.last_label_sig || labels_arrived {
-                st.last_is_25d_ui = is_25d_ui;
-                st.last_label_sig = label_sig;
-                FrameOutcome::Dirty
-            } else {
-                FrameOutcome::Unchanged
-            }
+            earth_for_frame.step_frame(dt)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use strata_earth::{ecef_to_geodetic, EarthOrbitController, LocalFrame, MIN_RANGE_M};
+    use strata_render::camera64::DVec3;
+
+    #[test]
+    fn orbit_zoom_and_tilt_never_roll_camera() {
+        let mut orbit = EarthOrbitController::new();
+        orbit.set_viewport_size(1440.0, 900.0);
+        orbit.handle_mouse_down(2, 720.0, 450.0);
+        orbit.handle_mouse_move(780.0, 410.0);
+        orbit.handle_mouse_up(2);
+
+        let before_tilt = orbit.tilt_deg;
+        let first_step = orbit.step_damping(1.0 / 60.0, false, |_, _| 0.0);
+        assert!(first_step, "orbit/tilt must damp smoothly rather than snapping");
+        assert!(orbit.tilt_deg >= before_tilt - 1.0);
+
+        let (cam, up_opt) = orbit.to_camera_and_up(false, 0.0);
+        let up_v = up_opt
+            .map(|u| DVec3::new(u[0], u[1], u[2]))
+            .expect("3D camera provides up vector");
+        let frame = LocalFrame::at(cam.focus.lat_deg, cam.focus.lon_deg);
+        let up_dot = up_v.dot(frame.up);
+        assert!(
+            up_dot.abs() < 0.05,
+            "screen-up hint must lie in local tangent plane, got dot={up_dot}"
+        );
+        assert!(
+            cam.focus.lat_deg.abs() <= 89.95,
+            "latitude must stay safely away from polar flip singularity"
+        );
+    }
+
+    #[test]
+    fn pivot_orbit_and_pan_in_25d_work_smoothly() {
+        let mut orbit = EarthOrbitController::new();
+        orbit.set_viewport_size(1440.0, 900.0);
+        orbit.jump_to(37.7749, -122.4194, 4_000.0, 0.0, 45.0);
+
+        let h0 = orbit.heading_deg;
+        let t0 = orbit.tilt_deg;
+        orbit.handle_mouse_down(2, 720.0, 450.0);
+        orbit.handle_mouse_move(820.0, 390.0);
+        orbit.handle_mouse_up(2);
+
+        assert!(
+            (orbit.heading_deg - h0).abs() > 1.0,
+            "horizontal pivot drag must orbit azimuth heading cleanly around pivot, got {}",
+            orbit.heading_deg
+        );
+        assert!(
+            orbit.tilt_deg > t0,
+            "upward drag must increase tilt cleanly around pivot"
+        );
+
+        let lat0 = orbit.lat_deg;
+        let lon0 = orbit.lon_deg;
+        orbit.handle_mouse_down(0, 720.0, 450.0);
+        orbit.handle_mouse_move(600.0, 380.0);
+        orbit.handle_mouse_up(0);
+        assert!(orbit.step_damping(1.0 / 60.0, false, |_, _| 0.0));
+        assert!(
+            (orbit.lat_deg - lat0).abs() > 1e-5 || (orbit.lon_deg - lon0).abs() > 1e-5,
+            "left drag in 2.5D must pan terrain focus cleanly"
+        );
+    }
+
+    #[test]
+    fn close_ground_zoom_stays_above_mountain_elevation() {
+        let mut orbit = EarthOrbitController::new();
+        orbit.set_viewport_size(800.0, 600.0);
+        orbit.jump_to(46.0, 7.6, 80.0, 15.0, 75.0);
+        for _ in 0..20 {
+            orbit.handle_scroll(-110.0, 400.0, 300.0);
+        }
+        let peak_m = |_: f64, _: f64| 4_200.0;
+        for _ in 0..90 {
+            orbit.step_damping(1.0 / 60.0, false, peak_m);
+        }
+        assert!(orbit.range_m >= MIN_RANGE_M - 1e-6 && orbit.range_m <= 55.0);
+        let (cam, up_opt) = orbit.to_camera_and_up_clamped(false, peak_m);
+        let p = cam.placement_with_up(up_opt.map(|u| DVec3::new(u[0], u[1], u[2])));
+        let eye_geo = ecef_to_geodetic(p.eye);
+        assert!(eye_geo.height_m >= 4_200.0 + 24.5);
+    }
 }

@@ -273,6 +273,11 @@ impl EarthCamera {
     /// That keeps a one-metre offset resolvable at terrain altitudes while
     /// never clipping the surface below the eye.
     pub fn placement(&self) -> CameraPlacement {
+        self.placement_with_up(None)
+    }
+
+    /// Resolves ECEF eye, aim, depth range, and optional custom up vector for arcball orientation.
+    pub fn placement_with_up(&self, up_override: Option<DVec3>) -> CameraPlacement {
         let anchor = geodetic_to_ecef(self.focus);
         let frame = LocalFrame::at(self.focus.lat_deg, self.focus.lon_deg);
         let offset = |[e, n, u]: [f64; 3]| {
@@ -284,12 +289,15 @@ impl EarthCamera {
         };
         let eye = anchor.add(offset(self.eye_offset_m));
         let aim = anchor.add(offset(self.aim_offset_m));
-        // The camera's up vector is the local up, so the globe's north stays
-        // up in the frame.
-        let up = frame.up;
+        let up = match up_override {
+            Some(u) if u.length() > 1e-6 => u.normalize(),
+            _ => frame.up,
+        };
         let altitude = self.altitude_m();
         let horizon = horizon_distance_m(altitude);
-        let (near, far) = depth_range(altitude, horizon, self.near_m);
+        let clearance = altitude.min(self.eye_distance_m().max(2.0));
+        let (near, _) = depth_range(clearance, horizon, self.near_m);
+        let (_, far) = depth_range(altitude, horizon, self.near_m);
         CameraPlacement {
             eye,
             aim,
@@ -311,7 +319,26 @@ pub fn screen_to_ray(
     viewport_height: f64,
     camera: &EarthCamera,
 ) -> (DVec3, DVec3) {
-    let placement = camera.placement();
+    screen_to_ray_with_up(
+        screen_x,
+        screen_y,
+        viewport_width,
+        viewport_height,
+        camera,
+        None,
+    )
+}
+
+/// Same as [`screen_to_ray`] with an optional explicit ECEF camera-up hint.
+pub fn screen_to_ray_with_up(
+    screen_x: f64,
+    screen_y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+) -> (DVec3, DVec3) {
+    let placement = camera.placement_with_up(up_override);
     let eye = placement.eye;
     let aim = placement.aim;
 
@@ -366,8 +393,33 @@ pub fn pick_geodetic(
     viewport_height: f64,
     camera: &EarthCamera,
 ) -> Option<Geodetic> {
-    let (ray_origin, ray_dir) =
-        screen_to_ray(screen_x, screen_y, viewport_width, viewport_height, camera);
+    pick_geodetic_with_up(
+        screen_x,
+        screen_y,
+        viewport_width,
+        viewport_height,
+        camera,
+        None,
+    )
+}
+
+/// Same as [`pick_geodetic`] with an optional explicit ECEF camera-up hint.
+pub fn pick_geodetic_with_up(
+    screen_x: f64,
+    screen_y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+) -> Option<Geodetic> {
+    let (ray_origin, ray_dir) = screen_to_ray_with_up(
+        screen_x,
+        screen_y,
+        viewport_width,
+        viewport_height,
+        camera,
+        up_override,
+    );
     let hit_ecef = raycast_ellipsoid(ray_origin, ray_dir)?;
     Some(ecef_to_geodetic(hit_ecef))
 }
@@ -940,7 +992,17 @@ pub struct Frustum6 {
 impl Frustum6 {
     /// Extracts the 6 exact clip planes from `camera` and viewport size in `f64`.
     pub fn from_camera(camera: &EarthCamera, viewport_w: f64, viewport_h: f64) -> Self {
-        let placement = camera.placement();
+        Self::from_camera_with_up(camera, None, viewport_w, viewport_h)
+    }
+
+    /// Extracts the 6 exact clip planes from `camera` with an optional custom up vector.
+    pub fn from_camera_with_up(
+        camera: &EarthCamera,
+        up_override: Option<DVec3>,
+        viewport_w: f64,
+        viewport_h: f64,
+    ) -> Self {
+        let placement = camera.placement_with_up(up_override);
         let aspect = (viewport_w.max(1.0) / viewport_h.max(1.0)).max(0.01);
         Self::new(
             placement.eye,
@@ -1026,7 +1088,7 @@ impl Frustum6 {
 }
 
 /// Default hard ceiling on visible quadtree leaves emitted per frame so GPU texture atlas capacity is never exceeded.
-pub const MAX_QUADTREE_LEAVES: usize = 144;
+pub const MAX_QUADTREE_LEAVES: usize = 256;
 
 #[derive(Clone, Copy)]
 struct LodCandidate {
@@ -1070,18 +1132,52 @@ pub fn traverse_quadtree_lod_frustum6_projected(
     max_leaves: usize,
     projection: TileProjection,
 ) -> Vec<TileKey> {
+    traverse_quadtree_lod_frustum6_projected_with_up(
+        camera,
+        None,
+        viewport_width_px,
+        viewport_height_px,
+        sse_threshold_px,
+        max_level,
+        tile_grid,
+        horizon_cull,
+        max_leaves,
+        projection,
+    )
+}
+
+/// Same as [`traverse_quadtree_lod_frustum6_projected`] with an optional explicit camera up hint.
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod_frustum6_projected_with_up(
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+    horizon_cull: bool,
+    max_leaves: usize,
+    projection: TileProjection,
+) -> Vec<TileKey> {
     let cap = max_leaves.max(4);
-    let placement = camera.placement();
+    let placement = camera.placement_with_up(up_override);
     let eye = placement.eye;
-    let frustum = Frustum6::from_camera(camera, viewport_width_px, viewport_height_px);
+    let frustum = Frustum6::from_camera_with_up(
+        camera,
+        up_override,
+        viewport_width_px,
+        viewport_height_px,
+    );
     let mut heap = std::collections::BinaryHeap::<LodCandidate>::with_capacity(cap * 2);
     let mut leaves = Vec::with_capacity(cap);
 
+    let lod_grid = tile_grid.max(65);
     let root = TileKey::new(0, 0, 0);
     let root_span_m = 2.0 * std::f64::consts::PI * wgs84::A;
     let root_sse = compute_tile_sse(
         root_span_m,
-        tile_grid,
+        lod_grid,
         eye.length().max(1.0),
         viewport_height_px,
         camera.fov_y_deg,
@@ -1090,6 +1186,8 @@ pub fn traverse_quadtree_lod_frustum6_projected(
         sse: root_sse,
         key: root,
     });
+
+    let eye_alt = (eye.length() - wgs84::A).max(200.0);
 
     while let Some(node) = heap.pop() {
         let key = node.key;
@@ -1107,16 +1205,35 @@ pub fn traverse_quadtree_lod_frustum6_projected(
                 if horizon_cull && !frustum.intersects_sphere(center, radius * 1.15) {
                     continue;
                 }
-                let dist_to_eye = (center.sub(eye).length() - radius).max(1.0);
+                let surface_r = (radius - 5_000.0).max(0.0);
+                let to_center = center.sub(eye);
+                let center_dist = to_center.length().max(1.0);
+                let dist_to_eye = (center_dist - surface_r).max(1.0);
                 let per_axis = child.tiles_per_axis() as f64;
-                let ground_span_m = (2.0 * std::f64::consts::PI * wgs84::A) / per_axis;
-                let child_sse = compute_tile_sse(
+                let lat_cos = if projection == TileProjection::WebMercator {
+                    let horiz_r = (center.x * center.x + center.y * center.y).sqrt();
+                    (horiz_r / center.length().max(1.0)).clamp(0.25, 1.0)
+                } else {
+                    1.0
+                };
+                let ground_span_m =
+                    ((2.0 * std::f64::consts::PI * wgs84::A) / per_axis) * lat_cos;
+                let mut child_sse = compute_tile_sse(
                     ground_span_m,
-                    tile_grid,
+                    lod_grid,
                     dist_to_eye,
                     viewport_height_px,
                     camera.fov_y_deg,
                 );
+                if eye_alt < 450_000.0 {
+                    let surf_up = center.scale(1.0 / center.length().max(1.0));
+                    let cos_inc = (-to_center.dot(surf_up) / center_dist).clamp(0.16, 1.0);
+                    let foreshorten = cos_inc.sqrt().clamp(0.42, 1.0);
+                    let dist_ratio = dist_to_eye / eye_alt;
+                    let dist_falloff =
+                        (1.0 / (1.0 + 0.24 * (dist_ratio - 2.0).max(0.0))).max(0.22);
+                    child_sse *= foreshorten * dist_falloff;
+                }
                 visible_children[q as usize] = Some(LodCandidate {
                     sse: child_sse,
                     key: child,
@@ -1150,6 +1267,153 @@ pub fn traverse_quadtree_lod_frustum6_projected(
     }
     leaves.sort();
     leaves
+}
+
+/// Traverses the planetary quadtree for a flat 2D horizontal map with seamless East/West
+/// world-wrapping copies (`wrap_x`) and strict North/South pole bounds.
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod_2d_flat(
+    camera: &EarthCamera,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+    max_leaves: usize,
+    projection: TileProjection,
+) -> Vec<(TileKey, i32)> {
+    let cap = max_leaves.max(16);
+    let lod_grid = tile_grid.max(65);
+    let alt_m = camera.altitude_m().max(100.0);
+    let focus_lat = camera.focus.lat_deg.clamp(-85.051129, 85.051129);
+    let focus_lon = wrap_longitude(camera.focus.lon_deg);
+    let aspect = (viewport_width_px.max(1.0) / viewport_height_px.max(1.0)).max(0.01);
+    let tan_half_y = (camera.fov_y_deg.to_radians() * 0.5).tan().max(1e-4);
+    let half_h_m = alt_m * tan_half_y * 1.15;
+    let half_w_m = half_h_m * aspect;
+    let m_per_deg = (std::f64::consts::PI * wgs84::A) / 180.0;
+    let half_lat_deg = half_h_m / m_per_deg;
+    let half_lon_deg = half_w_m / m_per_deg;
+    let max_wrap = ((half_lon_deg / 360.0).ceil() as i32 + 1).clamp(1, 3);
+
+    let tile_eval = |key: TileKey| -> Option<(f64, Vec<i32>)> {
+        let bounds = match projection {
+            TileProjection::WebMercator => tile_bounds_mercator(key),
+            TileProjection::Geographic4326 => tile_bounds(key),
+        };
+        if bounds.lat1 < focus_lat - half_lat_deg || bounds.lat0 > focus_lat + half_lat_deg {
+            return None;
+        }
+        let tile_mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
+        let half_span_lon = (bounds.lon1 - bounds.lon0) * 0.5;
+        let dlon0 = wrap_longitude(tile_mid_lon - focus_lon);
+        let mut wraps = Vec::new();
+        let mut min_dlon_abs = f64::INFINITY;
+        for w in -max_wrap..=max_wrap {
+            let dlon = dlon0 + (w as f64) * 360.0;
+            if dlon + half_span_lon >= -half_lon_deg && dlon - half_span_lon <= half_lon_deg {
+                wraps.push(w);
+                let edge_gap_lon = (dlon.abs() - half_span_lon).max(0.0);
+                min_dlon_abs = min_dlon_abs.min(edge_gap_lon);
+            }
+        }
+        if wraps.is_empty() {
+            return None;
+        }
+        let mid_lat = (bounds.lat0 + bounds.lat1) * 0.5;
+        let half_span_lat = (bounds.lat1 - bounds.lat0) * 0.5;
+        let dlat_gap = ((mid_lat - focus_lat).abs() - half_span_lat).max(0.0);
+        let dx_m = min_dlon_abs * m_per_deg;
+        let dy_m = dlat_gap * m_per_deg;
+        let dist_to_eye = (alt_m * alt_m + dx_m * dx_m + dy_m * dy_m).sqrt();
+        let per_axis = key.tiles_per_axis() as f64;
+        let lat_cos = if projection == TileProjection::WebMercator {
+            mid_lat.to_radians().cos().abs().clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        let ground_span_m = ((2.0 * std::f64::consts::PI * wgs84::A) / per_axis) * lat_cos;
+        let dist_ratio = dist_to_eye / alt_m;
+        let dist_falloff = (1.0 / (1.0 + 0.20 * (dist_ratio - 1.5).max(0.0))).max(0.32);
+        let sse = compute_tile_sse(
+            ground_span_m,
+            lod_grid,
+            dist_to_eye,
+            viewport_height_px,
+            camera.fov_y_deg,
+        ) * dist_falloff;
+        Some((sse, wraps))
+    };
+
+    let mut heap = std::collections::BinaryHeap::<LodCandidate>::with_capacity(cap * 2);
+    let mut leaves: Vec<TileKey> = Vec::with_capacity(cap);
+    let root = TileKey::new(0, 0, 0);
+    let root_span_m = 2.0 * std::f64::consts::PI * wgs84::A;
+    let root_sse = compute_tile_sse(
+        root_span_m,
+        lod_grid,
+        alt_m,
+        viewport_height_px,
+        camera.fov_y_deg,
+    );
+    heap.push(LodCandidate {
+        sse: root_sse,
+        key: root,
+    });
+
+    while let Some(node) = heap.pop() {
+        let key = node.key;
+        if key.level < max_level && (key.level == 0 || node.sse > sse_threshold_px) {
+            let mut children = [None, None, None, None];
+            let mut vis_count = 0usize;
+            for q in 0..4u8 {
+                let Some(child) = key.child(q) else {
+                    continue;
+                };
+                if let Some((child_sse, _)) = tile_eval(child) {
+                    children[q as usize] = Some(LodCandidate {
+                        sse: child_sse,
+                        key: child,
+                    });
+                    vis_count += 1;
+                }
+            }
+            if vis_count == 0 {
+                continue;
+            }
+            if leaves.len() + heap.len() + vis_count <= cap {
+                for ch in children.into_iter().flatten() {
+                    heap.push(ch);
+                }
+            } else {
+                leaves.push(key);
+                break;
+            }
+        } else {
+            leaves.push(key);
+            if leaves.len() + heap.len() >= cap {
+                break;
+            }
+        }
+    }
+    while let Some(rem) = heap.pop() {
+        if leaves.len() < cap {
+            leaves.push(rem.key);
+        } else {
+            break;
+        }
+    }
+    leaves.sort();
+
+    let mut out = Vec::with_capacity(leaves.len() * 2);
+    for key in leaves {
+        if let Some((_, wraps)) = tile_eval(key) {
+            for w in wraps {
+                out.push((key, w));
+            }
+        }
+    }
+    out
 }
 
 /// Traverses the planetary quadtree using exact 6-plane frustum culling, horizon occlusion,
@@ -1263,7 +1527,31 @@ pub fn retained_camera_uniforms(
     ambient_color: [f32; 3],
     background: strata_render::scene3d::Background3D,
 ) -> strata_render::scene3d::RetainedCameraUniforms {
-    let placement = camera.placement();
+    retained_camera_uniforms_with_up(
+        camera,
+        None,
+        viewport_w,
+        viewport_h,
+        sun_dir,
+        sun_color,
+        ambient_color,
+        background,
+    )
+}
+
+/// Same as [`retained_camera_uniforms`] with an optional explicit ECEF camera up vector.
+#[allow(clippy::too_many_arguments)]
+pub fn retained_camera_uniforms_with_up(
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+    viewport_w: f64,
+    viewport_h: f64,
+    sun_dir: [f32; 3],
+    sun_color: [f32; 3],
+    ambient_color: [f32; 3],
+    background: strata_render::scene3d::Background3D,
+) -> strata_render::scene3d::RetainedCameraUniforms {
+    let placement = camera.placement_with_up(up_override);
     let aspect = (viewport_w.max(1.0) / viewport_h.max(1.0)).max(0.01);
     let view_rel = DMat4::view_rotation_only(placement.eye, placement.aim, placement.up);
     let f = 1.0 / (placement.fov_y_deg.to_radians() * 0.5).tan();

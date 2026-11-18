@@ -2157,6 +2157,134 @@ pub fn label_style(kind: EarthLabelKind) -> ([u8; 3], EarthLabelIcon, f32) {
     }
 }
 
+/// Reusable geodetic-to-screen projector honoring curved 3D, 2.5D tangent flatten, and 2D map morphs.
+#[derive(Clone, Copy)]
+pub struct EarthScreenProjector {
+    eye: DVec3,
+    vp: [[f32; 4]; 4],
+    focus_lat: f64,
+    focus_lon: f64,
+    focus_frame: LocalFrame,
+    focus_ecef: DVec3,
+    cos_scale: f64,
+    flat_t: f64,
+    map_2d: f64,
+    vw: f32,
+    vh: f32,
+}
+
+impl EarthScreenProjector {
+    /// Builds a screen projector matching `input`'s exact camera & surface morph matrices.
+    pub fn from_input(input: &EarthInput) -> Self {
+        let vw = input.viewport.width.max(1.0);
+        let vh = input.viewport.height.max(1.0);
+        let cam = &input.camera;
+        let ll = input.low_level_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph) as f64;
+        let map_2d = ll.map_2d_morph as f64;
+        let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
+        let eye = DVec3::new(cam_u.eye_ecef[0], cam_u.eye_ecef[1], cam_u.eye_ecef[2]);
+        let focus_surface = Geodetic::new(cam.focus.lat_deg, cam.focus.lon_deg, 0.0);
+        let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
+        let focus_ecef = geodetic_to_ecef(focus_surface);
+        let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
+        let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+        Self {
+            eye,
+            vp: cam_u.view_proj_rte,
+            focus_lat: cam.focus.lat_deg,
+            focus_lon: cam.focus.lon_deg,
+            focus_frame,
+            focus_ecef,
+            cos_scale,
+            flat_t,
+            map_2d,
+            vw,
+            vh,
+        }
+    }
+
+    /// Projects `(lat_deg, lon_deg, elev_m)` to `(screen_x, screen_y, ndc_x, ndc_y, horizon_fade)`.
+    pub fn project_raw(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+        elev_m: f64,
+    ) -> Option<(f32, f32, f32, f32, f32)> {
+        let p_curved = geodetic_to_ecef(Geodetic::new(lat_deg, lon_deg, elev_m));
+        let p_world = if self.flat_t <= 1e-6 {
+            p_curved
+        } else {
+            let dlon_deg = ((lon_deg - self.focus_lon + 180.0).rem_euclid(360.0)) - 180.0;
+            let dlat_deg = lat_deg - self.focus_lat;
+            let east_m = dlon_deg.to_radians() * EARTH_RADIUS_M * self.cos_scale;
+            let north_m = dlat_deg.to_radians() * EARTH_RADIUS_M;
+            let up_h = elev_m * (1.0 - self.map_2d);
+            let p_flat = self
+                .focus_ecef
+                .add(self.focus_frame.east.scale(east_m))
+                .add(self.focus_frame.north.scale(north_m))
+                .add(self.focus_frame.up.scale(up_h));
+            DVec3::new(
+                p_curved.x + (p_flat.x - p_curved.x) * self.flat_t,
+                p_curved.y + (p_flat.y - p_curved.y) * self.flat_t,
+                p_curved.z + (p_flat.z - p_curved.z) * self.flat_t,
+            )
+        };
+
+        let to_eye = self.eye.sub(p_world);
+        let dist = to_eye.length().max(1.0);
+        let normal = if self.flat_t < 0.5 {
+            p_curved.normalize()
+        } else {
+            self.focus_frame.up
+        };
+        let cos_horizon = normal.dot(to_eye.scale(1.0 / dist));
+        let horizon_fade = if self.map_2d > 0.35 {
+            1.0
+        } else {
+            smoothstep_f64(0.06, 0.24, cos_horizon) as f32
+        };
+        if horizon_fade <= 0.01 {
+            return None;
+        }
+
+        let rel = p_world.sub(self.eye);
+        let rx = rel.x as f32;
+        let ry = rel.y as f32;
+        let rz = rel.z as f32;
+        let clip_x =
+            self.vp[0][0] * rx + self.vp[1][0] * ry + self.vp[2][0] * rz + self.vp[3][0];
+        let clip_y =
+            self.vp[0][1] * rx + self.vp[1][1] * ry + self.vp[2][1] * rz + self.vp[3][1];
+        let clip_z =
+            self.vp[0][2] * rx + self.vp[1][2] * ry + self.vp[2][2] * rz + self.vp[3][2];
+        let clip_w =
+            self.vp[0][3] * rx + self.vp[1][3] * ry + self.vp[2][3] * rz + self.vp[3][3];
+        if clip_w <= 0.001 {
+            return None;
+        }
+        let ndc_x = clip_x / clip_w;
+        let ndc_y = clip_y / clip_w;
+        let ndc_z = clip_z / clip_w;
+        if !(0.0..=1.0).contains(&ndc_z) {
+            return None;
+        }
+        let screen_x = (ndc_x + 1.0) * 0.5 * self.vw;
+        let screen_y = (1.0 - ndc_y) * 0.5 * self.vh;
+        Some((screen_x, screen_y, ndc_x, ndc_y, horizon_fade))
+    }
+
+    /// Projects a geodetic coordinate into pixel coordinates `(x, y)` inside `[0..vw, 0..vh]`.
+    pub fn project_point(&self, lat_deg: f64, lon_deg: f64, elev_m: f64) -> Option<(f32, f32)> {
+        let (sx, sy, ndc_x, ndc_y, _) = self.project_raw(lat_deg, lon_deg, elev_m)?;
+        if ndc_x.abs() > 1.0 || ndc_y.abs() > 1.0 {
+            return None;
+        }
+        Some((sx, sy))
+    }
+}
+
 /// Projects `labels` into screen coordinates using `input`'s exact camera & seamless 3D/2.5D/2D
 /// morph state, applies smooth altitude/horizon fades, and declutters overlapping screen boxes.
 pub fn project_earth_labels(
@@ -2167,27 +2295,13 @@ pub fn project_earth_labels(
     if !input.layers.labels || labels.is_empty() {
         return Vec::new();
     }
-    let vw = input.viewport.width.max(1.0) as f64;
-    let vh = input.viewport.height.max(1.0) as f64;
-    let cam = &input.camera;
-    let alt_m = cam.altitude_m();
-    let ll = input.low_level_state();
-    let flat_t = ll.local_25d_blend.max(ll.map_2d_morph) as f64;
-    let map_2d = ll.map_2d_morph as f64;
-
-    let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
-    let eye = DVec3::new(cam_u.eye_ecef[0], cam_u.eye_ecef[1], cam_u.eye_ecef[2]);
-    let vp = cam_u.view_proj_rte;
-
-    let focus_surface = Geodetic::new(cam.focus.lat_deg, cam.focus.lon_deg, 0.0);
-    let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
-    let focus_ecef = geodetic_to_ecef(focus_surface);
-    let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
-    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+    let projector = EarthScreenProjector::from_input(input);
+    let alt_m = input.camera.altitude_m();
+    let vw = projector.vw;
+    let vh = projector.vh;
 
     let mut candidates: Vec<(u16, f32, ProjectedEarthLabel)> = Vec::new();
     for lbl in labels {
-        // Smooth altitude visibility fade-in & fade-out
         let fade_in = smoothstep_f64(lbl.min_alt_m * 0.70, lbl.min_alt_m * 1.45, alt_m);
         let fade_out = 1.0 - smoothstep_f64(lbl.max_alt_m * 0.68, lbl.max_alt_m * 1.25, alt_m);
         let alt_alpha = fade_in * fade_out;
@@ -2195,66 +2309,23 @@ pub fn project_earth_labels(
             continue;
         }
 
-        let p_curved = geodetic_to_ecef(Geodetic::new(lbl.lat_deg, lbl.lon_deg, lbl.elevation_m));
-        let p_world = if flat_t <= 1e-6 {
-            p_curved
-        } else {
-            let dlon_deg = ((lbl.lon_deg - cam.focus.lon_deg + 180.0).rem_euclid(360.0)) - 180.0;
-            let dlat_deg = lbl.lat_deg - cam.focus.lat_deg;
-            let east_m = dlon_deg.to_radians() * EARTH_RADIUS_M * cos_scale;
-            let north_m = dlat_deg.to_radians() * EARTH_RADIUS_M;
-            let up_h = lbl.elevation_m * (1.0 - map_2d);
-            let p_flat = focus_ecef
-                .add(focus_frame.east.scale(east_m))
-                .add(focus_frame.north.scale(north_m))
-                .add(focus_frame.up.scale(up_h));
-            DVec3::new(
-                p_curved.x + (p_flat.x - p_curved.x) * flat_t,
-                p_curved.y + (p_flat.y - p_curved.y) * flat_t,
-                p_curved.z + (p_flat.z - p_curved.z) * flat_t,
-            )
+        let Some((raw_x, raw_y, ndc_x, ndc_y, horizon_fade)) =
+            projector.project_raw(lbl.lat_deg, lbl.lon_deg, lbl.elevation_m)
+        else {
+            continue;
         };
-
-        let to_eye = eye.sub(p_world);
-        let dist = to_eye.length().max(1.0);
-        let normal = if flat_t < 0.5 {
-            p_curved.normalize()
-        } else {
-            focus_frame.up
-        };
-        let cos_horizon = normal.dot(to_eye.scale(1.0 / dist));
-        let horizon_fade = if map_2d > 0.35 {
-            1.0
-        } else {
-            smoothstep_f64(0.06, 0.24, cos_horizon)
-        };
-        let alpha = (alt_alpha * horizon_fade) as f32;
+        let alpha = (alt_alpha as f32) * horizon_fade;
         if alpha <= 0.03 {
             continue;
         }
-
-        let rel = p_world.sub(eye);
-        let rx = rel.x as f32;
-        let ry = rel.y as f32;
-        let rz = rel.z as f32;
-        let clip_x = vp[0][0] * rx + vp[1][0] * ry + vp[2][0] * rz + vp[3][0];
-        let clip_y = vp[0][1] * rx + vp[1][1] * ry + vp[2][1] * rz + vp[3][1];
-        let clip_z = vp[0][2] * rx + vp[1][2] * ry + vp[2][2] * rz + vp[3][2];
-        let clip_w = vp[0][3] * rx + vp[1][3] * ry + vp[2][3] * rz + vp[3][3];
-        if clip_w <= 0.001 {
-            continue;
-        }
-        let ndc_x = clip_x / clip_w;
-        let ndc_y = clip_y / clip_w;
-        let ndc_z = clip_z / clip_w;
-        if ndc_x.abs() > 0.96 || ndc_y.abs() > 0.94 || !(0.0..=1.0).contains(&ndc_z) {
+        if ndc_x.abs() > 0.96 || ndc_y.abs() > 0.94 {
             continue;
         }
 
-        let screen_x = ((ndc_x + 1.0) * 0.5 * vw as f32).clamp(20.0, vw as f32 - 20.0);
-        let screen_y = ((1.0 - ndc_y) * 0.5 * vh as f32).clamp(18.0, vh as f32 - 18.0);
+        let screen_x = raw_x.clamp(20.0, vw - 20.0);
+        let screen_y = raw_y.clamp(18.0, vh - 18.0);
         // Keep clear of top-right floating control card
-        if screen_x > vw as f32 - 455.0 && screen_y < 145.0 {
+        if screen_x > vw - 455.0 && screen_y < 145.0 {
             continue;
         }
 

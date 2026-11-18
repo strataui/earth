@@ -1636,6 +1636,7 @@ dependencies = [
  "flate2",
  "image",
  "libc",
+ "strata-ui",
  "strata_layout",
  "strata_primitives",
  "strata_render",
@@ -1667,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "strata-ui-platform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cairo-rs",
  "gtk",
@@ -1754,7 +1755,7 @@ version = "0.1.0"
 
 [[package]]
 name = "strata_render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
  "miniz_oxide 0.8.9",

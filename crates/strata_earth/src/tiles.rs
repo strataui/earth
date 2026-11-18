@@ -16,11 +16,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
-    mpsc::{channel, Receiver, Sender},
-    Arc, Mutex,
+    mpsc::{channel, Receiver},
+    Arc, Condvar, Mutex,
 };
 
-use crate::geodesy::TileKey;
+use crate::geodesy::{tile_bounds_mercator, Geodetic, TileKey};
 use strata_render::texture3d::{
     AddressMode, FilterMode, SamplerDesc, TextureData, TextureDesc, TextureFormat, TextureId,
     TextureStore,
@@ -155,12 +155,30 @@ pub enum TileError {
 /// A miss may block, but callers should treat it as optional and keep drawing
 /// the ancestor imagery instead.
 pub trait TileSource {
+    /// Signals a new frame with active camera focus and altitude so streaming sources
+    /// can dynamically reprioritize in-flight download queues.
+    fn begin_frame(&mut self, _focus: Geodetic, _altitude_m: f64) {}
+
+    /// Signals that all visible tile requests for the active frame have been submitted,
+    /// allowing streaming sources to cancel queued tasks that are no longer visible.
+    fn end_frame(&mut self) {}
+
     /// Returns the imagery for a tile, if available right now.
     fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError>;
 
     /// Non-mutating lookup of imagery already resident in memory/embedded defaults
     /// (must never initiate network I/O). Used when resolving loaded ancestor fallbacks.
     fn peek_cached_imagery(&self, _key: TileKey) -> Option<TileImage> {
+        None
+    }
+
+    /// Returns high-resolution night city-lights tile imagery if supported and cached/loaded.
+    fn night_lights(&mut self, _key: TileKey) -> Result<Option<TileImage>, TileError> {
+        Ok(None)
+    }
+
+    /// Non-mutating lookup of cached high-res night city-lights imagery.
+    fn peek_cached_night_lights(&self, _key: TileKey) -> Option<TileImage> {
         None
     }
 
@@ -172,6 +190,15 @@ pub trait TileSource {
     fn peek_cached_elevation(&self, _key: TileKey) -> Option<TileElevation> {
         None
     }
+
+    /// Updates the active tile API provider configuration at runtime when supported,
+    /// returning `true` if the source applied the switch cleanly.
+    fn set_provider(&mut self, _config: &TileProviderConfig) -> bool {
+        false
+    }
+
+    /// Registers an optional wakeup callback invoked on background fetch completion.
+    fn set_tile_ready_callback(&mut self, _cb: Option<Arc<dyn Fn() + Send + Sync>>) {}
 }
 
 /// Identifies an uploaded tile image so repeated frames reuse one handle.
@@ -285,6 +312,7 @@ impl TileRegistry {
 #[derive(Debug, Default)]
 pub struct MemoryTileSource {
     imagery: std::collections::HashMap<TileKey, TileImage>,
+    night_lights: std::collections::HashMap<TileKey, TileImage>,
     elevation: std::collections::HashMap<TileKey, TileElevation>,
     /// Optional revision counter per key, so a test can force a re-upload.
     revisions: std::collections::HashMap<TileKey, u32>,
@@ -297,6 +325,11 @@ impl MemoryTileSource {
 
     pub fn insert_imagery(&mut self, key: TileKey, image: TileImage) -> &mut Self {
         self.imagery.insert(key, image);
+        self
+    }
+
+    pub fn insert_night_lights(&mut self, key: TileKey, image: TileImage) -> &mut Self {
+        self.night_lights.insert(key, image);
         self
     }
 
@@ -322,6 +355,14 @@ impl TileSource for MemoryTileSource {
 
     fn peek_cached_imagery(&self, key: TileKey) -> Option<TileImage> {
         self.imagery.get(&key).cloned()
+    }
+
+    fn night_lights(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
+        Ok(self.night_lights.get(&key).cloned())
+    }
+
+    fn peek_cached_night_lights(&self, key: TileKey) -> Option<TileImage> {
+        self.night_lights.get(&key).cloned()
     }
 
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
@@ -644,6 +685,7 @@ pub const DEFAULT_MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 pub enum TileDataKey {
     Imagery(TileKey),
     Elevation(TileKey),
+    NightLights(TileKey),
 }
 
 /// In-memory cached tile item.
@@ -746,34 +788,103 @@ impl LruTileCache {
         self.current_bytes = 0;
     }
 
+    /// Clears only cached imagery tiles, leaving elevation and night-lights intact.
+    pub fn clear_imagery(&mut self) {
+        let keys: Vec<TileDataKey> = self
+            .map
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, TileDataKey::Imagery(_)))
+            .collect();
+        for k in keys {
+            let _ = self.remove(&k);
+        }
+    }
+
+    /// Clears only cached night-lights tiles.
+    pub fn clear_night_lights(&mut self) {
+        let keys: Vec<TileDataKey> = self
+            .map
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, TileDataKey::NightLights(_)))
+            .collect();
+        for k in keys {
+            let _ = self.remove(&k);
+        }
+    }
+
+    /// Clears only cached elevation tiles.
+    pub fn clear_elevation(&mut self) {
+        let keys: Vec<TileDataKey> = self
+            .map
+            .keys()
+            .copied()
+            .filter(|k| matches!(k, TileDataKey::Elevation(_)))
+            .collect();
+        for k in keys {
+            let _ = self.remove(&k);
+        }
+    }
+
     pub fn contains_imagery(&self, key: TileKey) -> bool {
         self.map.contains_key(&TileDataKey::Imagery(key))
+    }
+
+    pub fn contains_night_lights(&self, key: TileKey) -> bool {
+        self.map.contains_key(&TileDataKey::NightLights(key))
     }
 
     pub fn contains_elevation(&self, key: TileKey) -> bool {
         self.map.contains_key(&TileDataKey::Elevation(key))
     }
 
-    /// Fetches imagery for `key`, marking it as most recently used.
-    pub fn get_imagery(&mut self, key: TileKey) -> Option<TileImage> {
-        match self.get(&TileDataKey::Imagery(key)) {
+    fn get_img(&mut self, data_key: TileDataKey) -> Option<TileImage> {
+        match self.get(&data_key) {
             Some(CachedTileData::Imagery(img)) => Some(img),
             _ => None,
         }
     }
 
-    /// Peeks cached imagery without updating LRU order or needing mutable access.
-    pub fn peek_imagery(&self, key: TileKey) -> Option<TileImage> {
-        let &idx = self.map.get(&TileDataKey::Imagery(key))?;
+    fn peek_img(&self, data_key: TileDataKey) -> Option<TileImage> {
+        let &idx = self.map.get(&data_key)?;
         match self.nodes.get(idx).and_then(|n| n.as_ref())?.value {
             CachedTileData::Imagery(ref img) => Some(img.clone()),
             CachedTileData::Elevation(_) => None,
         }
     }
 
+    /// Fetches imagery for `key`, marking it as most recently used.
+    pub fn get_imagery(&mut self, key: TileKey) -> Option<TileImage> {
+        self.get_img(TileDataKey::Imagery(key))
+    }
+
+    /// Peeks cached imagery without updating LRU order or needing mutable access.
+    pub fn peek_imagery(&self, key: TileKey) -> Option<TileImage> {
+        self.peek_img(TileDataKey::Imagery(key))
+    }
+
     /// Inserts imagery for `key`, evicting older entries if exceeding the byte budget.
     pub fn insert_imagery(&mut self, key: TileKey, image: TileImage) {
         self.insert(TileDataKey::Imagery(key), CachedTileData::Imagery(image));
+    }
+
+    /// Fetches cached high-res night lights imagery for `key`, marking it as most recently used.
+    pub fn get_night_lights(&mut self, key: TileKey) -> Option<TileImage> {
+        self.get_img(TileDataKey::NightLights(key))
+    }
+
+    /// Peeks cached high-res night lights imagery without mutating LRU order.
+    pub fn peek_night_lights(&self, key: TileKey) -> Option<TileImage> {
+        self.peek_img(TileDataKey::NightLights(key))
+    }
+
+    /// Inserts high-res night lights imagery for `key`.
+    pub fn insert_night_lights(&mut self, key: TileKey, image: TileImage) {
+        self.insert(
+            TileDataKey::NightLights(key),
+            CachedTileData::Imagery(image),
+        );
     }
 
     /// Fetches elevation for `key`, marking it as most recently used.
@@ -972,6 +1083,14 @@ impl<S: TileSource> LruTileCacheSource<S> {
 }
 
 impl<S: TileSource> TileSource for LruTileCacheSource<S> {
+    fn begin_frame(&mut self, focus: Geodetic, altitude_m: f64) {
+        self.inner.begin_frame(focus, altitude_m);
+    }
+
+    fn end_frame(&mut self) {
+        self.inner.end_frame();
+    }
+
     fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
         if let Some(image) = self.cache.get_imagery(key) {
             self.hits += 1;
@@ -1011,29 +1130,69 @@ impl<S: TileSource> TileSource for LruTileCacheSource<S> {
     }
 }
 
-/// Formats a Slippy Map XYZ or WMTS URL template with a given TileKey.
+/// Converts a slippy/quadtree [`TileKey`] into a Bing Maps QuadKey string (`'0'..='3'` digits).
+pub fn tile_key_to_quadkey(key: TileKey) -> String {
+    if key.level == 0 {
+        return String::new();
+    }
+    let mut qk = String::with_capacity(key.level as usize);
+    for i in (0..key.level).rev() {
+        let mask = 1u32 << i;
+        let mut digit = 0u8;
+        if (key.x & mask) != 0 {
+            digit |= 1;
+        }
+        if (key.y & mask) != 0 {
+            digit |= 2;
+        }
+        qk.push((b'0' + digit) as char);
+    }
+    qk
+}
+
+/// Formats a Slippy Map XYZ, TMS (`{-y}`), WMTS, QuadKey (`{quadkey}`), or API-key template URL.
 ///
 /// Supported tokens:
-/// - `{z}`: tile zoom level
-/// - `{x}`: tile column index
-/// - `{y}`: tile row index
+/// - `{z}` / `{TileMatrix}`: tile zoom level
+/// - `{x}` / `{TileCol}`: tile column index
+/// - `{y}` / `{TileRow}`: tile row index (XYZ top-to-bottom)
+/// - `{-y}`: TMS inverted row index `(1 << z) - 1 - y`
+/// - `{quadkey}` / `{q}`: Bing Maps QuadKey string
 /// - `{s}`: subdomain round-robin
-/// - `{TileMatrix}`: WMTS tile matrix (level)
-/// - `{TileCol}`: WMTS column
-/// - `{TileRow}`: WMTS row
-pub fn format_slippy_url(
+/// - `{api_key}` / `{apikey}` / `{access_token}` / `{token}`: API key substitution
+pub fn format_tile_url(
     template: &str,
     key: TileKey,
     subdomains: &[String],
     subdomain_counter: &mut usize,
+    api_key: Option<&str>,
 ) -> String {
+    let per_axis = 1u32 << key.level.min(31);
+    let tms_y = per_axis.saturating_sub(1).saturating_sub(key.y);
+    let quadkey = if template.contains("{quadkey}") || template.contains("{q}") {
+        tile_key_to_quadkey(key)
+    } else {
+        String::new()
+    };
+
     let mut url = template
         .replace("{z}", &key.level.to_string())
         .replace("{x}", &key.x.to_string())
         .replace("{y}", &key.y.to_string())
+        .replace("{-y}", &tms_y.to_string())
         .replace("{TileMatrix}", &key.level.to_string())
         .replace("{TileCol}", &key.x.to_string())
-        .replace("{TileRow}", &key.y.to_string());
+        .replace("{TileRow}", &key.y.to_string())
+        .replace("{quadkey}", &quadkey)
+        .replace("{q}", &quadkey);
+
+    if let Some(k) = api_key {
+        url = url
+            .replace("{api_key}", k)
+            .replace("{apikey}", k)
+            .replace("{access_token}", k)
+            .replace("{token}", k);
+    }
 
     if url.contains("{s}") {
         if !subdomains.is_empty() {
@@ -1045,6 +1204,16 @@ pub fn format_slippy_url(
         }
     }
     url
+}
+
+/// Formats a Slippy Map XYZ or WMTS URL template with a given TileKey.
+pub fn format_slippy_url(
+    template: &str,
+    key: TileKey,
+    subdomains: &[String],
+    subdomain_counter: &mut usize,
+) -> String {
+    format_tile_url(template, key, subdomains, subdomain_counter, None)
 }
 
 /// Decodes standard 8-bit PNG byte streams into raw 32-bit RGBA pixels.
@@ -1309,6 +1478,7 @@ pub trait HttpTransport: Send + Sync + 'static {
 pub struct StandardHttpTransport {
     user_agent: String,
     timeout_ms: u64,
+    headers: Vec<(String, String)>,
     agent: ureq::Agent,
 }
 
@@ -1324,6 +1494,7 @@ impl Default for StandardHttpTransport {
         Self {
             user_agent,
             timeout_ms,
+            headers: Vec::new(),
             agent,
         }
     }
@@ -1351,17 +1522,37 @@ impl StandardHttpTransport {
             .build();
         self
     }
+
+    /// Adds a custom HTTP header sent on every tile request (e.g., `Authorization`, `x-api-key`, `Referer`).
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Replaces or sets custom HTTP headers sent on every tile request.
+    pub fn with_headers<K, V>(mut self, headers: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers = headers
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
 }
 
 impl HttpTransport for StandardHttpTransport {
     fn fetch(&self, url: &str) -> Result<Vec<u8>, TileError> {
-        let resp = self
-            .agent
-            .get(url)
-            .set(
-                "Accept",
-                "image/png,image/jpeg,image/webp,application/json,*/*",
-            )
+        let mut req = self.agent.get(url).set(
+            "Accept",
+            "image/png,image/jpeg,image/webp,application/json,*/*",
+        );
+        for (name, val) in &self.headers {
+            req = req.set(name, val);
+        }
+        let resp = req
             .call()
             .map_err(|e| TileError::Transport(format!("HTTP/HTTPS fetch failed for {url}: {e}")))?;
 
@@ -1424,6 +1615,7 @@ pub struct NetworkTileStats {
     pub cache_misses: u64,
     pub disk_cache_hits: u64,
     pub decode_errors: u64,
+    pub cancelled_requests: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1433,31 +1625,564 @@ pub enum ElevationEncoding {
     Terrarium,
 }
 
+#[inline]
+fn fnv1a_64_str(acc: &mut u64, s: &str) {
+    for &b in s.as_bytes() {
+        *acc ^= b as u64;
+        *acc = acc.wrapping_mul(0x100_0000_01b3);
+    }
+    *acc ^= 0xff;
+    *acc = acc.wrapping_mul(0x100_0000_01b3);
+}
+
+#[inline]
+fn sanitize_slug(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(32));
+    for ch in raw.chars() {
+        if out.len() >= 32 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "custom".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Configured elevation DEM source paired with a [`TileProviderConfig`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TileElevationPreset {
+    /// No elevation heightmap streaming.
+    None,
+    /// Public-domain AWS / Mapzen Terrarium elevation PNGs (`z=0..=15`).
+    AwsTerrarium,
+    /// Mapbox Terrain-RGB elevation tiles (`z=0..=15`, uses `{api_key}`).
+    MapboxTerrainRgb,
+    /// Custom XYZ / WMTS elevation endpoint.
+    Custom {
+        template: String,
+        encoding: ElevationEncoding,
+        max_level: u8,
+    },
+}
+
+impl Default for TileElevationPreset {
+    fn default() -> Self {
+        Self::AwsTerrarium
+    }
+}
+
+impl TileElevationPreset {
+    fn resolve(&self) -> Option<(String, ElevationEncoding, u8)> {
+        match self {
+            Self::None => None,
+            Self::AwsTerrarium => Some((
+                "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+                    .to_string(),
+                ElevationEncoding::Terrarium,
+                15,
+            )),
+            Self::MapboxTerrainRgb => Some((
+                "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token={api_key}"
+                    .to_string(),
+                ElevationEncoding::TerrainRgb,
+                15,
+            )),
+            Self::Custom {
+                template,
+                encoding,
+                max_level,
+            } => Some((template.clone(), *encoding, *max_level)),
+        }
+    }
+}
+
+/// Built-in world imagery & map tile API presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TileProviderPreset {
+    /// Esri ArcGIS World Imagery satellite mosaic (`z=0..=18`).
+    #[default]
+    ArcGisWorldImagery,
+    /// Esri ArcGIS World Topographic map (`z=0..=18`).
+    ArcGisWorldTopo,
+    /// Esri ArcGIS World Street map (`z=0..=18`).
+    ArcGisWorldStreet,
+    /// Standard OpenStreetMap Slippy XYZ tiles (`z=0..=19`).
+    OpenStreetMap,
+    /// OpenTopoMap topographic contour tiles (`z=0..=17`).
+    OpenTopoMap,
+    /// Carto Voyager light street/terrain style (`z=0..=19`).
+    CartoVoyager,
+    /// Carto Dark Matter dark basemap (`z=0..=19`).
+    CartoDarkMatter,
+    /// Google Maps Satellite imagery (`z=0..=19`).
+    GoogleSatellite,
+    /// Google Maps Hybrid satellite + roads (`z=0..=19`).
+    GoogleHybrid,
+    /// Google Maps standard roadmap (`z=0..=19`).
+    GoogleRoadmap,
+    /// Microsoft Bing Aerial Maps via `{quadkey}` (`z=0..=19`).
+    BingAerial,
+    /// Mapbox Satellite imagery (requires `api_key`, `z=0..=19`).
+    MapboxSatellite,
+    /// Mapbox Streets raster tiles (requires `api_key`, `z=0..=19`).
+    MapboxStreets,
+}
+
+impl TileProviderPreset {
+    /// Stable filesystem-safe identifier used in pack filenames and CLI flags.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ArcGisWorldImagery => "arcgis_world_imagery",
+            Self::ArcGisWorldTopo => "arcgis_world_topo",
+            Self::ArcGisWorldStreet => "arcgis_world_street",
+            Self::OpenStreetMap => "osm",
+            Self::OpenTopoMap => "opentopomap",
+            Self::CartoVoyager => "carto_voyager",
+            Self::CartoDarkMatter => "carto_dark",
+            Self::GoogleSatellite => "google_satellite",
+            Self::GoogleHybrid => "google_hybrid",
+            Self::GoogleRoadmap => "google_roadmap",
+            Self::BingAerial => "bing_aerial",
+            Self::MapboxSatellite => "mapbox_satellite",
+            Self::MapboxStreets => "mapbox_streets",
+        }
+    }
+
+    /// Human-readable short display name for UI switchers.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::ArcGisWorldImagery => "Satellite",
+            Self::ArcGisWorldTopo => "Esri Topo",
+            Self::ArcGisWorldStreet => "Esri Street",
+            Self::OpenStreetMap => "OSM Street",
+            Self::OpenTopoMap => "OpenTopo",
+            Self::CartoVoyager => "Voyager",
+            Self::CartoDarkMatter => "Dark Map",
+            Self::GoogleSatellite => "Google Sat",
+            Self::GoogleHybrid => "Google Hybrid",
+            Self::GoogleRoadmap => "Google Road",
+            Self::BingAerial => "Bing Aerial",
+            Self::MapboxSatellite => "Mapbox Sat",
+            Self::MapboxStreets => "Mapbox Road",
+        }
+    }
+
+    /// Standard pre-baked `z=0..=4` pack filename matching this preset.
+    pub fn pack_filename(self) -> String {
+        format!("base_world_map_{}.pack", self.id())
+    }
+
+    /// Parses a preset from CLI / config string aliases (case-insensitive).
+    pub fn from_id(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "arcgis_world_imagery" | "arcgis" | "satellite" | "esri_imagery" | "world_imagery" => {
+                Some(Self::ArcGisWorldImagery)
+            }
+            "arcgis_world_topo" | "esri_topo" | "topo" | "world_topo" => Some(Self::ArcGisWorldTopo),
+            "arcgis_world_street" | "esri_street" | "world_street" => {
+                Some(Self::ArcGisWorldStreet)
+            }
+            "osm" | "openstreetmap" | "street" => Some(Self::OpenStreetMap),
+            "opentopomap" | "otm" => Some(Self::OpenTopoMap),
+            "carto_voyager" | "voyager" => Some(Self::CartoVoyager),
+            "carto_dark" | "dark" | "dark_matter" => Some(Self::CartoDarkMatter),
+            "google_satellite" | "google_sat" | "google" => Some(Self::GoogleSatellite),
+            "google_hybrid" => Some(Self::GoogleHybrid),
+            "google_roadmap" | "google_road" => Some(Self::GoogleRoadmap),
+            "bing_aerial" | "bing" => Some(Self::BingAerial),
+            "mapbox_satellite" | "mapbox" => Some(Self::MapboxSatellite),
+            "mapbox_streets" | "mapbox_road" => Some(Self::MapboxStreets),
+            _ => None,
+        }
+    }
+
+    /// Ordered list of public keyless presets usable without an external API token.
+    pub const fn public_presets() -> &'static [Self] {
+        &[
+            Self::ArcGisWorldImagery,
+            Self::OpenStreetMap,
+            Self::ArcGisWorldTopo,
+            Self::ArcGisWorldStreet,
+            Self::OpenTopoMap,
+            Self::CartoVoyager,
+            Self::CartoDarkMatter,
+            Self::GoogleSatellite,
+            Self::GoogleHybrid,
+            Self::GoogleRoadmap,
+            Self::BingAerial,
+        ]
+    }
+
+    /// Cycles to the next public keyless preset.
+    pub fn next_public(self) -> Self {
+        let list = Self::public_presets();
+        let idx = list.iter().position(|&p| p == self).unwrap_or(0);
+        list[(idx + 1) % list.len()]
+    }
+
+    /// Converts this preset into a full [`TileProviderConfig`].
+    pub fn to_config(self) -> TileProviderConfig {
+        TileProviderConfig::preset(self)
+    }
+}
+
+/// Complete configuration for an imagery/elevation/night tile API endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileProviderConfig {
+    pub id: String,
+    pub display_name: String,
+    pub imagery_url_template: String,
+    pub subdomains: Vec<String>,
+    pub max_imagery_level: u8,
+    pub api_key: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub elevation: TileElevationPreset,
+    pub night_lights_url_template: Option<String>,
+    pub night_lights_max_level: u8,
+    pub base_pack_id: Option<String>,
+}
+
+impl Default for TileProviderConfig {
+    fn default() -> Self {
+        Self::preset(TileProviderPreset::ArcGisWorldImagery)
+    }
+}
+
+impl TileProviderConfig {
+    /// Builds a configuration from a built-in [`TileProviderPreset`].
+    pub fn preset(preset: TileProviderPreset) -> Self {
+        let (tpl, subs, max_z, night) = match preset {
+            TileProviderPreset::ArcGisWorldImagery => (
+                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                &[][..],
+                18,
+                Some(DEFAULT_NASA_BLACK_MARBLE_URL.to_string()),
+            ),
+            TileProviderPreset::ArcGisWorldTopo => (
+                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}",
+                &[][..],
+                18,
+                None,
+            ),
+            TileProviderPreset::ArcGisWorldStreet => (
+                "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+                &[][..],
+                18,
+                None,
+            ),
+            TileProviderPreset::OpenStreetMap => (
+                "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                &[][..],
+                19,
+                None,
+            ),
+            TileProviderPreset::OpenTopoMap => (
+                "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+                &["a", "b", "c"][..],
+                17,
+                None,
+            ),
+            TileProviderPreset::CartoVoyager => (
+                "https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+                &["a", "b", "c", "d"][..],
+                19,
+                None,
+            ),
+            TileProviderPreset::CartoDarkMatter => (
+                "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+                &["a", "b", "c", "d"][..],
+                19,
+                None,
+            ),
+            TileProviderPreset::GoogleSatellite => (
+                "https://mt{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+                &["0", "1", "2", "3"][..],
+                19,
+                Some(DEFAULT_NASA_BLACK_MARBLE_URL.to_string()),
+            ),
+            TileProviderPreset::GoogleHybrid => (
+                "https://mt{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+                &["0", "1", "2", "3"][..],
+                19,
+                None,
+            ),
+            TileProviderPreset::GoogleRoadmap => (
+                "https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+                &["0", "1", "2", "3"][..],
+                19,
+                None,
+            ),
+            TileProviderPreset::BingAerial => (
+                "https://ecn.t{s}.tiles.virtualearth.net/tiles/a{quadkey}.jpeg?g=1",
+                &["0", "1", "2", "3"][..],
+                19,
+                Some(DEFAULT_NASA_BLACK_MARBLE_URL.to_string()),
+            ),
+            TileProviderPreset::MapboxSatellite => (
+                "https://api.mapbox.com/v4/mapbox.satellite/{z}/{x}/{y}@2x.png?access_token={api_key}",
+                &[][..],
+                19,
+                Some(DEFAULT_NASA_BLACK_MARBLE_URL.to_string()),
+            ),
+            TileProviderPreset::MapboxStreets => (
+                "https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/{z}/{x}/{y}?access_token={api_key}",
+                &[][..],
+                19,
+                None,
+            ),
+        };
+        Self {
+            id: preset.id().to_string(),
+            display_name: preset.display_name().to_string(),
+            imagery_url_template: tpl.to_string(),
+            subdomains: subs.iter().map(|s| (*s).to_string()).collect(),
+            max_imagery_level: max_z,
+            api_key: None,
+            headers: Vec::new(),
+            elevation: TileElevationPreset::AwsTerrarium,
+            night_lights_url_template: night,
+            night_lights_max_level: 8,
+            base_pack_id: Some(preset.id().to_string()),
+        }
+    }
+
+    /// Creates a custom provider configuration targeting any Slippy XYZ, TMS (`{-y}`),
+    /// WMTS, or QuadKey (`{quadkey}`) URL template.
+    pub fn custom(id: impl Into<String>, imagery_url_template: impl Into<String>) -> Self {
+        let id_str = id.into();
+        let slug = sanitize_slug(&id_str);
+        Self {
+            id: slug,
+            display_name: id_str,
+            imagery_url_template: imagery_url_template.into(),
+            subdomains: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            max_imagery_level: 19,
+            api_key: None,
+            headers: Vec::new(),
+            elevation: TileElevationPreset::None,
+            night_lights_url_template: None,
+            night_lights_max_level: 8,
+            base_pack_id: None,
+        }
+    }
+
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = name.into();
+        self
+    }
+
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn with_headers<K, V>(mut self, headers: impl IntoIterator<Item = (K, V)>) -> Self
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        self.headers = headers
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        self
+    }
+
+    pub fn with_subdomains(mut self, subdomains: &[&str]) -> Self {
+        self.subdomains = subdomains.iter().map(|s| (*s).to_string()).collect();
+        self
+    }
+
+    pub fn with_max_imagery_level(mut self, max_level: u8) -> Self {
+        self.max_imagery_level = max_level;
+        self
+    }
+
+    pub fn with_elevation(mut self, elevation: TileElevationPreset) -> Self {
+        self.elevation = elevation;
+        self
+    }
+
+    pub fn with_terrarium_elevation(mut self) -> Self {
+        self.elevation = TileElevationPreset::AwsTerrarium;
+        self
+    }
+
+    pub fn with_mapbox_elevation(mut self, token: impl Into<String>) -> Self {
+        self.api_key = Some(token.into());
+        self.elevation = TileElevationPreset::MapboxTerrainRgb;
+        self
+    }
+
+    pub fn with_nasa_black_marble(mut self) -> Self {
+        self.night_lights_url_template = Some(DEFAULT_NASA_BLACK_MARBLE_URL.to_string());
+        self.night_lights_max_level = 8;
+        self
+    }
+
+    pub fn with_base_pack_id(mut self, pack_id: Option<impl Into<String>>) -> Self {
+        self.base_pack_id = pack_id.map(Into::into);
+        self
+    }
+
+    /// Computes a collision-free cache namespace directory name keyed by provider ID + template + API key hash.
+    pub fn imagery_cache_namespace(&self) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        fnv1a_64_str(&mut h, &self.id);
+        fnv1a_64_str(&mut h, &self.imagery_url_template);
+        if let Some(ref key) = self.api_key {
+            fnv1a_64_str(&mut h, key);
+        }
+        format!("{}_{:016x}", sanitize_slug(&self.id), h)
+    }
+
+    /// Computes a stable cache namespace for the active elevation source, or `None` when disabled.
+    pub fn elevation_cache_namespace(&self) -> Option<String> {
+        let (tpl, enc, max_z) = self.elevation.resolve()?;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        fnv1a_64_str(&mut h, &tpl);
+        let enc_tag = match enc {
+            ElevationEncoding::RawF32 => "raw",
+            ElevationEncoding::TerrainRgb => "trgb",
+            ElevationEncoding::Terrarium => "terrarium",
+        };
+        fnv1a_64_str(&mut h, enc_tag);
+        h ^= max_z as u64;
+        if let Some(ref key) = self.api_key {
+            fnv1a_64_str(&mut h, key);
+        }
+        Some(format!("{enc_tag}_{h:016x}"))
+    }
+
+    /// Computes a stable cache namespace for the night lights layer.
+    pub fn night_cache_namespace(&self) -> Option<String> {
+        let tpl = self.night_lights_url_template.as_deref()?;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        fnv1a_64_str(&mut h, tpl);
+        Some(format!("night_{h:016x}"))
+    }
+}
+
 struct FetchTask {
     key: TileDataKey,
+    tile: TileKey,
+    kind_weight: f64,
+    generation: u64,
+    provider_gen: u64,
     url: String,
     is_elevation: bool,
     elevation_encoding: ElevationEncoding,
     disk_cache_path: Option<PathBuf>,
 }
 
+struct DynamicFetchQueue {
+    tasks: HashMap<TileDataKey, FetchTask>,
+    in_flight: HashSet<(TileDataKey, u64)>,
+    not_found_keys: HashSet<(TileDataKey, u64)>,
+    generation: u64,
+    imagery_provider_gen: u64,
+    elev_provider_gen: u64,
+    focus_lat: f64,
+    focus_lon: f64,
+    focus_alt_m: f64,
+    shutdown: bool,
+}
+
+impl DynamicFetchQueue {
+    fn new() -> Self {
+        Self {
+            tasks: HashMap::new(),
+            in_flight: HashSet::new(),
+            not_found_keys: HashSet::new(),
+            generation: 1,
+            imagery_provider_gen: 1,
+            elev_provider_gen: 1,
+            focus_lat: 0.0,
+            focus_lon: 0.0,
+            focus_alt_m: 1_000_000.0,
+            shutdown: false,
+        }
+    }
+
+    fn task_score(&self, task: &FetchTask) -> f64 {
+        let gen_score = if task.generation == self.generation {
+            1_000_000.0
+        } else {
+            -100_000.0 * ((self.generation.saturating_sub(task.generation)) as f64).min(10.0)
+        };
+        let b = tile_bounds_mercator(task.tile);
+        let mid_lat = (b.lat0 + b.lat1) * 0.5;
+        let mid_lon = (b.lon0 + b.lon1) * 0.5;
+        let dlat = (mid_lat - self.focus_lat).abs();
+        let mut dlon = (mid_lon - self.focus_lon).abs();
+        if dlon > 180.0 {
+            dlon = 360.0 - dlon;
+        }
+        let lon_scale = self.focus_lat.to_radians().cos().abs().max(0.2);
+        let ang_dist = dlat.hypot(dlon * lon_scale);
+        let view_deg = (self.focus_alt_m.max(100.0) / 6_371_000.0)
+            .to_degrees()
+            .max(0.02);
+        let norm_dist = (ang_dist / view_deg).min(24.0);
+        let zoom_bias = -(task.tile.level as f64) * 3_000.0;
+        gen_score + task.kind_weight + zoom_bias - norm_dist * 400.0
+    }
+
+    fn pop_best(&mut self) -> Option<FetchTask> {
+        let mut best_key: Option<TileDataKey> = None;
+        let mut best_score = f64::NEG_INFINITY;
+        for (k, t) in &self.tasks {
+            let s = self.task_score(t);
+            if s > best_score {
+                best_score = s;
+                best_key = Some(*k);
+            }
+        }
+        let k = best_key?;
+        let task = self.tasks.remove(&k)?;
+        self.in_flight.insert((k, task.provider_gen));
+        Some(task)
+    }
+}
+
 type TileReadyCallback = Arc<dyn Fn() + Send + Sync>;
 type TileReadySlot = Arc<Mutex<Option<TileReadyCallback>>>;
+type WorkerResultMsg = (TileDataKey, u64, Result<CachedTileData, TileError>);
 
-/// Non-blocking asynchronous network tile streaming source supporting Slippy XYZ
-/// and WMTS raster tile protocols with memory and disk LRU caching.
+pub const DEFAULT_NASA_BLACK_MARBLE_URL: &str =
+    "https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_CityLights_2012/default/GoogleMapsCompatible_Level8/{z}/{y}/{x}.jpg";
+
+/// Non-blocking asynchronous network tile streaming source supporting Slippy XYZ, TMS (`{-y}`),
+/// WMTS, and Bing QuadKey (`{quadkey}`) protocols with provider-keyed LRU/disk caches.
 pub struct NetworkTileSource {
-    imagery_url_template: String,
+    provider: TileProviderConfig,
+    imagery_cache_ns: String,
+    elev_cache_ns: Option<String>,
+    night_cache_ns: Option<String>,
     elevation_url_template: Option<String>,
+    elevation_max_level: u8,
     elevation_encoding: ElevationEncoding,
-    subdomains: Vec<String>,
     subdomain_counter: usize,
     cache: LruTileCache,
     disk_cache_dir: Option<PathBuf>,
     transport: Arc<dyn HttpTransport>,
-    pending: Arc<Mutex<HashSet<TileDataKey>>>,
-    results_rx: Receiver<(TileDataKey, Result<CachedTileData, TileError>)>,
-    task_tx: Sender<FetchTask>,
+    uses_default_transport: bool,
+    queue: Arc<(Mutex<DynamicFetchQueue>, Condvar)>,
+    results_tx: std::sync::mpsc::Sender<WorkerResultMsg>,
+    results_rx: Receiver<WorkerResultMsg>,
     on_tile_ready: TileReadySlot,
     stats: NetworkTileStats,
     default_tile_size: u32,
@@ -1466,56 +2191,111 @@ pub struct NetworkTileSource {
 impl NetworkTileSource {
     /// Creates a new network tile source targeting the specified imagery URL template.
     pub fn new(imagery_url_template: impl Into<String>) -> Self {
-        Self::with_options(
-            imagery_url_template,
-            None,
-            false,
+        let tpl: String = imagery_url_template.into();
+        let cfg = TileProviderConfig::custom("custom", tpl);
+        Self::from_provider(cfg)
+    }
+
+    /// Creates a [`NetworkTileSource`] from a [`TileProviderConfig`], applying templates,
+    /// subdomains, API keys, custom HTTP headers, and elevation configuration.
+    pub fn from_provider(provider: TileProviderConfig) -> Self {
+        let mut transport = StandardHttpTransport::new();
+        if !provider.headers.is_empty() {
+            transport = transport.with_headers(provider.headers.clone());
+        }
+        Self::from_provider_with_transport(
+            provider,
             DEFAULT_MAX_CACHE_BYTES,
             None,
-            Arc::new(StandardHttpTransport::new()),
+            Arc::new(transport),
+            true,
         )
     }
 
-    /// Convenience constructor targeting standard OpenStreetMap tiles (`https://tile.openstreetmap.org/{z}/{x}/{y}.png`).
+    /// Creates a [`NetworkTileSource`] from a built-in [`TileProviderPreset`].
+    pub fn from_preset(preset: TileProviderPreset) -> Self {
+        Self::from_provider(TileProviderConfig::preset(preset))
+    }
+
+    fn from_provider_with_transport(
+        provider: TileProviderConfig,
+        max_cache_bytes: usize,
+        disk_cache_dir: Option<PathBuf>,
+        transport: Arc<dyn HttpTransport>,
+        uses_default_transport: bool,
+    ) -> Self {
+        let queue = Arc::new((Mutex::new(DynamicFetchQueue::new()), Condvar::new()));
+        let (results_tx, results_rx) = channel::<WorkerResultMsg>();
+        let on_tile_ready: TileReadySlot = Arc::new(Mutex::new(None));
+
+        Self::spawn_fetch_workers(
+            8,
+            Arc::clone(&queue),
+            results_tx.clone(),
+            Arc::clone(&transport),
+            Arc::clone(&on_tile_ready),
+        );
+
+        let imagery_cache_ns = provider.imagery_cache_namespace();
+        let elev_cache_ns = provider.elevation_cache_namespace();
+        let night_cache_ns = provider.night_cache_namespace();
+        let (elevation_url_template, elevation_encoding, elevation_max_level) =
+            match provider.elevation.resolve() {
+                Some((t, e, z)) => (Some(t), e, z),
+                None => (None, ElevationEncoding::RawF32, 20),
+            };
+
+        Self {
+            provider,
+            imagery_cache_ns,
+            elev_cache_ns,
+            night_cache_ns,
+            elevation_url_template,
+            elevation_max_level,
+            elevation_encoding,
+            subdomain_counter: 0,
+            cache: LruTileCache::new(max_cache_bytes),
+            disk_cache_dir,
+            transport,
+            uses_default_transport,
+            queue,
+            results_tx,
+            results_rx,
+            on_tile_ready,
+            stats: NetworkTileStats::default(),
+            default_tile_size: 256,
+        }
+    }
+
+    /// Convenience constructor targeting standard OpenStreetMap tiles.
     pub fn osm() -> Self {
-        Self::new("https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+        Self::from_preset(TileProviderPreset::OpenStreetMap).with_elevation_preset(TileElevationPreset::None)
     }
 
     /// Convenience constructor targeting open satellite world imagery (ArcGIS World Imagery)
-    /// paired with global AWS Terrarium DEM heightmaps.
+    /// paired with global AWS Terrarium DEM heightmaps and streamed NASA Black Marble (`z=0..=8`).
     pub fn world_satellite_with_terrain() -> Self {
-        Self::new("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}")
-            .with_terrarium_elevation()
+        Self::from_preset(TileProviderPreset::ArcGisWorldImagery)
     }
 
     /// Convenience constructor targeting Mapbox satellite imagery and Terrain-RGB elevation.
     pub fn mapbox(access_token: &str) -> Self {
-        let img = format!(
-            "https://api.mapbox.com/v4/mapbox.satellite/{{z}}/{{x}}/{{y}}@2x.png?access_token={access_token}"
-        );
-        let elev = format!(
-            "https://api.mapbox.com/v4/mapbox.terrain-rgb/{{z}}/{{x}}/{{y}}.pngraw?access_token={access_token}"
-        );
-        Self::with_options(
-            img,
-            Some(elev),
-            true,
-            DEFAULT_MAX_CACHE_BYTES,
-            None,
-            Arc::new(StandardHttpTransport::new()),
+        Self::from_provider(
+            TileProviderConfig::preset(TileProviderPreset::MapboxSatellite)
+                .with_mapbox_elevation(access_token)
+                .with_nasa_black_marble(),
         )
     }
 
     fn spawn_fetch_workers(
         worker_count: usize,
-        task_rx: std::sync::mpsc::Receiver<FetchTask>,
-        results_tx: std::sync::mpsc::Sender<(TileDataKey, Result<CachedTileData, TileError>)>,
+        queue: Arc<(Mutex<DynamicFetchQueue>, Condvar)>,
+        results_tx: std::sync::mpsc::Sender<WorkerResultMsg>,
         transport: Arc<dyn HttpTransport>,
         on_tile_ready: TileReadySlot,
     ) {
-        let shared_rx = Arc::new(Mutex::new(task_rx));
         for idx in 0..worker_count.max(1) {
-            let rx = Arc::clone(&shared_rx);
+            let q = Arc::clone(&queue);
             let tx = results_tx.clone();
             let worker_transport = Arc::clone(&transport);
             let worker_ready = Arc::clone(&on_tile_ready);
@@ -1523,17 +2303,41 @@ impl NetworkTileSource {
                 .name(format!("strata-tile-fetcher-{idx}"))
                 .spawn(move || loop {
                     let task = {
-                        let Ok(guard) = rx.lock() else {
-                            break;
-                        };
-                        match guard.recv() {
-                            Ok(t) => t,
+                        let (lock, cv) = &*q;
+                        let mut guard = match lock.lock() {
+                            Ok(g) => g,
                             Err(_) => break,
+                        };
+                        loop {
+                            if guard.shutdown {
+                                return;
+                            }
+                            if let Some(t) = guard.pop_best() {
+                                break t;
+                            }
+                            guard = match cv.wait(guard) {
+                                Ok(g) => g,
+                                Err(_) => return,
+                            };
                         }
                     };
                     let result = Self::process_fetch_task(&worker_transport, &task);
                     let ok = result.is_ok();
-                    let _ = tx.send((task.key, result));
+                    let is_permanent_miss = matches!(
+                        &result,
+                        Err(TileError::Transport(msg))
+                            if msg.contains("404") || msg.contains("400") || msg.contains("410")
+                    );
+                    if let Ok(mut guard) = q.0.lock() {
+                        guard.in_flight.remove(&(task.key, task.provider_gen));
+                        if is_permanent_miss {
+                            if guard.not_found_keys.len() > 2048 {
+                                guard.not_found_keys.clear();
+                            }
+                            guard.not_found_keys.insert((task.key, task.provider_gen));
+                        }
+                    }
+                    let _ = tx.send((task.key, task.provider_gen, result));
                     if ok {
                         if let Ok(guard) = worker_ready.lock() {
                             if let Some(ref cb) = *guard {
@@ -1545,6 +2349,26 @@ impl NetworkTileSource {
         }
     }
 
+    fn respawn_workers(&mut self, transport: Arc<dyn HttpTransport>) {
+        if let Ok(mut guard) = self.queue.0.lock() {
+            guard.shutdown = true;
+            self.queue.1.notify_all();
+        }
+        let queue = Arc::new((Mutex::new(DynamicFetchQueue::new()), Condvar::new()));
+        let (results_tx, results_rx) = channel::<WorkerResultMsg>();
+        Self::spawn_fetch_workers(
+            8,
+            Arc::clone(&queue),
+            results_tx.clone(),
+            Arc::clone(&transport),
+            Arc::clone(&self.on_tile_ready),
+        );
+        self.transport = transport;
+        self.queue = queue;
+        self.results_tx = results_tx;
+        self.results_rx = results_rx;
+    }
+
     /// Fully customizable builder constructor.
     pub fn with_options(
         imagery_url_template: impl Into<String>,
@@ -1554,39 +2378,96 @@ impl NetworkTileSource {
         disk_cache_dir: Option<PathBuf>,
         transport: Arc<dyn HttpTransport>,
     ) -> Self {
-        let (task_tx, task_rx) = channel::<FetchTask>();
-        let (results_tx, results_rx) =
-            channel::<(TileDataKey, Result<CachedTileData, TileError>)>();
-        let on_tile_ready: TileReadySlot = Arc::new(Mutex::new(None));
-
-        Self::spawn_fetch_workers(
-            6,
-            task_rx,
-            results_tx,
-            Arc::clone(&transport),
-            Arc::clone(&on_tile_ready),
-        );
-
-        Self {
-            imagery_url_template: imagery_url_template.into(),
-            elevation_url_template,
-            elevation_encoding: if elevation_is_terrain_rgb {
-                ElevationEncoding::TerrainRgb
-            } else {
-                ElevationEncoding::RawF32
+        let elev = match elevation_url_template {
+            Some(template) => TileElevationPreset::Custom {
+                template,
+                encoding: if elevation_is_terrain_rgb {
+                    ElevationEncoding::TerrainRgb
+                } else {
+                    ElevationEncoding::RawF32
+                },
+                max_level: 20,
             },
-            subdomains: vec!["a".to_string(), "b".to_string(), "c".to_string()],
-            subdomain_counter: 0,
-            cache: LruTileCache::new(max_cache_bytes),
-            disk_cache_dir,
-            transport,
-            pending: Arc::new(Mutex::new(HashSet::new())),
-            results_rx,
-            task_tx,
-            on_tile_ready,
-            stats: NetworkTileStats::default(),
-            default_tile_size: 256,
+            None => TileElevationPreset::None,
+        };
+        let mut cfg = TileProviderConfig::custom("custom", imagery_url_template);
+        cfg.elevation = elev;
+        Self::from_provider_with_transport(cfg, max_cache_bytes, disk_cache_dir, transport, false)
+    }
+
+    /// Returns the active [`TileProviderConfig`].
+    pub fn provider_config(&self) -> &TileProviderConfig {
+        &self.provider
+    }
+
+    /// Returns the active disk-cache namespace derived from the current imagery provider URL/key.
+    pub fn imagery_cache_namespace(&self) -> &str {
+        &self.imagery_cache_ns
+    }
+
+    /// Switches the active tile provider at runtime, clearing stale imagery/night caches and
+    /// isolating disk storage per provider hash while preserving elevation caches when unchanged.
+    pub fn apply_provider(&mut self, config: &TileProviderConfig) {
+        let imagery_changed = self.provider.imagery_url_template != config.imagery_url_template
+            || self.provider.api_key != config.api_key
+            || self.provider.subdomains != config.subdomains
+            || self.provider.headers != config.headers
+            || self.provider.night_lights_url_template != config.night_lights_url_template
+            || self.provider.id != config.id;
+        let elev_changed = self.provider.elevation != config.elevation
+            || self.provider.api_key != config.api_key
+            || self.provider.headers != config.headers;
+
+        self.provider = config.clone();
+        self.imagery_cache_ns = config.imagery_cache_namespace();
+        self.elev_cache_ns = config.elevation_cache_namespace();
+        self.night_cache_ns = config.night_cache_namespace();
+
+        let (el_tpl, el_enc, el_max) = match config.elevation.resolve() {
+            Some((t, e, z)) => (Some(t), e, z),
+            None => (None, ElevationEncoding::RawF32, 20),
+        };
+        self.elevation_url_template = el_tpl;
+        self.elevation_encoding = el_enc;
+        self.elevation_max_level = el_max;
+
+        if imagery_changed {
+            self.cache.clear_imagery();
+            self.cache.clear_night_lights();
         }
+        if elev_changed {
+            self.cache.clear_elevation();
+        }
+
+        if let Ok(mut guard) = self.queue.0.lock() {
+            if imagery_changed {
+                guard.imagery_provider_gen = guard.imagery_provider_gen.wrapping_add(1).max(1);
+                guard
+                    .tasks
+                    .retain(|k, _| matches!(k, TileDataKey::Elevation(_)));
+                guard
+                    .not_found_keys
+                    .retain(|(k, _)| matches!(k, TileDataKey::Elevation(_)));
+            }
+            if elev_changed {
+                guard.elev_provider_gen = guard.elev_provider_gen.wrapping_add(1).max(1);
+                guard
+                    .tasks
+                    .retain(|k, _| !matches!(k, TileDataKey::Elevation(_)));
+                guard
+                    .not_found_keys
+                    .retain(|(k, _)| !matches!(k, TileDataKey::Elevation(_)));
+            }
+        }
+
+        if !config.headers.is_empty() && self.uses_default_transport {
+            let t = Arc::new(StandardHttpTransport::new().with_headers(config.headers.clone()));
+            self.respawn_workers(t);
+        } else if self.uses_default_transport && imagery_changed {
+            let t = Arc::new(StandardHttpTransport::new());
+            self.respawn_workers(t);
+        }
+        self.poll_completed();
     }
 
     /// Registers a wakeup callback invoked whenever a downloaded tile finishes decoding.
@@ -1598,25 +2479,31 @@ impl NetworkTileSource {
 
     /// Replaces the active HTTP transport (useful for mock injection in tests).
     pub fn with_transport(mut self, transport: impl HttpTransport) -> Self {
-        let transport: Arc<dyn HttpTransport> = Arc::new(transport);
-        self.transport = Arc::clone(&transport);
-        let (task_tx, task_rx) = channel::<FetchTask>();
-        let (results_tx, results_rx) =
-            channel::<(TileDataKey, Result<CachedTileData, TileError>)>();
-        Self::spawn_fetch_workers(
-            6,
-            task_rx,
-            results_tx,
-            Arc::clone(&transport),
-            Arc::clone(&self.on_tile_ready),
-        );
-
-        self.task_tx = task_tx;
-        self.results_rx = results_rx;
+        self.uses_default_transport = false;
+        let t: Arc<dyn HttpTransport> = Arc::new(transport);
+        self.respawn_workers(t);
         self
     }
 
-    /// Sets the on-disk cache directory.
+    /// Sets the API key / token used in URL template substitutions (`{api_key}`, `{access_token}`).
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.provider.api_key = Some(api_key.into());
+        self.imagery_cache_ns = self.provider.imagery_cache_namespace();
+        self.elev_cache_ns = self.provider.elevation_cache_namespace();
+        self
+    }
+
+    /// Adds a custom HTTP header on outgoing requests (uses `StandardHttpTransport`).
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.provider.headers.push((name.into(), value.into()));
+        if self.uses_default_transport {
+            let t = Arc::new(StandardHttpTransport::new().with_headers(self.provider.headers.clone()));
+            self.respawn_workers(t);
+        }
+        self
+    }
+
+    /// Sets the on-disk cache directory (automatically namespaced per provider template/key hash).
     pub fn with_disk_cache(mut self, path: impl Into<PathBuf>) -> Self {
         self.disk_cache_dir = Some(path.into());
         self
@@ -1624,28 +2511,55 @@ impl NetworkTileSource {
 
     /// Configures subdomains for load balancing.
     pub fn with_subdomains(mut self, subdomains: &[&str]) -> Self {
-        self.subdomains = subdomains.iter().map(|s| s.to_string()).collect();
+        self.provider.subdomains = subdomains.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Sets the elevation preset cleanly.
+    pub fn with_elevation_preset(mut self, preset: TileElevationPreset) -> Self {
+        self.provider.elevation = preset;
+        let (el_tpl, el_enc, el_max) = match self.provider.elevation.resolve() {
+            Some((t, e, z)) => (Some(t), e, z),
+            None => (None, ElevationEncoding::RawF32, 20),
+        };
+        self.elevation_url_template = el_tpl;
+        self.elevation_encoding = el_enc;
+        self.elevation_max_level = el_max;
+        self.elev_cache_ns = self.provider.elevation_cache_namespace();
         self
     }
 
     /// Sets the elevation URL template.
-    pub fn with_elevation(mut self, template: impl Into<String>, is_terrain_rgb: bool) -> Self {
-        self.elevation_url_template = Some(template.into());
-        self.elevation_encoding = if is_terrain_rgb {
+    pub fn with_elevation(self, template: impl Into<String>, is_terrain_rgb: bool) -> Self {
+        let tpl = template.into();
+        let enc = if is_terrain_rgb {
             ElevationEncoding::TerrainRgb
         } else {
             ElevationEncoding::RawF32
         };
-        self
+        self.with_elevation_preset(TileElevationPreset::Custom {
+            template: tpl,
+            encoding: enc,
+            max_level: 20,
+        })
     }
 
     /// Enables public-domain global AWS Terrarium DEM heightmaps (`z=0..15`).
-    pub fn with_terrarium_elevation(mut self) -> Self {
-        self.elevation_url_template = Some(
-            "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png".to_string(),
-        );
-        self.elevation_encoding = ElevationEncoding::Terrarium;
+    pub fn with_terrarium_elevation(self) -> Self {
+        self.with_elevation_preset(TileElevationPreset::AwsTerrarium)
+    }
+
+    /// Configures a streamed multi-resolution night city-lights WMTS/XYZ layer up to `max_level`.
+    pub fn with_night_lights(mut self, template: impl Into<String>, max_level: u8) -> Self {
+        self.provider.night_lights_url_template = Some(template.into());
+        self.provider.night_lights_max_level = max_level;
+        self.night_cache_ns = self.provider.night_cache_namespace();
         self
+    }
+
+    /// Enables public-domain NASA GIBS VIIRS Black Marble streaming (`z=0..=8`, ~611 m/texel).
+    pub fn with_nasa_black_marble(self) -> Self {
+        self.with_night_lights(DEFAULT_NASA_BLACK_MARBLE_URL, 8)
     }
 
     /// Inspects the current network tile statistics.
@@ -1653,24 +2567,69 @@ impl NetworkTileSource {
         self.stats
     }
 
+    /// Returns the number of queued tile fetch tasks waiting to start.
+    pub fn pending_queue_len(&self) -> usize {
+        self.queue.0.lock().map(|g| g.tasks.len()).unwrap_or(0)
+    }
+
     /// Accesses the underlying in-memory LRU cache.
     pub fn cache(&self) -> &LruTileCache {
         &self.cache
     }
 
-    /// Drains completed background downloads into the in-memory LRU cache.
+    #[inline]
+    fn imagery_disk_path(&self, key: TileKey) -> Option<PathBuf> {
+        self.disk_cache_dir.as_ref().map(|d| {
+            d.join("providers")
+                .join(&self.imagery_cache_ns)
+                .join(format!("{}/{}/{}.png", key.level, key.x, key.y))
+        })
+    }
+
+    #[inline]
+    fn night_disk_path(&self, key: TileKey) -> Option<PathBuf> {
+        let ns = self.night_cache_ns.as_deref()?;
+        self.disk_cache_dir.as_ref().map(|d| {
+            d.join("night")
+                .join(ns)
+                .join(format!("{}/{}/{}.jpg", key.level, key.x, key.y))
+        })
+    }
+
+    #[inline]
+    fn elevation_disk_path(&self, key: TileKey) -> Option<PathBuf> {
+        let ns = self.elev_cache_ns.as_deref()?;
+        self.disk_cache_dir.as_ref().map(|d| {
+            d.join("elev")
+                .join(ns)
+                .join(format!("{}/{}/{}.elev", key.level, key.x, key.y))
+        })
+    }
+
+    /// Drains completed background downloads into the in-memory LRU cache, discarding
+    /// stale responses from superseded providers.
     pub fn poll_completed(&mut self) {
-        while let Ok((key, result)) = self.results_rx.try_recv() {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(&key);
+        let (exp_img_gen, exp_elev_gen) = self
+            .queue
+            .0
+            .lock()
+            .map(|g| (g.imagery_provider_gen, g.elev_provider_gen))
+            .unwrap_or((1, 1));
+        while let Ok((key, pgen, result)) = self.results_rx.try_recv() {
+            let expected = match key {
+                TileDataKey::Elevation(_) => exp_elev_gen,
+                TileDataKey::Imagery(_) | TileDataKey::NightLights(_) => exp_img_gen,
+            };
+            if pgen != expected {
+                continue;
             }
             match result {
                 Ok(data) => match data {
-                    CachedTileData::Imagery(img) => {
-                        if let TileDataKey::Imagery(k) = key {
-                            self.cache.insert_imagery(k, img);
-                        }
-                    }
+                    CachedTileData::Imagery(img) => match key {
+                        TileDataKey::Imagery(k) => self.cache.insert_imagery(k, img),
+                        TileDataKey::NightLights(k) => self.cache.insert_night_lights(k, img),
+                        TileDataKey::Elevation(_) => {}
+                    },
                     CachedTileData::Elevation(elev) => {
                         if let TileDataKey::Elevation(k) = key {
                             self.cache.insert_elevation(k, elev);
@@ -1686,15 +2645,15 @@ impl NetworkTileSource {
 
     /// Synchronously fetches and caches an imagery tile, blocking until complete.
     pub fn fetch_sync(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
-        let url = format_slippy_url(
-            &self.imagery_url_template,
+        let url = format_tile_url(
+            &self.provider.imagery_url_template,
             key,
-            &self.subdomains,
+            &self.provider.subdomains,
             &mut self.subdomain_counter,
+            self.provider.api_key.as_deref(),
         );
         let bytes = self.transport.fetch(&url)?;
-        if let Some(dir) = &self.disk_cache_dir {
-            let path = dir.join(format!("{}/{}/{}.png", key.level, key.x, key.y));
+        if let Some(path) = self.imagery_disk_path(key) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1714,15 +2673,15 @@ impl NetworkTileSource {
             Some(t) => t.clone(),
             None => return Ok(None),
         };
-        let url = format_slippy_url(
+        let url = format_tile_url(
             &template,
             key,
-            &self.subdomains,
+            &self.provider.subdomains,
             &mut self.subdomain_counter,
+            self.provider.api_key.as_deref(),
         );
         let bytes = self.transport.fetch(&url)?;
-        if let Some(dir) = &self.disk_cache_dir {
-            let path = dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y));
+        if let Some(path) = self.elevation_disk_path(key) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1848,25 +2807,107 @@ impl NetworkTileSource {
             bytes.len()
         )))
     }
-}
 
-impl TileSource for NetworkTileSource {
-    fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
+    fn enqueue_fetch(
+        &mut self,
+        data_key: TileDataKey,
+        tile: TileKey,
+        kind_weight: f64,
+        template: &str,
+        is_elevation: bool,
+        disk_cache_path: Option<PathBuf>,
+    ) {
+        let (lock, cv) = &*self.queue;
+        let Ok(mut guard) = lock.lock() else {
+            return;
+        };
+        let gen = guard.generation;
+        let pgen = if is_elevation {
+            guard.elev_provider_gen
+        } else {
+            guard.imagery_provider_gen
+        };
+        if guard.in_flight.contains(&(data_key, pgen))
+            || guard.not_found_keys.contains(&(data_key, pgen))
+        {
+            return;
+        }
+        if let Some(existing) = guard.tasks.get_mut(&data_key) {
+            existing.generation = gen;
+            existing.provider_gen = pgen;
+            existing.kind_weight = kind_weight.max(existing.kind_weight);
+            cv.notify_one();
+            return;
+        }
+        let url = format_tile_url(
+            template,
+            tile,
+            &self.provider.subdomains,
+            &mut self.subdomain_counter,
+            self.provider.api_key.as_deref(),
+        );
+        guard.tasks.insert(
+            data_key,
+            FetchTask {
+                key: data_key,
+                tile,
+                kind_weight,
+                generation: gen,
+                provider_gen: pgen,
+                url,
+                is_elevation,
+                elevation_encoding: self.elevation_encoding,
+                disk_cache_path,
+            },
+        );
+        cv.notify_one();
+        self.stats.network_requests += 1;
+    }
+
+    fn fetch_image_layer(
+        &mut self,
+        key: TileKey,
+        is_night: bool,
+    ) -> Result<Option<TileImage>, TileError> {
         self.poll_completed();
 
-        // 1. Check in-memory LRU cache
-        if let Some(img) = self.cache.get_imagery(key) {
+        let cached = if is_night {
+            self.cache.get_night_lights(key)
+        } else {
+            self.cache.get_imagery(key)
+        };
+        if let Some(img) = cached {
             self.stats.cache_hits += 1;
             return Ok(Some(img));
         }
 
-        // 2. Check on-disk cache if configured
-        if let Some(dir) = &self.disk_cache_dir {
-            let path = dir.join(format!("{}/{}/{}.png", key.level, key.x, key.y));
+        let (template, disk_path) = if is_night {
+            let Some(ref tpl) = self.provider.night_lights_url_template else {
+                return Ok(None);
+            };
+            if key.level > self.provider.night_lights_max_level {
+                return Ok(None);
+            }
+            (tpl.clone(), self.night_disk_path(key))
+        } else {
+            if key.level > self.provider.max_imagery_level {
+                return Ok(None);
+            }
+            (
+                self.provider.imagery_url_template.clone(),
+                self.imagery_disk_path(key),
+            )
+        };
+
+        if let Some(ref path) = disk_path {
             if path.is_file() {
-                if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(bytes) = std::fs::read(path) {
                     if let Ok(img) = Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
-                        self.cache.insert_imagery(key, img.clone());
+                        if is_night {
+                            self.cache.insert_night_lights(key, img.clone());
+                        } else {
+                            self.cache.insert_imagery(key, img.clone());
+                        }
                         self.stats.disk_cache_hits += 1;
                         return Ok(Some(img));
                     }
@@ -1875,44 +2916,66 @@ impl TileSource for NetworkTileSource {
         }
 
         self.stats.cache_misses += 1;
-        let data_key = TileDataKey::Imagery(key);
+        let data_key = if is_night {
+            TileDataKey::NightLights(key)
+        } else {
+            TileDataKey::Imagery(key)
+        };
+        let weight = if is_night { 50_000.0 } else { 200_000.0 };
+        self.enqueue_fetch(data_key, key, weight, &template, false, disk_path);
+        Ok(None)
+    }
+}
 
-        // 3. Enqueue fetch if not already pending
-        let mut is_new = false;
-        if let Ok(mut pending) = self.pending.lock() {
-            if !pending.contains(&data_key) {
-                pending.insert(data_key);
-                is_new = true;
+impl Drop for NetworkTileSource {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.queue.0.lock() {
+            guard.shutdown = true;
+            self.queue.1.notify_all();
+        }
+    }
+}
+
+impl TileSource for NetworkTileSource {
+    fn begin_frame(&mut self, focus: Geodetic, altitude_m: f64) {
+        if let Ok(mut guard) = self.queue.0.lock() {
+            guard.generation = guard.generation.wrapping_add(1).max(1);
+            guard.focus_lat = focus.lat_deg;
+            guard.focus_lon = focus.lon_deg;
+            guard.focus_alt_m = altitude_m.max(100.0);
+            if guard.tasks.len() > 2048 {
+                let min_keep = guard.generation.saturating_sub(1);
+                guard.tasks.retain(|_, t| t.generation >= min_keep);
             }
         }
+    }
 
-        if is_new {
-            let url = format_slippy_url(
-                &self.imagery_url_template,
-                key,
-                &self.subdomains,
-                &mut self.subdomain_counter,
-            );
-            let disk_cache_path = self
-                .disk_cache_dir
-                .as_ref()
-                .map(|dir| dir.join(format!("{}/{}/{}.png", key.level, key.x, key.y)));
-            let _ = self.task_tx.send(FetchTask {
-                key: data_key,
-                url,
-                is_elevation: false,
-                elevation_encoding: ElevationEncoding::RawF32,
-                disk_cache_path,
-            });
-            self.stats.network_requests += 1;
-        }
+    fn end_frame(&mut self) {
+        let cancelled = if let Ok(mut guard) = self.queue.0.lock() {
+            let gen = guard.generation;
+            let before = guard.tasks.len();
+            guard.tasks.retain(|_, t| t.generation >= gen);
+            before.saturating_sub(guard.tasks.len())
+        } else {
+            0
+        };
+        self.stats.cancelled_requests += cancelled as u64;
+    }
 
-        // Return None non-blockingly so the scene renderer falls back to an ancestor tile
-        Ok(None)
+    fn imagery(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
+        self.fetch_image_layer(key, false)
     }
 
     fn peek_cached_imagery(&self, key: TileKey) -> Option<TileImage> {
         self.cache.peek_imagery(key)
+    }
+
+    fn night_lights(&mut self, key: TileKey) -> Result<Option<TileImage>, TileError> {
+        self.fetch_image_layer(key, true)
+    }
+
+    fn peek_cached_night_lights(&self, key: TileKey) -> Option<TileImage> {
+        self.cache.peek_night_lights(key)
     }
 
     fn elevation(&mut self, key: TileKey) -> Result<Option<TileElevation>, TileError> {
@@ -1922,16 +2985,19 @@ impl TileSource for NetworkTileSource {
             Some(t) => t.clone(),
             None => return Ok(None),
         };
+        if key.level > self.elevation_max_level {
+            return Ok(None);
+        }
 
         if let Some(elev) = self.cache.get_elevation(key) {
             self.stats.cache_hits += 1;
             return Ok(Some(elev));
         }
 
-        if let Some(dir) = &self.disk_cache_dir {
-            let path = dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y));
+        let disk_path = self.elevation_disk_path(key);
+        if let Some(ref path) = disk_path {
             if path.is_file() {
-                if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(bytes) = std::fs::read(path) {
                     if let Ok(elev) = Self::decode_elevation_bytes(&bytes, self.elevation_encoding)
                     {
                         self.cache.insert_elevation(key, elev.clone());
@@ -1943,41 +3009,28 @@ impl TileSource for NetworkTileSource {
         }
 
         self.stats.cache_misses += 1;
-        let data_key = TileDataKey::Elevation(key);
-
-        let mut is_new = false;
-        if let Ok(mut pending) = self.pending.lock() {
-            if !pending.contains(&data_key) {
-                pending.insert(data_key);
-                is_new = true;
-            }
-        }
-
-        if is_new {
-            let url = format_slippy_url(
-                &template,
-                key,
-                &self.subdomains,
-                &mut self.subdomain_counter,
-            );
-            let disk_cache_path = self
-                .disk_cache_dir
-                .as_ref()
-                .map(|dir| dir.join(format!("{}/{}/{}.elev", key.level, key.x, key.y)));
-            let _ = self.task_tx.send(FetchTask {
-                key: data_key,
-                url,
-                is_elevation: true,
-                elevation_encoding: self.elevation_encoding,
-                disk_cache_path,
-            });
-            self.stats.network_requests += 1;
-        }
-
+        let elev_weight = 100_000.0;
+        self.enqueue_fetch(
+            TileDataKey::Elevation(key),
+            key,
+            elev_weight,
+            &template,
+            true,
+            disk_path,
+        );
         Ok(None)
     }
 
     fn peek_cached_elevation(&self, key: TileKey) -> Option<TileElevation> {
         self.cache.peek_elevation(key)
+    }
+
+    fn set_provider(&mut self, config: &TileProviderConfig) -> bool {
+        self.apply_provider(config);
+        true
+    }
+
+    fn set_tile_ready_callback(&mut self, cb: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.set_on_tile_ready(cb);
     }
 }

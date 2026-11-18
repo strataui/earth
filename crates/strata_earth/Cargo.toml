@@ -16,11 +16,16 @@ description = "Earth scene plugin: f64 geodesy, tile resolution, and scene assem
 name = "strata_earth"
 path = "src/lib.rs"
 
+[features]
+default = []
+widget = ["dep:strata-ui"]
+
 [dependencies]
 strata_primitives = { workspace = true }
 strata_style = { workspace = true }
 strata_layout = { workspace = true }
 strata_render = { workspace = true }
+strata-ui = { path = "../../../strata/crates/strata", optional = true }
 flate2 = "1.0"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

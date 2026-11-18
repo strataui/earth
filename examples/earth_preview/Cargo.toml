@@ -17,7 +17,7 @@ name = "earth_preview"
 path = "src/bin/earth_preview.rs"
 
 [dependencies]
-strata_earth = { workspace = true }
+strata_earth = { workspace = true, features = ["widget"] }
 strata_layout = { workspace = true }
 strata_render = { workspace = true }
 strata = { package = "strata-ui", path = "../../../strata/crates/strata" }

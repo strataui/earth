@@ -269,6 +269,8 @@ pub struct WeatherConfig {
     pub global_cloud_map: bool,
     /// Opacity of the 3D global cloud map (`0.0..=1.0`).
     pub global_cloud_opacity: f32,
+    /// Resolution tier for the live global cloud map (`1K`, `2K`, `4K`, `8K`).
+    pub cloud_resolution: crate::astro::CloudMapResolution,
     /// Custom or default live global cloud-map URL (`https://clouds.matteason.co.uk/...`).
     pub cloud_map_url: String,
     /// Global cloud drift offset speed in radians/second (defaults to `0.0`).
@@ -315,10 +317,12 @@ pub struct WeatherConfig {
 
 impl Default for WeatherConfig {
     fn default() -> Self {
+        let cloud_resolution = crate::astro::CloudMapResolution::default();
         Self {
             global_cloud_map: true,
             global_cloud_opacity: 0.72,
-            cloud_map_url: crate::astro::DEFAULT_CLOUD_MAP_URL.to_string(),
+            cloud_resolution,
+            cloud_map_url: cloud_resolution.url().to_string(),
             global_cloud_spin_rad_s: 0.0,
             clouds_25d: true,
             cloud_count: 14,
@@ -337,6 +341,30 @@ impl Default for WeatherConfig {
             snow_scale_m: 2.6,
             snow_color: [0.96, 0.98, 1.0, 0.94],
             weather_time_s: 0.0,
+        }
+    }
+}
+
+impl WeatherConfig {
+    /// Selects a cloud map resolution preset and updates [`Self::cloud_map_url`].
+    pub fn with_cloud_resolution(mut self, res: crate::astro::CloudMapResolution) -> Self {
+        self.cloud_resolution = res;
+        if self.cloud_map_url.is_empty()
+            || crate::astro::CloudMapResolution::is_preset_url(&self.cloud_map_url)
+        {
+            self.cloud_map_url = res.url().to_string();
+        }
+        self
+    }
+
+    /// Returns a custom URL if set by caller, otherwise the URL for [`Self::cloud_resolution`].
+    pub fn resolved_cloud_map_url(&self) -> &str {
+        if !self.cloud_map_url.trim().is_empty()
+            && !crate::astro::CloudMapResolution::is_preset_url(&self.cloud_map_url)
+        {
+            &self.cloud_map_url
+        } else {
+            self.cloud_resolution.url()
         }
     }
 }
