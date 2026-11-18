@@ -123,6 +123,14 @@ pub struct SpaceEnvironmentConfig {
     pub stars_visible: bool,
     /// Starfield & Milky Way brightness multiplier (`1.0` default).
     pub stars_intensity: f32,
+    /// Real telescope skybox survey preset (`CompositeOptical` default).
+    pub skybox_survey: crate::skybox::SpaceSkyboxSurvey,
+    /// Programmatic skybox cubemap resolution (`High` `2048^2` default; `Ultra` `4096^2` for 4K).
+    pub skybox_quality: crate::skybox::SpaceSkyboxQuality,
+    /// Brightness multiplier for real telescope skybox cubemap (`1.0` default).
+    pub skybox_intensity: f32,
+    /// Remote CDN / GitHub rolling-release (`assets` & `assets-legacy`) asset configuration.
+    pub assets: crate::assets_cdn::AssetSourceConfig,
     /// Render live / propagated real orbital satellites (ISS, Hubble, NOAA, GPS, etc.) in 3D space (fades out in 2.5D).
     pub satellites_visible: bool,
     /// Render orbital ground-track arcs for flagship spacecraft in 3D space.
@@ -146,6 +154,10 @@ impl Default for SpaceEnvironmentConfig {
             custom_moon_dir: None,
             stars_visible: true,
             stars_intensity: 1.0,
+            skybox_survey: crate::skybox::SpaceSkyboxSurvey::default(),
+            skybox_quality: crate::skybox::SpaceSkyboxQuality::default(),
+            skybox_intensity: 1.0,
+            assets: crate::assets_cdn::AssetSourceConfig::default(),
             satellites_visible: true,
             satellite_orbits_visible: true,
             satellite_scale_m: 38_000.0,
@@ -154,6 +166,23 @@ impl Default for SpaceEnvironmentConfig {
 }
 
 impl SpaceEnvironmentConfig {
+    /// Sets the telescope skybox survey and programmatic resolution tier.
+    pub fn with_skybox(
+        mut self,
+        survey: crate::skybox::SpaceSkyboxSurvey,
+        quality: crate::skybox::SpaceSkyboxQuality,
+    ) -> Self {
+        self.skybox_survey = survey;
+        self.skybox_quality = quality;
+        self
+    }
+
+    /// Overrides the remote CDN base URL for downloadable assets (e.g. `https://cdn.strata.larvance.com/earth`).
+    pub fn with_asset_cdn(mut self, cdn_base: Option<impl Into<String>>) -> Self {
+        self.assets = self.assets.with_cdn_base(cdn_base);
+        self
+    }
+
     /// Uses the host OS wall clock and local UTC offset to compute solar/lunar direction.
     pub fn with_system_clock(mut self) -> Self {
         self.sun_direction = SunDirectionMode::SystemClock;
@@ -179,6 +208,76 @@ impl SpaceEnvironmentConfig {
     }
 }
 
+/// Optional animated wavy ocean rendering on non-land water surfaces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OceanWavesConfig {
+    /// Enables animated multi-octave Gerstner waves and sun-glint crests on non-land surfaces (`false` default).
+    pub enabled: bool,
+    /// Wave height / slope amplitude multiplier (`1.0` default).
+    pub wave_strength: f32,
+    /// Spatial wave frequency multiplier (`1.0` default; higher = tighter waves).
+    pub wave_scale: f32,
+    /// Specular sun-glint & whitecap crest highlight intensity (`1.0` default).
+    pub glint_intensity: f32,
+    /// Animation speed multiplier (`1.0` default).
+    pub speed: f32,
+    /// Translucent wave surface opacity over underlying bathymetry/satellite water (`0.36` default).
+    pub opacity: f32,
+}
+
+impl Default for OceanWavesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wave_strength: 1.0,
+            wave_scale: 1.0,
+            glint_intensity: 1.0,
+            speed: 1.0,
+            opacity: 0.36,
+        }
+    }
+}
+
+impl OceanWavesConfig {
+    /// Returns a preset with wavy ocean rendering enabled at nominal strength.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn with_strength(mut self, strength: f32) -> Self {
+        self.wave_strength = strength.max(0.0);
+        self
+    }
+
+    pub fn with_scale(mut self, scale: f32) -> Self {
+        self.wave_scale = scale.max(0.1);
+        self
+    }
+
+    pub fn with_speed(mut self, speed: f32) -> Self {
+        self.speed = speed.max(0.0);
+        self
+    }
+
+    pub fn with_glint(mut self, glint: f32) -> Self {
+        self.glint_intensity = glint.max(0.0);
+        self
+    }
+
+    pub fn with_opacity(mut self, opacity: f32) -> Self {
+        self.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+}
+
 /// Low-level surface geometry mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SurfaceMode {
@@ -195,6 +294,8 @@ pub enum SurfaceMode {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EarthInput {
     pub camera: EarthCamera,
+    /// Optional explicit ECEF camera-up vector for gimbal-free 3D arcball/trackball orientation.
+    pub camera_up_ecef: Option<[f64; 3]>,
     pub viewport: Rect,
     /// High-level view mode (`Mode3D` or `Mode2D`).
     pub view_mode: EarthViewMode,
@@ -241,6 +342,8 @@ pub struct EarthInput {
     pub space: SpaceEnvironmentConfig,
     /// Toggleable 3D global cloud map and 2.5D-only 3D CC0 clouds, rain, and snow models.
     pub weather: crate::gltf::WeatherConfig,
+    /// Optional animated wavy ocean renders on non-land water surfaces.
+    pub ocean_waves: OceanWavesConfig,
 }
 
 impl EarthInput {
@@ -334,6 +437,7 @@ impl Default for EarthInput {
     fn default() -> Self {
         Self {
             camera: EarthCamera::default(),
+            camera_up_ecef: None,
             viewport: Rect::new(0.0, 0.0, 1440.0, 900.0),
             view_mode: EarthViewMode::Mode3D,
             view_morph: 0.0,
@@ -356,6 +460,18 @@ impl Default for EarthInput {
             elevation_enabled: true,
             space: SpaceEnvironmentConfig::default(),
             weather: crate::gltf::WeatherConfig::default(),
+            ocean_waves: OceanWavesConfig::default(),
+        }
+    }
+}
+
+impl EarthInput {
+    /// Returns a full-globe spherical LOD preset (`SurfaceMode::QuadtreeLod`) suitable for
+    /// interactive 3D/2.5D/2D `<EarthView>` components across planetary and local scales.
+    pub fn globe() -> Self {
+        Self {
+            surface_mode: SurfaceMode::QuadtreeLod,
+            ..Self::default()
         }
     }
 }
@@ -592,6 +708,37 @@ impl EarthScene {
                 }
             }
 
+            fn resolve_elevation_non_flooding(
+                requested: TileKey,
+                src: &mut dyn TileSource,
+            ) -> (Option<crate::tiles::TileElevation>, TileKey) {
+                if let Ok(Some(elev)) = src.elevation(requested) {
+                    return (Some(elev), requested);
+                }
+                let mut probe = requested;
+                if requested.level > 15 {
+                    let mut p15 = requested;
+                    while p15.level > 15 {
+                        p15 = match p15.parent() {
+                            Some(p) => p,
+                            None => break,
+                        };
+                    }
+                    probe = p15;
+                    if let Ok(Some(elev)) = src.elevation(p15) {
+                        return (Some(elev), p15);
+                    }
+                }
+                let mut anc = probe.parent();
+                while let Some(a) = anc {
+                    if let Some(elev) = src.peek_cached_elevation(a) {
+                        return (Some(elev), a);
+                    }
+                    anc = a.parent();
+                }
+                (None, requested)
+            }
+
             match effective_mode {
                 SurfaceMode::FlatPatches => {
                     let span_deg = tile_patch_span_deg(&input.camera, input.patch_scale);
@@ -608,13 +755,14 @@ impl EarthScene {
                             }
                         }
 
-                        let elevation = source.elevation(requested).ok().flatten();
+                        let (elevation, elev_tile) =
+                            resolve_elevation_non_flooding(requested, source);
                         let (index_start, index_count) = push_tile_patch(
                             &mut self.terrain,
                             patch.bounds,
                             input.tile_grid.max(2),
                             elevation.as_ref(),
-                            requested,
+                            elev_tile,
                             with_skirts,
                         );
                         patch.resolution = resolution;
@@ -628,7 +776,7 @@ impl EarthScene {
                                 origin,
                                 patch.bounds,
                                 elevation.as_ref(),
-                                requested,
+                                elev_tile,
                             );
                         }
                         self.patches.push(patch);
@@ -669,13 +817,14 @@ impl EarthScene {
                                 }
                             }
 
-                            let elevation = source.elevation(requested).ok().flatten();
+                            let (elevation, elev_tile) =
+                                resolve_elevation_non_flooding(requested, source);
                             let (index_start, index_count) = push_tile_patch(
                                 &mut self.terrain,
                                 bounds,
                                 input.tile_grid.max(2),
                                 elevation.as_ref(),
-                                requested,
+                                elev_tile,
                                 with_skirts,
                             );
                             self.patches.push(PatchFrame {
@@ -725,13 +874,14 @@ impl EarthScene {
                             }
                         }
 
-                        let elevation = source.elevation(requested).ok().flatten();
+                        let (elevation, elev_tile) =
+                            resolve_elevation_non_flooding(requested, source);
                         let (index_start, index_count) = push_tile_patch(
                             &mut self.terrain,
                             bounds,
                             input.tile_grid.max(2),
                             elevation.as_ref(),
-                            requested,
+                            elev_tile,
                             with_skirts,
                         );
 

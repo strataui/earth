@@ -520,3 +520,425 @@ fn test_rte_eye_uniforms_projection_identity() {
         ndc_z
     );
 }
+
+#[test]
+fn test_camera_up_override_prevents_polar_gimbal_lock_and_orients_view_rot() {
+    use strata_render::camera64::DVec3;
+    use strata_render::scene3d::Background3D;
+
+    // Directly above the North Pole looking straight down at Earth's center.
+    let camera = EarthCamera {
+        focus: Geodetic::new(90.0, 0.0, 0.0),
+        aim_offset_m: [0.0, 0.0, -R],
+        eye_offset_m: [0.0, 0.0, 8_000_000.0],
+        ..EarthCamera::default()
+    };
+
+    let up_y = DVec3::new(0.0, 1.0, 0.0);
+    let up_neg_x = DVec3::new(-1.0, 0.0, 0.0);
+
+    let u1 = strata_earth::retained_camera_uniforms_with_up(
+        &camera,
+        Some(up_y),
+        1440.0,
+        900.0,
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.1, 0.1, 0.1],
+        Background3D::Transparent,
+    );
+    let u2 = strata_earth::retained_camera_uniforms_with_up(
+        &camera,
+        Some(up_neg_x),
+        1440.0,
+        900.0,
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.1, 0.1, 0.1],
+        Background3D::Transparent,
+    );
+
+    // Row 1 of column-major view_rot is the camera's local +Y (up) axis in world space.
+    let cam_up_1 = [u1.view_rot[0][1], u1.view_rot[1][1], u1.view_rot[2][1]];
+    let cam_up_2 = [u2.view_rot[0][1], u2.view_rot[1][1], u2.view_rot[2][1]];
+    assert!(
+        cam_up_1[1] > 0.999 && cam_up_1[0].abs() < 1e-3 && cam_up_1[2].abs() < 1e-3,
+        "expected camera +Y to align with +Y override at North Pole, got {:?}",
+        cam_up_1
+    );
+    assert!(
+        cam_up_2[0] < -0.999 && cam_up_2[1].abs() < 1e-3 && cam_up_2[2].abs() < 1e-3,
+        "expected camera +Y to align with -X override at North Pole, got {:?}",
+        cam_up_2
+    );
+
+    let leaves = strata_earth::traverse_quadtree_lod_frustum6_projected_with_up(
+        &camera,
+        Some(up_y),
+        1440.0,
+        900.0,
+        2.0,
+        16,
+        9,
+        true,
+        strata_earth::MAX_QUADTREE_LEAVES,
+        strata_earth::TileProjection::WebMercator,
+    );
+    assert_eq!(strata_earth::MAX_QUADTREE_LEAVES, 256);
+    assert!(!leaves.is_empty());
+    assert!(
+        leaves.iter().all(|k| k.level >= 1),
+        "close 3D orbit should subdivide past level 0, got {:?}",
+        leaves
+    );
+}
+
+#[test]
+fn test_2d_flat_lod_wraps_horizontally_and_stops_at_poles() {
+    let camera = EarthCamera {
+        focus: Geodetic::new(15.0, 175.0, 0.0),
+        aim_offset_m: [0.0, 0.0, 0.0],
+        eye_offset_m: [0.0, 0.0, 25_000_000.0],
+        fov_y_deg: 55.0,
+        near_m: 1_000.0,
+    };
+    let items = strata_earth::traverse_quadtree_lod_2d_flat(
+        &camera,
+        1280.0,
+        800.0,
+        2.0,
+        16,
+        9,
+        strata_earth::MAX_QUADTREE_LEAVES,
+        strata_earth::TileProjection::WebMercator,
+    );
+    assert!(!items.is_empty());
+    assert!(
+        items.iter().all(|(k, _)| k.level >= 1),
+        "2D flat traversal must subdivide past level 0 for clean wrapping"
+    );
+    let has_left_wrap = items.iter().any(|(_, w)| *w < 0);
+    let has_center = items.iter().any(|(_, w)| *w == 0);
+    let has_right_wrap = items.iter().any(|(_, w)| *w > 0);
+    assert!(
+        has_left_wrap && has_center && has_right_wrap,
+        "wide 2D view across antimeridian should emit wrapped horizontal copies (-1, 0, +1)"
+    );
+    for (k, _) in &items {
+        let b = strata_earth::tile_bounds_mercator(*k);
+        assert!(b.lat1 <= 90.0 && b.lat0 >= -90.0);
+    }
+
+    // Near the North Pole at medium zoom: must not wrap vertically around to southern tiles.
+    let north_cam = EarthCamera {
+        focus: Geodetic::new(85.0, 0.0, 0.0),
+        aim_offset_m: [0.0, 0.0, 0.0],
+        eye_offset_m: [0.0, 0.0, 500_000.0],
+        fov_y_deg: 55.0,
+        near_m: 1_000.0,
+    };
+    let north_items = strata_earth::traverse_quadtree_lod_2d_flat(
+        &north_cam,
+        1280.0,
+        800.0,
+        2.0,
+        16,
+        9,
+        strata_earth::MAX_QUADTREE_LEAVES,
+        strata_earth::TileProjection::WebMercator,
+    );
+    assert!(!north_items.is_empty());
+    for (k, _) in &north_items {
+        let b = strata_earth::tile_bounds_mercator(*k);
+        assert!(
+            b.lat1 > 60.0,
+            "near-North-Pole 2D view must end cleanly at pole without vertical wrap: {b:?}"
+        );
+    }
+}
+
+#[test]
+fn test_elevation_above_max_zoom_samples_ancestor_quadrant_seamlessly() {
+    use strata_earth::{
+        EarthCamera, EarthDefaultTileSource, EarthInput, EarthViewMode, NetworkTileSource,
+        RetainedTerrainBuilder, SurfaceMode, TileProjection,
+    };
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "strata_earth_elev_subtile_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let net = NetworkTileSource::new("http://127.0.0.1:0/{z}/{x}/{y}.png")
+        .with_elevation("http://127.0.0.1:0/{z}/{x}/{y}.png", false)
+        .with_disk_cache(&tmp_dir);
+    let elev_ns = net
+        .provider_config()
+        .elevation_cache_namespace()
+        .expect("elevation namespace");
+    let tile_dir = tmp_dir.join("elev").join(elev_ns).join("15/18738");
+    std::fs::create_dir_all(&tile_dir).unwrap();
+
+    // Write a deterministic 16x16 sloped z=15 heightmap (0 m at NW corner to 600 m at SE corner)
+    // in NetworkTileSource's raw elevation format (w_le, h_le, f32_le heights).
+    let w = 16u32;
+    let h = 16u32;
+    let mut raw = Vec::with_capacity(8 + (w * h * 4) as usize);
+    raw.extend_from_slice(&w.to_le_bytes());
+    raw.extend_from_slice(&h.to_le_bytes());
+    for y in 0..h {
+        for x in 0..w {
+            let elev_m = (x as f32 / (w - 1) as f32) * 350.0 + (y as f32 / (h - 1) as f32) * 250.0;
+            raw.extend_from_slice(&elev_m.to_le_bytes());
+        }
+    }
+    std::fs::write(tile_dir.join("12385.elev"), &raw).unwrap();
+
+    let mut source = EarthDefaultTileSource::with_network(net);
+
+    // EarthDefaultTileSource must NOT report ancestor z=15 data as if it belonged to z=16+.
+    use strata_earth::TileSource;
+    let child_nw = TileKey::new(16, 37476, 24770);
+    let parent_15 = TileKey::new(15, 18738, 12385);
+    assert!(source.elevation(parent_15).unwrap().is_some());
+    assert!(
+        source.elevation(child_nw).unwrap().is_none(),
+        "z=16 request must return None above max_elevation_level=15 so caller retains z=15 ancestor key"
+    );
+    assert!(source.peek_cached_elevation(child_nw).is_none());
+
+    // Center camera inside (15, 18738, 12385) close enough to subdivide into z=16+ leaves.
+    let bounds_15 = strata_earth::tile_bounds_mercator(parent_15);
+    let mid_lat = (bounds_15.lat0 + bounds_15.lat1) * 0.5;
+    let mid_lon = (bounds_15.lon0 + bounds_15.lon1) * 0.5;
+
+    let mut input = EarthInput {
+        camera: EarthCamera {
+            focus: Geodetic::new(mid_lat, mid_lon, 0.0),
+            aim_offset_m: [0.0, 0.0, 0.0],
+            eye_offset_m: [0.0, -400.0, 450.0],
+            fov_y_deg: 55.0,
+            near_m: 2.0,
+        },
+        view_mode: EarthViewMode::Mode3D,
+        seamless_25d: true,
+        tile_projection: TileProjection::WebMercator,
+        surface_mode: SurfaceMode::QuadtreeLod,
+        elevation_enabled: true,
+        tile_grid: 9,
+        max_tile_level: 17,
+        sse_threshold: 2.0,
+        ..EarthInput::default()
+    };
+    input.viewport.width = 1440.0;
+    input.viewport.height = 900.0;
+
+    let mut builder = RetainedTerrainBuilder::new();
+    let (frame, _) = builder.build_frame(&input, &mut source, 1, true);
+
+    use std::collections::HashMap;
+    let n = 9usize;
+    let by_key: HashMap<(u8, u32, u32), &_> = frame
+        .meshes
+        .iter()
+        .map(|m| ((m.key.level, m.key.col, m.key.row), m))
+        .collect();
+
+    let mut checked_subtile_pairs = 0usize;
+    for (&(lvl, col, row), m) in &by_key {
+        if lvl <= 15 {
+            continue;
+        }
+        let s = lvl - 15;
+        let px = col >> s;
+        let py = row >> s;
+        if px != 18738 || py != 12385 {
+            continue;
+        }
+        if let Some(right) = by_key.get(&(lvl, col + 1, row)) {
+            if (col + 1) >> s == px {
+                checked_subtile_pairs += 1;
+                for r in 0..n {
+                    let a = m.vertices[r * n + (n - 1)].pos_u;
+                    let b = right.vertices[r * n].pos_u;
+                    let d = ((m.center_ecef[0] + a[0] as f64 - (right.center_ecef[0] + b[0] as f64)).powi(2)
+                        + (m.center_ecef[1] + a[1] as f64 - (right.center_ecef[1] + b[1] as f64)).powi(2)
+                        + (m.center_ecef[2] + a[2] as f64 - (right.center_ecef[2] + b[2] as f64)).powi(2))
+                    .sqrt();
+                    assert!(d < 0.05, "east-west seam gap within z=15 parent at ({lvl},{col},{row}): {d}m");
+                }
+            }
+        }
+        if let Some(south) = by_key.get(&(lvl, col, row + 1)) {
+            if (row + 1) >> s == py {
+                checked_subtile_pairs += 1;
+                for c in 0..n {
+                    let a = m.vertices[c].pos_u;
+                    let b = south.vertices[(n - 1) * n + c].pos_u;
+                    let d = ((m.center_ecef[0] + a[0] as f64 - (south.center_ecef[0] + b[0] as f64)).powi(2)
+                        + (m.center_ecef[1] + a[1] as f64 - (south.center_ecef[1] + b[1] as f64)).powi(2)
+                        + (m.center_ecef[2] + a[2] as f64 - (south.center_ecef[2] + b[2] as f64)).powi(2))
+                    .sqrt();
+                    assert!(d < 0.05, "north-south seam gap within z=15 parent at ({lvl},{col},{row}): {d}m");
+                }
+            }
+        }
+    }
+    assert!(
+        checked_subtile_pairs > 0,
+        "expected z>=16 child tiles inside (15, 18738, 12385) to verify seam continuity"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_tilted_lod_reduces_resolution_for_far_tiles() {
+    use strata_earth::{
+        EarthInput, EarthViewMode, RetainedTerrainBuilder, SurfaceMode, TileElevation, TileError,
+        TileImage, TileProjection, TileSource,
+    };
+
+    struct OfflineDummyTileSource;
+    impl TileSource for OfflineDummyTileSource {
+        fn imagery(&mut self, _key: TileKey) -> Result<Option<TileImage>, TileError> {
+            Ok(None)
+        }
+        fn elevation(&mut self, _key: TileKey) -> Result<Option<TileElevation>, TileError> {
+            Ok(None)
+        }
+    }
+
+    let focus = Geodetic::new(40.7128, -74.0060, 0.0);
+    // Low, strongly tilted 2.5D camera looking north over a deep foreground-to-horizon swath.
+    let mut input = EarthInput {
+        camera: EarthCamera {
+            focus,
+            aim_offset_m: [0.0, 40_000.0, 0.0],
+            eye_offset_m: [0.0, -45_000.0, 22_000.0],
+            fov_y_deg: 55.0,
+            near_m: 100.0,
+        },
+        view_mode: EarthViewMode::Mode3D,
+        seamless_25d: true,
+        tile_projection: TileProjection::WebMercator,
+        surface_mode: SurfaceMode::QuadtreeLod,
+        elevation_enabled: false,
+        tile_grid: 9,
+        max_tile_level: 16,
+        sse_threshold: 2.0,
+        ..EarthInput::default()
+    };
+    input.viewport.width = 1440.0;
+    input.viewport.height = 900.0;
+
+    let mut source = OfflineDummyTileSource;
+    let mut builder = RetainedTerrainBuilder::new();
+    let (frame, _) = builder.build_frame(&input, &mut source, 1, true);
+    assert!(
+        frame.meshes.len() > 20,
+        "expected substantial leaf set across tilted frustum, got {}",
+        frame.meshes.len()
+    );
+
+    let origin = geodetic_to_ecef(focus);
+    let basis = LocalFrame::at(focus.lat_deg, focus.lon_deg);
+    let [oe, on, ou] = input.camera.eye_offset_m;
+    let eye_x = origin.x + basis.east.x * oe + basis.north.x * on + basis.up.x * ou;
+    let eye_y = origin.y + basis.east.y * oe + basis.north.y * on + basis.up.y * ou;
+    let eye_z = origin.z + basis.east.z * oe + basis.north.z * on + basis.up.z * ou;
+    let mut by_dist: Vec<(f64, u8)> = frame
+        .meshes
+        .iter()
+        .map(|m| {
+            let dx = m.center_ecef[0] - eye_x;
+            let dy = m.center_ecef[1] - eye_y;
+            let dz = m.center_ecef[2] - eye_z;
+            ((dx * dx + dy * dy + dz * dz).sqrt(), m.key.level)
+        })
+        .collect();
+    by_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let q = (by_dist.len() / 4).max(4);
+    let near_avg: f64 = by_dist[..q].iter().map(|(_, l)| *l as f64).sum::<f64>() / q as f64;
+    let far_avg: f64 = by_dist[by_dist.len() - q..]
+        .iter()
+        .map(|(_, l)| *l as f64)
+        .sum::<f64>()
+        / q as f64;
+    let near_max = by_dist[..q].iter().map(|(_, l)| *l).max().unwrap_or(0);
+    let far_max = by_dist[by_dist.len() - q..]
+        .iter()
+        .map(|(_, l)| *l)
+        .max()
+        .unwrap_or(0);
+
+    assert!(
+        far_avg + 0.5 < near_avg && far_max < near_max,
+        "expected distant tilted horizon tiles to receive strictly coarser LODs than foreground: near_avg={near_avg:.2} near_max={near_max}, far_avg={far_avg:.2} far_max={far_max}"
+    );
+}
+
+#[test]
+fn full_3d_globe_view_covers_entire_visible_hemisphere() {
+    use strata_earth::{
+        EarthDefaultTileSource, EarthInput, EarthOrbitController, EarthViewMode,
+        RetainedTerrainBuilder, MAX_QUADTREE_LEAVES,
+    };
+
+    let mut orbit = EarthOrbitController::new();
+    orbit.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
+    orbit.set_viewport_size(1440.0, 900.0);
+    let (cam, up_opt) = orbit.to_camera_and_up(false, 0.0);
+    let mut input = EarthInput::globe();
+    input.camera = cam;
+    input.camera_up_ecef = up_opt;
+    input.view_mode = EarthViewMode::Mode3D;
+    input.viewport.width = 1440.0;
+    input.viewport.height = 900.0;
+
+    let up_v = up_opt.map(|u| strata_render::camera64::DVec3::new(u[0], u[1], u[2]));
+    let leaves = strata_earth::traverse_quadtree_lod_frustum6_projected_with_up(
+        &input.camera,
+        up_v,
+        1440.0,
+        900.0,
+        input.sse_threshold,
+        input.max_tile_level,
+        input.tile_grid.max(2),
+        true,
+        MAX_QUADTREE_LEAVES,
+        input.tile_projection,
+    );
+    let mut min_lat = 90.0f64;
+    let mut max_lat = -90.0f64;
+    let mut min_lon = 180.0f64;
+    let mut max_lon = -180.0f64;
+    for &k in &leaves {
+        let b = strata_earth::tile_bounds_mercator(k);
+        min_lat = min_lat.min(b.lat0);
+        max_lat = max_lat.max(b.lat1);
+        min_lon = min_lon.min(b.lon0);
+        max_lon = max_lon.max(b.lon1);
+    }
+
+    let mut source = EarthDefaultTileSource::offline_basemap();
+    let mut builder = RetainedTerrainBuilder::new();
+    let (frame, stats) = builder.build_frame(&input, &mut source, 1, true);
+    assert!(
+        frame.meshes.len() >= 24 && frame.instances.len() >= 24 && stats.visible_tiles >= 24,
+        "full 3D globe build must emit all visible hemisphere tiles, got meshes={} instances={}",
+        frame.meshes.len(),
+        frame.instances.len(),
+    );
+    assert!(
+        max_lon - min_lon > 120.0 && max_lat - min_lat > 100.0,
+        "full 3D view must cover visible hemisphere, got lon=[{min_lon}..{max_lon}] lat=[{min_lat}..{max_lat}]"
+    );
+}
+
+
+
+
+
+

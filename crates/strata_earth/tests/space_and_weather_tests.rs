@@ -69,9 +69,9 @@ fn embedded_bsc5_catalog_has_8404_scientific_stars() {
 #[test]
 fn embedded_land_mask_accurately_separates_land_and_ocean() {
     let mask = embedded_land_mask();
-    assert_eq!(mask.width, 1024);
-    assert_eq!(mask.height, 512);
-    assert_eq!(mask.rgba8.len(), 1024 * 512 * 4);
+    assert_eq!(mask.width, 4096);
+    assert_eq!(mask.height, 2048);
+    assert_eq!(mask.rgba8.len(), 4096 * 2048 * 4);
 
     // Sahara, Central Europe, Central Asia, Amazonia -> strictly landmass (>200).
     assert!(sample_mask_at_lat_lon(23.0, 12.0) > 200);
@@ -313,6 +313,30 @@ fn transitions_fade_terminator_city_lights_and_clouds_in_25d_and_toggles_work() 
         cam_25d.cloud_layer_opacity < 1e-4,
         "3D cloud shell must fade out in 2.5D"
     );
+    assert!(
+        cam_25d.local_cloud_opacity > 0.5,
+        "cropped overhead satellite cloud canopy should remain active in 2.5D, got {}",
+        cam_25d.local_cloud_opacity
+    );
+
+    let mut input_2d = input_3d.clone();
+    input_2d.view_mode = strata_earth::EarthViewMode::Mode2D;
+    input_2d.view_morph = 1.0;
+    let cam_2d = RetainedTerrainBuilder::camera_from_input(&input_2d);
+    assert!(!cam_2d.moon_visible, "Moon must be hidden in 2D map mode");
+    assert!(!cam_2d.sun_visible, "Sun must be hidden in 2D map mode");
+    assert!(!cam_2d.stars_visible, "Stars must be hidden in 2D map mode");
+    assert_eq!(cam_2d.skybox_intensity, 0.0);
+    assert_eq!(cam_2d.cloud_layer_opacity, 0.0);
+    assert_eq!(cam_2d.local_cloud_opacity, 0.0);
+    assert_eq!(cam_2d.day_night_strength, 0.0);
+    match cam_2d.background {
+        strata_render::scene3d::Background3D::VerticalGradient { top, bottom } => {
+            assert!(top.r() == 0.0 && top.g() == 0.0 && top.b() == 0.0);
+            assert!(bottom.r() == 0.0 && bottom.g() == 0.0 && bottom.b() == 0.0);
+        }
+        _ => {}
+    }
 
     let mut builder = RetainedTerrainBuilder::new();
     let mut src = MemoryTileSource::new();
@@ -660,3 +684,353 @@ fn google_earth_labels_project_fade_and_parse_highways_and_mountains() {
     assert_eq!(parsed[1].text, "East Peak");
     assert_eq!(parsed[1].kind, strata_earth::EarthLabelKind::Mountain);
 }
+
+#[test]
+fn healpix_cubemap_projection_and_ssky_roundtrip() {
+    use std::sync::Arc;
+    use strata_earth::{
+        blend_composite_cubemap, cubemap_face_dir, decode_ssky, encode_ssky_jpeg, encode_ssky_png,
+        healpix_nest_index, icrs_to_galactic, vec_to_healpix_face_uv, SpaceSkyboxQuality,
+        SpaceSkyboxSurvey,
+    };
+
+    // Galactic North Pole J2000 direction should transform close to (0, 0, +1) in Galactic frame.
+    let ngp_icrs = [-0.867_666_149, -0.198_076_373, 0.455_983_776];
+    let ngp_gal = icrs_to_galactic(ngp_icrs);
+    assert!(ngp_gal[2] > 0.999_9, "expected NGP z ~ +1, got {:?}", ngp_gal);
+
+    // Galactic Center (1, 0, 0) lands on HEALPix base face 4!
+    let (bf, _u, _v) = vec_to_healpix_face_uv([1.0, 0.0, 0.0]);
+    assert_eq!(bf, 4);
+    assert_eq!(healpix_nest_index(4, 0, 0, 1), 16);
+    assert_eq!(healpix_nest_index(4, 1, 0, 1), 17);
+
+    // Cubemap face direction covers all 6 axis directions cleanly.
+    assert!(cubemap_face_dir(0, 4, 4, 8)[0] > 0.9);
+    assert!(cubemap_face_dir(1, 4, 4, 8)[0] < -0.9);
+    assert!(cubemap_face_dir(2, 4, 4, 8)[1] > 0.9);
+    assert!(cubemap_face_dir(3, 4, 4, 8)[1] < -0.9);
+    assert!(cubemap_face_dir(4, 4, 4, 8)[2] > 0.9);
+    assert!(cubemap_face_dir(5, 4, 4, 8)[2] < -0.9);
+
+    // PNG & JPEG .ssky encode/decode round-trip + composite blending.
+    let face_size = 16u32;
+    let gaia: [Arc<Vec<u8>>; 6] =
+        std::array::from_fn(|i| Arc::new([20 + (i as u8) * 10, 30, 50, 255].repeat(256)));
+    let wise: [Arc<Vec<u8>>; 6] = std::array::from_fn(|_| Arc::new([180, 90, 40, 255].repeat(256)));
+    let comp = blend_composite_cubemap(&gaia, None, Some(&wise));
+    assert!(comp[0][0] > gaia[0][0], "AllWISE highlight should boost composite red");
+
+    let png_bytes = encode_ssky_png(
+        face_size,
+        SpaceSkyboxSurvey::CompositeOptical,
+        SpaceSkyboxQuality::Low,
+        &comp,
+    )
+    .expect("encode ssky png");
+    let (dec_size, dec_faces) = decode_ssky(&png_bytes).expect("decode ssky png");
+    assert_eq!(dec_size, face_size);
+    assert_eq!(dec_faces[0].as_slice(), comp[0].as_slice());
+
+    let jpg_bytes = encode_ssky_jpeg(
+        face_size,
+        SpaceSkyboxSurvey::AllWiseInfrared,
+        SpaceSkyboxQuality::Low,
+        &wise,
+        92,
+    )
+    .expect("encode ssky jpeg");
+    let (j_size, j_faces) = decode_ssky(&jpg_bytes).expect("decode ssky jpeg");
+    assert_eq!(j_size, face_size);
+    assert_eq!(j_faces[2][3], 255);
+}
+
+#[test]
+fn rolling_assets_and_legacy_fallback_caches_atomically() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use strata_earth::{
+        encode_ssky_png, sha256_hex, versioned_legacy_filename, AssetManager, AssetManifest,
+        AssetManifestEntry, AssetSourceConfig, SpaceSkyboxQuality, SpaceSkyboxStore,
+        SpaceSkyboxSurvey,
+    };
+
+    // 1. Verify default URL chain ordering (CDN assets -> GitHub assets -> CDN legacy -> GitHub legacy).
+    let def_cfg = AssetSourceConfig::default();
+    let legacy = versioned_legacy_filename("skybox-composite-ultra.ssky", 1);
+    assert_eq!(legacy, "skybox-composite-ultra-v1.ssky");
+    let urls = def_cfg.candidate_urls_for("skybox-composite-ultra.ssky", Some(&legacy));
+    assert_eq!(
+        urls,
+        vec![
+            "https://cdn.strata.larvance.com/earth/assets/skybox-composite-ultra.ssky",
+            "https://github.com/strataui/earth/releases/download/assets/skybox-composite-ultra.ssky",
+            "https://cdn.strata.larvance.com/earth/assets-legacy/skybox-composite-ultra-v1.ssky",
+            "https://github.com/strataui/earth/releases/download/assets-legacy/skybox-composite-ultra-v1.ssky",
+        ]
+    );
+
+    // 2. Spin up local mock HTTP server serving wrong SHA on /assets/ and valid pinned SHA on /assets-legacy/.
+    let faces: [Arc<Vec<u8>>; 6] = std::array::from_fn(|i| Arc::new([40 + (i as u8) * 15, 60, 120, 255].repeat(64)));
+    let valid_ssky = encode_ssky_png(
+        8,
+        SpaceSkyboxSurvey::GaiaDr3Optical,
+        SpaceSkyboxQuality::Low,
+        &faces,
+    )
+    .unwrap();
+    let expected_sha = sha256_hex(&valid_ssky);
+
+    let mut manifest = AssetManifest {
+        schema_version: 1,
+        entries: std::collections::HashMap::new(),
+    };
+    let fname = SpaceSkyboxSurvey::GaiaDr3Optical.cdn_filename(SpaceSkyboxQuality::Low);
+    let leg_name = versioned_legacy_filename(&fname, 1);
+    manifest.entries.insert(
+        fname.clone(),
+        AssetManifestEntry {
+            key: fname.clone(),
+            filename: fname.clone(),
+            version: 1,
+            sha256: Some(expected_sha.clone()),
+            bytes: valid_ssky.len() as u64,
+            legacy_filename: Some(leg_name.clone()),
+            license: Some("ESA/Gaia/DPAC".to_string()),
+        },
+    );
+    let parsed = AssetManifest::from_json_str(&manifest.to_json_string()).expect("manifest roundtrip");
+    assert_eq!(parsed.entries[&fname].sha256.as_deref(), Some(expected_sha.as_str()));
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock cdn");
+    let addr = listener.local_addr().unwrap();
+    let valid_clone = valid_ssky.clone();
+    let leg_path = format!("/assets-legacy/{leg_name}");
+    let cur_path = format!("/assets/{fname}");
+    let srv = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let mut req_buf = [0u8; 2048];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            if first_line.contains(&cur_path) {
+                // Return stale content with wrong checksum so client falls back to assets-legacy!
+                let body = b"stale-newer-version-bytes";
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(body);
+            } else if first_line.contains(&leg_path) {
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    valid_clone.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes());
+                let _ = stream.write_all(&valid_clone);
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    });
+
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let tmp_cache = std::env::temp_dir().join(format!("strata_earth_test_cache_{stamp}"));
+    let mut cfg = AssetSourceConfig::default()
+        .with_cdn_base(Some(format!("http://{addr}")))
+        .with_cache_dir(&tmp_cache);
+    cfg.github_repo.clear();
+    cfg.offline = false;
+    cfg.allow_direct_hips_fallback = false;
+
+    let mgr = AssetManager::new();
+    let fetched = mgr
+        .fetch_or_cache(
+            &cfg,
+            &fname,
+            Some(&leg_name),
+            Some(&expected_sha),
+            Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .expect("fetch via assets-legacy fallback");
+    assert_eq!(fetched, valid_ssky);
+
+    // Offline cache hit works immediately with zero network!
+    cfg.offline = true;
+    let cached = mgr
+        .fetch_or_cache(
+            &cfg,
+            &fname,
+            Some(&leg_name),
+            Some(&expected_sha),
+            Duration::from_secs(1),
+            1024 * 1024,
+        )
+        .expect("read from local cache while offline");
+    assert_eq!(cached, valid_ssky);
+
+    // SpaceSkyboxStore reads synchronously from cache even when offline, and clears when Off!
+    let store = SpaceSkyboxStore::new(None);
+    store.ensure_loaded(SpaceSkyboxSurvey::GaiaDr3Optical, SpaceSkyboxQuality::Low, &cfg);
+    let (rev1, cube1) = store.snapshot();
+    assert!(rev1 >= 1 && cube1.as_ref().is_some_and(|c| c.face_size == 8));
+
+    store.ensure_loaded(SpaceSkyboxSurvey::GaiaDr3Optical, SpaceSkyboxQuality::Off, &cfg);
+    let (rev2, cube2) = store.snapshot();
+    assert!(rev2 > rev1 && cube2.is_none());
+
+    drop(srv);
+    let _ = std::fs::remove_dir_all(&tmp_cache);
+}
+
+#[test]
+fn retained_builder_attaches_streamed_night_lights_on_zoomed_3d_tiles() {
+    use strata_earth::TileKey;
+
+    let mut src = MemoryTileSource::new();
+    let day_img = strata_earth::TileImage {
+        width: 4,
+        height: 4,
+        pixels: [80, 100, 120, 255].repeat(16),
+    };
+    let night_img = strata_earth::TileImage {
+        width: 4,
+        height: 4,
+        pixels: [255, 220, 150, 255].repeat(16),
+    };
+    src.insert_imagery(TileKey::new(0, 0, 0), day_img);
+    // NYC area at z=6 (parent of any deeper tile)
+    let nyc_z6 = TileKey::new(6, 18, 24);
+    src.insert_night_lights(nyc_z6, night_img);
+
+    let mut input = EarthInput {
+        camera: EarthCamera {
+            focus: Geodetic::new(40.7128, -74.0060, 0.0),
+            aim_offset_m: [0.0, 0.0, 0.0],
+            eye_offset_m: [0.0, 0.0, 650_000.0],
+            fov_y_deg: 55.0,
+            near_m: 100.0,
+        },
+        surface_mode: SurfaceMode::QuadtreeLod,
+        tile_projection: TileProjection::WebMercator,
+        elevation_enabled: false,
+        max_tile_level: 14,
+        tile_grid: 5,
+        sse_threshold: 8.0,
+        space: SpaceEnvironmentConfig {
+            day_night_lighting: true,
+            city_lights: true,
+            ..SpaceEnvironmentConfig::default()
+        },
+        ..EarthInput::default()
+    };
+
+    let mut builder = RetainedTerrainBuilder::new();
+    let (frame_on, _) = builder.build_frame(&input, &mut src, 1, false);
+    assert!(
+        frame_on
+            .instances
+            .iter()
+            .any(|inst| inst.night_texture_id.is_some()),
+        "zoomed 3D tiles in range of a cached z=6 night tile must attach night_texture_id"
+    );
+
+    // Turning sun lighting (unified daylight) off suppresses night textures cleanly.
+    input.space.day_night_lighting = false;
+    let (frame_unified, _) = builder.build_frame(&input, &mut src, 2, false);
+    assert!(
+        frame_unified
+            .instances
+            .iter()
+            .all(|inst| inst.night_texture_id.is_none()),
+        "unified sun lighting must omit night_texture_id overlays"
+    );
+}
+
+#[test]
+fn cloud_map_resolution_tiers_and_custom_url_override() {
+    use strata_earth::CloudMapResolution;
+
+    let mut res = CloudMapResolution::Low;
+    assert_eq!(res.short_label(), "1K");
+    assert!(res.url().contains("1024x512"));
+    res = res.next();
+    assert_eq!(res, CloudMapResolution::Medium);
+    assert_eq!(res.short_label(), "2K");
+    assert!(res.url().contains("2048x1024"));
+    res = res.next();
+    assert_eq!(res, CloudMapResolution::High);
+    assert_eq!(res.short_label(), "4K");
+    assert!(res.url().contains("4096x2048"));
+    res = res.next();
+    assert_eq!(res, CloudMapResolution::Ultra);
+    assert_eq!(res.short_label(), "8K");
+    assert!(res.url().contains("8192x4096"));
+    assert_eq!(res.next(), CloudMapResolution::Low);
+
+    let cfg = WeatherConfig::default().with_cloud_resolution(CloudMapResolution::High);
+    assert_eq!(cfg.resolved_cloud_map_url(), CloudMapResolution::High.url());
+
+    let mut custom = WeatherConfig::default();
+    custom.cloud_map_url = "https://example.test/custom_clouds.png".to_string();
+    custom = custom.with_cloud_resolution(CloudMapResolution::Ultra);
+    assert_eq!(
+        custom.resolved_cloud_map_url(),
+        "https://example.test/custom_clouds.png"
+    );
+}
+
+#[test]
+fn cloud_opacity_has_no_mid_orbit_dip_and_shader_defines_plane_fade() {
+    let base_op = 0.72f32;
+    let mut input = EarthInput {
+        camera: EarthCamera {
+            focus: Geodetic::new(38.5, 24.0, 0.0),
+            aim_offset_m: [0.0, 0.0, 0.0],
+            eye_offset_m: [0.0, 0.0, 10_000_000.0],
+            fov_y_deg: 46.0,
+            near_m: 1_000.0,
+        },
+        viewport: Rect::new(0.0, 0.0, 1280.0, 800.0),
+        seamless_25d: true,
+        tile_projection: TileProjection::WebMercator,
+        surface_mode: SurfaceMode::QuadtreeLod,
+        layers: LayerToggles {
+            clouds: true,
+            ..LayerToggles::default()
+        },
+        ..EarthInput::default()
+    };
+    input.weather.global_cloud_map = true;
+    input.weather.global_cloud_opacity = base_op;
+
+    for alt_m in [
+        10_000_000.0,
+        2_000_000.0,
+        1_225_000.0,
+        600_000.0,
+        450_000.0,
+        120_000.0,
+        13_500.0,
+        1_500.0,
+    ] {
+        input.camera.eye_offset_m = [0.0, 0.0, alt_m];
+        let cam = RetainedTerrainBuilder::camera_from_input(&input);
+        let combined = cam.cloud_layer_opacity + cam.local_cloud_opacity;
+        assert!(
+            (combined - base_op).abs() < 1e-4,
+            "combined cloud uniform opacity must stay steady at {base_op} without mid-orbit dip at alt={alt_m}m, got {combined}"
+        );
+    }
+}
+
+
+
+
