@@ -77,6 +77,8 @@ pub struct EarthViewState {
     last_label_sig: u64,
     last_label_refresh: Instant,
     last_labels_enabled: bool,
+    last_camera_sync: Option<Instant>,
+    camera_sync_pending: bool,
     tile_ready: Arc<AtomicBool>,
     label_ready: Arc<AtomicBool>,
     uncapped: bool,
@@ -139,11 +141,14 @@ impl EarthViewState {
             last_label_sig: 0,
             last_label_refresh: Instant::now(),
             last_labels_enabled: effective_input.layers.labels,
+            last_camera_sync: None,
+            camera_sync_pending: false,
             tile_ready,
             label_ready,
             uncapped: false,
         };
         st.sync_camera();
+        st.last_camera_sync = None;
         st.last_label_sig = st.label_state_signature();
         st
     }
@@ -151,6 +156,8 @@ impl EarthViewState {
     /// Synchronizes `viewport` camera uniforms and worker LOD target from `orbit` with strict
     /// terrain elevation collision clamping.
     pub fn sync_camera(&mut self) {
+        self.camera_sync_pending = false;
+        self.last_camera_sync = Some(Instant::now());
         let is_2d = self.viewport.view_mode() == EarthViewMode::Mode2D;
         let vw = self.orbit.viewport_w;
         let vh = self.orbit.viewport_h;
@@ -158,6 +165,18 @@ impl EarthViewState {
             .orbit
             .to_camera_and_up_clamped(is_2d, |lat, lon| self.viewport.sample_ground_elevation_m(lat, lon));
         self.viewport.update_camera_with_up(&cam, up_opt, vw, vh);
+    }
+
+    fn sync_camera_throttled(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_camera_sync
+            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(5))
+        {
+            self.camera_sync_pending = true;
+        } else {
+            self.sync_camera();
+        }
     }
 
     /// Bumps the reactive UI revision signal so label/HUD overlays re-render on the next paint.
@@ -326,7 +345,7 @@ impl EarthViewState {
             .orbit
             .step_damping(dt_s, is_2d, |lat, lon| vp_ref.sample_ground_elevation_m(lat, lon));
 
-        if orbit_dirty || trans_dirty {
+        if self.camera_sync_pending || orbit_dirty || trans_dirty {
             self.sync_camera();
         }
 
@@ -564,7 +583,7 @@ impl EarthView {
                 let mut st = st_move.borrow_mut();
                 st.orbit.set_viewport_size(ev.width, ev.height);
                 if st.orbit.handle_mouse_move(ev.offset_x, ev.offset_y) {
-                    st.sync_camera();
+                    st.sync_camera_throttled();
                 }
             })
             .onmouseup(move |ev: strata_dom::Event| {
@@ -587,7 +606,7 @@ impl EarthView {
                 st.orbit.set_viewport_size(ev.width, ev.height);
                 st.orbit
                     .handle_scroll(ev.delta_y, ev.offset_x, ev.offset_y);
-                st.sync_camera();
+                st.sync_camera_throttled();
             })
             .build();
 
@@ -612,7 +631,10 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
     let x = lbl.screen_x;
     let y = lbl.screen_y;
     let [r, g, b] = lbl.rgb;
-    let op = format!("{:.2}", lbl.alpha.clamp(0.0, 1.0));
+    let alpha = lbl.alpha.clamp(0.0, 1.0);
+    let op = format!("{:.2}", alpha);
+    let bg_op = format!("{:.2}", alpha * 0.35);
+    let bg25_op = format!("{:.2}", alpha * 0.25);
 
     match lbl.icon {
         EarthLabelIcon::HighwayShield => {
@@ -635,8 +657,8 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
         EarthLabelIcon::MountainRight => {
             rsx! {
                 <div
-                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, op, r, g, b, lbl.font_px)}
+                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
+                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
                     <span class="font-medium">{lbl.text.clone()}</span>
                     <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
@@ -648,8 +670,8 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
         EarthLabelIcon::ParkLeafRight => {
             rsx! {
                 <div
-                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, op, r, g, b, lbl.font_px)}
+                    class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
+                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
                     <span class="font-medium">{lbl.text.clone()}</span>
                     <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="currentColor">
@@ -661,8 +683,8 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
         EarthLabelIcon::CityDot => {
             rsx! {
                 <div
-                    class="absolute flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-black/35 select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, op, r, g, b, lbl.font_px)}
+                    class="absolute flex items-center gap-1.5 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
+                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
                     <div class="w-1.5 h-1.5 rounded-full bg-white/95" />
                     <span class="font-medium">{lbl.text.clone()}</span>
@@ -678,8 +700,8 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             };
             rsx! {
                 <div
-                    class={format!("absolute px-1 py-0.5 rounded bg-black/25 select-none whitespace-nowrap {}", extra_cls)}
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {}; color: rgb({},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, op, r, g, b, lbl.font_px)}
+                    class={format!("absolute px-1 py-0.5 rounded select-none whitespace-nowrap {}", extra_cls)}
+                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, bg25_op, r, g, b, op, lbl.font_px)}
                 >
                     <span>{lbl.text.clone()}</span>
                 </div>
