@@ -527,11 +527,23 @@ impl EarthView {
         let st_move = Rc::clone(&self.state);
         let st_up = Rc::clone(&self.state);
         let st_wheel = Rc::clone(&self.state);
+        let st_resize = Rc::clone(&self.state);
 
         let canvas = Canvas3D::builder()
             .retained(retained)
             .uncapped(uncapped)
             .class(cursor_cls)
+            .onresize(move |ev: strata_dom::Event| {
+                if ev.width > 0.0 && ev.height > 0.0 {
+                    let mut st = st_resize.borrow_mut();
+                    if (st.orbit.viewport_w - ev.width).abs() > 0.25
+                        || (st.orbit.viewport_h - ev.height).abs() > 0.25
+                    {
+                        st.orbit.set_viewport_size(ev.width, ev.height);
+                        st.sync_camera();
+                    }
+                }
+            })
             .onmousedown(move |ev: strata_dom::Event| {
                 ev.stop_propagation();
                 ev.prevent_default();
@@ -883,5 +895,59 @@ mod tests {
         let r1 = earth.with_state(|st| st.orbit.target_range_m);
         assert!(r1 < r0, "wheel up inside EarthView must zoom closer ({r1} < {r0})");
     }
+
+    #[test]
+    fn earth_view_detects_window_resize_and_updates_camera_without_mouse_events() {
+        let mut input = EarthInput::default();
+        input.elevation_enabled = false;
+        let source = Box::new(MemoryTileSource::default());
+        let earth = EarthView::new(&input, source);
+
+        let earth_view = earth.clone();
+        let build_root = move || {
+            rsx! {
+                <div class="w-full h-full">
+                    {earth_view.view()}
+                </div>
+            }
+        };
+
+        let mut runtime = AppRuntime::new(build_root(), 1200.0, 750.0, 1.0);
+        // Initial mount fires Canvas3D onresize with (1200, 750) automatically.
+        let (init_w, init_h, init_vp_w, init_vp_h) = earth.with_state(|st| {
+            let vp = st.viewport.input().viewport;
+            (st.orbit.viewport_w, st.orbit.viewport_h, vp.width, vp.height)
+        });
+        assert!((init_w - 1200.0).abs() < 0.5 && (init_h - 750.0).abs() < 0.5);
+        assert!((init_vp_w - 1200.0).abs() < 0.5 && (init_vp_h - 750.0).abs() < 0.5);
+
+        let mut compositor = SwapchainCompositor::new(1200, 750, 1.0);
+        let mut presenter =
+            SoftwareSurfacePresenter::new(1200, 750, SwapchainFormat::Bgra8Unorm);
+        let mut no_global_hook = |_: &PlatformEvent, _: &mut AppRuntime| false;
+
+        // Resize window to 1600x920 with zero mouse events: Canvas3D onresize must fire
+        // and mark both rebuild and redraw true.
+        let (needs_rebuild, needs_redraw, _) = dispatch_native_platform_event(
+            &PlatformEvent::WindowResized {
+                width: 1600,
+                height: 920,
+            },
+            &mut runtime,
+            &mut compositor,
+            &mut presenter,
+            &mut no_global_hook,
+        );
+        assert!(needs_rebuild, "Canvas3D onresize must request view rebuild on window resize");
+        assert!(needs_redraw, "WindowResized must request immediate redraw");
+
+        let (new_w, new_h, new_vp_w, new_vp_h) = earth.with_state(|st| {
+            let vp = st.viewport.input().viewport;
+            (st.orbit.viewport_w, st.orbit.viewport_h, vp.width, vp.height)
+        });
+        assert!((new_w - 1600.0).abs() < 0.5 && (new_h - 920.0).abs() < 0.5);
+        assert!((new_vp_w - 1600.0).abs() < 0.5 && (new_vp_h - 920.0).abs() < 0.5);
+    }
 }
+
 
