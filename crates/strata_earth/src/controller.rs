@@ -112,6 +112,8 @@ pub struct EarthOrbitController {
     orbit_vel_deg_s: (f64, f64),
     is_2d_hint: bool,
     ground_needs_snap: bool,
+    last_middle_click: Option<(std::time::Instant, f64, f64)>,
+    middle_press_origin: Option<(f64, f64)>,
 }
 
 impl Default for EarthOrbitController {
@@ -137,6 +139,8 @@ impl Default for EarthOrbitController {
             orbit_vel_deg_s: (0.0, 0.0),
             is_2d_hint: false,
             ground_needs_snap: true,
+            last_middle_click: None,
+            middle_press_origin: None,
         };
         ctrl.sync_dirs_from_geo();
         ctrl
@@ -382,13 +386,45 @@ impl EarthOrbitController {
         (ratio.log2() + 1.0).round().clamp(0.0, 19.0) as u8
     }
 
+    /// Resets camera pitch (`tilt_deg`) back to `0.0` (nadir), returning `true` if pitch changed.
+    pub fn reset_pitch(&mut self) -> bool {
+        let changed = self.tilt_deg.abs() > 1e-6 || self.orbit_vel_deg_s.1.abs() > 1e-6;
+        self.tilt_deg = 0.0;
+        self.orbit_vel_deg_s = (0.0, 0.0);
+        self.drag_action = None;
+        self.last_pointer = None;
+        self.middle_press_origin = None;
+        self.sync_dirs_from_geo();
+        changed
+    }
+
     /// Starts a pointer interaction (`0` = Left pan/arcball, `1`/`2` = Middle/Right heading+tilt orbit).
+    /// Double middle-clicking (`button == 1`) in 3D mode resets camera pitch (`tilt_deg`) to `0.0`.
     pub fn handle_mouse_down(&mut self, button: u32, x: f64, y: f64) -> bool {
         self.last_pointer = Some((x, y));
         self.spin_vel_rad_s = 0.0;
         self.pan_vel_lon_lat_s = (0.0, 0.0);
         self.orbit_vel_deg_s = (0.0, 0.0);
         self.zoom_cursor_px = None;
+
+        if button == 1 && !self.is_2d_hint {
+            let now = std::time::Instant::now();
+            if let Some((prev_time, px, py)) = self.last_middle_click {
+                if now.duration_since(prev_time) <= std::time::Duration::from_millis(450)
+                    && (x - px).hypot(y - py) <= 24.0
+                {
+                    self.last_middle_click = None;
+                    self.reset_pitch();
+                    return true;
+                }
+            }
+            self.last_middle_click = Some((now, x, y));
+            self.middle_press_origin = Some((x, y));
+        } else {
+            self.last_middle_click = None;
+            self.middle_press_origin = None;
+        }
+
         self.drag_action = match button {
             0 => Some(DragAction::PanOrArcball),
             1 | 2 => Some(DragAction::OrbitTilt),
@@ -402,6 +438,7 @@ impl EarthOrbitController {
         let was_dragging = self.drag_action.is_some();
         self.drag_action = None;
         self.last_pointer = None;
+        self.middle_press_origin = None;
         was_dragging
     }
 
@@ -409,6 +446,7 @@ impl EarthOrbitController {
     pub fn handle_cursor_left(&mut self) {
         self.drag_action = None;
         self.last_pointer = None;
+        self.middle_press_origin = None;
     }
 
     /// Applies pointer drag motion using component-local `(x, y)` coordinates.
@@ -421,6 +459,12 @@ impl EarthOrbitController {
             self.last_pointer = Some((x, y));
             return false;
         };
+        if let Some((ox, oy)) = self.middle_press_origin {
+            if (x - ox).hypot(y - oy) > 6.0 {
+                self.last_middle_click = None;
+                self.middle_press_origin = None;
+            }
+        }
         self.last_pointer = Some((x, y));
         let dx = x - px;
         let dy = y - py;
@@ -902,5 +946,31 @@ mod tests {
             prev_lon = ctrl.lon_deg;
         }
         assert!(ctrl.handle_mouse_up(0));
+    }
+
+    #[test]
+    fn double_middle_click_resets_pitch_in_3d_mode() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
+
+        // Middle-click and drag upward to increase pitch (tilt_deg).
+        assert!(ctrl.handle_mouse_down(1, 720.0, 450.0));
+        assert!(ctrl.handle_mouse_move(720.0, 350.0));
+        assert!(ctrl.handle_mouse_up(1));
+        assert!(ctrl.tilt_deg > 10.0, "expected positive pitch after middle drag");
+
+        // Double middle-click at the same position resets pitch to 0.0.
+        assert!(ctrl.handle_mouse_down(1, 720.0, 350.0));
+        assert!(ctrl.handle_mouse_up(1));
+        assert!(ctrl.tilt_deg > 10.0, "single middle click must not reset pitch yet");
+
+        assert!(ctrl.handle_mouse_down(1, 722.0, 351.0));
+        let _ = ctrl.handle_mouse_up(1);
+        assert!(
+            ctrl.tilt_deg.abs() < 1e-9,
+            "double middle click in 3D mode must reset pitch to 0.0, got {}",
+            ctrl.tilt_deg
+        );
     }
 }
