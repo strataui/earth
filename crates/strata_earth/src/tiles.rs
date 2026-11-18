@@ -2338,7 +2338,7 @@ impl NetworkTileSource {
                         }
                     }
                     let _ = tx.send((task.key, task.provider_gen, result));
-                    if ok {
+                    if ok || is_permanent_miss {
                         if let Ok(guard) = worker_ready.lock() {
                             if let Some(ref cb) = *guard {
                                 cb();
@@ -2636,8 +2636,15 @@ impl NetworkTileSource {
                         }
                     }
                 },
-                Err(_e) => {
-                    self.stats.decode_errors += 1;
+                Err(e) => {
+                    let is_placeholder_or_404 = matches!(
+                        &e,
+                        TileError::Transport(msg)
+                            if msg.contains("404") || msg.contains("400") || msg.contains("410")
+                    );
+                    if !is_placeholder_or_404 {
+                        self.stats.decode_errors += 1;
+                    }
                 }
             }
         }
@@ -2653,13 +2660,25 @@ impl NetworkTileSource {
             self.provider.api_key.as_deref(),
         );
         let bytes = self.transport.fetch(&url)?;
+        let image = match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
+            Ok(img) => img,
+            Err(TileError::Transport(ref msg)) if msg.contains("unavailable placeholder") => {
+                if let Ok(mut guard) = self.queue.0.lock() {
+                    let pgen = guard.imagery_provider_gen;
+                    guard
+                        .not_found_keys
+                        .insert((TileDataKey::Imagery(key), pgen));
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(path) = self.imagery_disk_path(key) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(path, &bytes);
         }
-        let image = Self::decode_imagery_bytes(&bytes, self.default_tile_size)?;
         self.cache.insert_imagery(key, image.clone());
         Ok(Some(image))
     }
@@ -2681,13 +2700,13 @@ impl NetworkTileSource {
             self.provider.api_key.as_deref(),
         );
         let bytes = self.transport.fetch(&url)?;
+        let elev = Self::decode_elevation_bytes(&bytes, self.elevation_encoding)?;
         if let Some(path) = self.elevation_disk_path(key) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(path, &bytes);
         }
-        let elev = Self::decode_elevation_bytes(&bytes, self.elevation_encoding)?;
         self.cache.insert_elevation(key, elev.clone());
         Ok(Some(elev))
     }
@@ -2697,25 +2716,35 @@ impl NetworkTileSource {
         task: &FetchTask,
     ) -> Result<CachedTileData, TileError> {
         let bytes = transport.fetch(&task.url)?;
+        let decoded = if task.is_elevation {
+            let elev = Self::decode_elevation_bytes(&bytes, task.elevation_encoding)?;
+            CachedTileData::Elevation(elev)
+        } else {
+            let img = Self::decode_imagery_bytes(&bytes, 256)?;
+            CachedTileData::Imagery(img)
+        };
         if let Some(path) = &task.disk_cache_path {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(path, &bytes);
         }
-        if task.is_elevation {
-            let elev = Self::decode_elevation_bytes(&bytes, task.elevation_encoding)?;
-            Ok(CachedTileData::Elevation(elev))
-        } else {
-            let img = Self::decode_imagery_bytes(&bytes, 256)?;
-            Ok(CachedTileData::Imagery(img))
+        Ok(decoded)
+    }
+
+    fn validate_decoded_imagery(img: TileImage) -> Result<TileImage, TileError> {
+        if is_unavailable_placeholder_tile(img.width, img.height, &img.pixels) {
+            return Err(TileError::Transport(
+                "404 unavailable placeholder tile".to_string(),
+            ));
         }
+        Ok(img)
     }
 
     fn decode_imagery_bytes(bytes: &[u8], default_size: u32) -> Result<TileImage, TileError> {
         if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             if let Ok((w, h, rgba)) = decode_png_to_rgba(bytes) {
-                return Ok(TileImage {
+                return Self::validate_decoded_imagery(TileImage {
                     width: w,
                     height: h,
                     pixels: rgba,
@@ -2724,7 +2753,7 @@ impl NetworkTileSource {
         }
         if let Ok(dyn_img) = image::load_from_memory(bytes) {
             let rgba = dyn_img.to_rgba8();
-            return Ok(TileImage {
+            return Self::validate_decoded_imagery(TileImage {
                 width: rgba.width(),
                 height: rgba.height(),
                 pixels: rgba.into_raw(),
@@ -2734,7 +2763,7 @@ impl NetworkTileSource {
             let w = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let h = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
             if w > 0 && h > 0 && bytes.len() == 8 + (w as usize * h as usize * 4) {
-                return Ok(TileImage {
+                return Self::validate_decoded_imagery(TileImage {
                     width: w,
                     height: h,
                     pixels: bytes[8..].to_vec(),
@@ -2742,7 +2771,7 @@ impl NetworkTileSource {
             }
         }
         if bytes.len() == (default_size as usize * default_size as usize * 4) {
-            return Ok(TileImage {
+            return Self::validate_decoded_imagery(TileImage {
                 width: default_size,
                 height: default_size,
                 pixels: bytes.to_vec(),
@@ -2752,7 +2781,7 @@ impl NetworkTileSource {
             let pixels = bytes.len() / 4;
             let side = (pixels as f64).sqrt().round() as usize;
             if side * side == pixels {
-                return Ok(TileImage {
+                return Self::validate_decoded_imagery(TileImage {
                     width: side as u32,
                     height: side as u32,
                     pixels: bytes.to_vec(),
@@ -2864,6 +2893,88 @@ impl NetworkTileSource {
         self.stats.network_requests += 1;
     }
 
+    fn is_key_not_found(&self, data_key: TileDataKey) -> bool {
+        self.queue
+            .0
+            .lock()
+            .map(|g| g.not_found_keys.contains(&(data_key, g.imagery_provider_gen)))
+            .unwrap_or(false)
+    }
+
+    fn mark_key_not_found(&self, data_key: TileDataKey) {
+        if let Ok(mut guard) = self.queue.0.lock() {
+            let pgen = guard.imagery_provider_gen;
+            if guard.not_found_keys.len() > 2048 {
+                guard.not_found_keys.clear();
+            }
+            guard.not_found_keys.insert((data_key, pgen));
+        }
+    }
+
+    fn warm_or_enqueue_available_ancestor(
+        &mut self,
+        leaf: TileKey,
+        is_night: bool,
+        template: &str,
+        weight: f64,
+    ) {
+        let mut anc = leaf.parent();
+        while let Some(parent_key) = anc {
+            let already_cached = if is_night {
+                self.cache.peek_night_lights(parent_key).is_some()
+            } else {
+                self.cache.peek_imagery(parent_key).is_some()
+            };
+            if already_cached {
+                break;
+            }
+            let parent_data_key = if is_night {
+                TileDataKey::NightLights(parent_key)
+            } else {
+                TileDataKey::Imagery(parent_key)
+            };
+            let parent_disk = if is_night {
+                self.night_disk_path(parent_key)
+            } else {
+                self.imagery_disk_path(parent_key)
+            };
+            if let Some(ref path) = parent_disk {
+                if path.is_file() {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
+                            Ok(img) => {
+                                if is_night {
+                                    self.cache.insert_night_lights(parent_key, img);
+                                } else {
+                                    self.cache.insert_imagery(parent_key, img);
+                                }
+                                self.stats.disk_cache_hits += 1;
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = std::fs::remove_file(path);
+                                self.mark_key_not_found(parent_data_key);
+                            }
+                        }
+                    }
+                }
+            }
+            if self.is_key_not_found(parent_data_key) {
+                anc = parent_key.parent();
+                continue;
+            }
+            self.enqueue_fetch(
+                parent_data_key,
+                parent_key,
+                weight,
+                template,
+                false,
+                parent_disk,
+            );
+            break;
+        }
+    }
+
     fn fetch_image_layer(
         &mut self,
         key: TileKey,
@@ -2899,29 +3010,41 @@ impl NetworkTileSource {
             )
         };
 
-        if let Some(ref path) = disk_path {
-            if path.is_file() {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(img) = Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
-                        if is_night {
-                            self.cache.insert_night_lights(key, img.clone());
-                        } else {
-                            self.cache.insert_imagery(key, img.clone());
-                        }
-                        self.stats.disk_cache_hits += 1;
-                        return Ok(Some(img));
-                    }
-                }
-            }
-        }
-
-        self.stats.cache_misses += 1;
         let data_key = if is_night {
             TileDataKey::NightLights(key)
         } else {
             TileDataKey::Imagery(key)
         };
         let weight = if is_night { 50_000.0 } else { 200_000.0 };
+
+        if let Some(ref path) = disk_path {
+            if path.is_file() {
+                if let Ok(bytes) = std::fs::read(path) {
+                    match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
+                        Ok(img) => {
+                            if is_night {
+                                self.cache.insert_night_lights(key, img.clone());
+                            } else {
+                                self.cache.insert_imagery(key, img.clone());
+                            }
+                            self.stats.disk_cache_hits += 1;
+                            return Ok(Some(img));
+                        }
+                        Err(_) => {
+                            let _ = std::fs::remove_file(path);
+                            self.mark_key_not_found(data_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.is_key_not_found(data_key) {
+            self.warm_or_enqueue_available_ancestor(key, is_night, &template, weight);
+            return Ok(None);
+        }
+
+        self.stats.cache_misses += 1;
         self.enqueue_fetch(data_key, key, weight, &template, false, disk_path);
         Ok(None)
     }
@@ -3034,3 +3157,115 @@ impl TileSource for NetworkTileSource {
         self.set_on_tile_ready(cb);
     }
 }
+
+/// Detects provider placeholder tiles such as ArcGIS `"Map data not yet available"` /
+/// `"Map data not available"` responses (returned with HTTP 200 and a uniform neutral-grey
+/// background with optional centered greyscale text) so they are treated as missing
+/// tiles and cleanly fall back to lower-zoom ancestor imagery.
+pub fn is_unavailable_placeholder_tile(width: u32, height: u32, rgba: &[u8]) -> bool {
+    let w = width as usize;
+    let h = height as usize;
+    if w < 64 || h < 64 || rgba.len() < w * h * 4 {
+        return false;
+    }
+
+    let border_rows = (h / 5).max(8);
+    let mut border_sum = 0u64;
+    let mut border_count = 0u64;
+    let mut border_min = 255u8;
+    let mut border_max = 0u8;
+
+    for y in (0..border_rows).chain((h - border_rows)..h) {
+        let row_off = y * w * 4;
+        for x in (0..w).step_by(2) {
+            let idx = row_off + x * 4;
+            let r = rgba[idx];
+            let g = rgba[idx + 1];
+            let b = rgba[idx + 2];
+            let a = rgba[idx + 3];
+            if a < 240 {
+                return false;
+            }
+            let cmax = r.max(g).max(b);
+            let cmin = r.min(g).min(b);
+            if cmax - cmin > 4 {
+                return false;
+            }
+            let luma = ((r as u16 + g as u16 + b as u16) / 3) as u8;
+            border_sum += luma as u64;
+            border_count += 1;
+            border_min = border_min.min(luma);
+            border_max = border_max.max(luma);
+        }
+    }
+
+    if border_count == 0 {
+        return false;
+    }
+    let bg_mean = (border_sum as f32) / (border_count as f32);
+    if !(125.0..=246.0).contains(&bg_mean) {
+        return false;
+    }
+    if border_max.saturating_sub(border_min) > 6 {
+        return false;
+    }
+
+    let mut border_abs_diff = 0.0f32;
+    let mut mad_count = 0u32;
+    for y in (0..border_rows).chain((h - border_rows)..h) {
+        let row_off = y * w * 4;
+        for x in (0..w).step_by(4) {
+            let idx = row_off + x * 4;
+            let luma =
+                (rgba[idx] as f32 + rgba[idx + 1] as f32 + rgba[idx + 2] as f32) * (1.0 / 3.0);
+            border_abs_diff += (luma - bg_mean).abs();
+            mad_count += 1;
+        }
+    }
+    let border_mad = border_abs_diff / (mad_count.max(1) as f32);
+    if border_mad > 1.0 {
+        return false;
+    }
+
+    let mut total_samples = 0u32;
+    let mut achromatic_samples = 0u32;
+    let mut bg_matching_samples = 0u32;
+    let mut text_contrast_samples = 0u32;
+
+    let mid_y0 = h / 4;
+    let mid_y1 = h - h / 4;
+    for y in (0..h).step_by(2) {
+        let row_off = y * w * 4;
+        let in_mid = y >= mid_y0 && y < mid_y1;
+        for x in (0..w).step_by(2) {
+            let idx = row_off + x * 4;
+            let r = rgba[idx];
+            let g = rgba[idx + 1];
+            let b = rgba[idx + 2];
+            let cmax = r.max(g).max(b);
+            let cmin = r.min(g).min(b);
+            total_samples += 1;
+            if cmax - cmin <= 6 {
+                achromatic_samples += 1;
+            }
+            let luma = (r as f32 + g as f32 + b as f32) * (1.0 / 3.0);
+            let diff = (luma - bg_mean).abs();
+            if diff <= 3.5 {
+                bg_matching_samples += 1;
+            } else if in_mid && diff >= 10.0 {
+                text_contrast_samples += 1;
+            }
+        }
+    }
+
+    if total_samples == 0 {
+        return false;
+    }
+    let achromatic_ratio = (achromatic_samples as f32) / (total_samples as f32);
+    let bg_ratio = (bg_matching_samples as f32) / (total_samples as f32);
+
+    achromatic_ratio >= 0.975
+        && bg_ratio >= 0.86
+        && (text_contrast_samples >= 8 || bg_ratio >= 0.995)
+}
+

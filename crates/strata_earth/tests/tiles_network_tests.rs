@@ -776,6 +776,101 @@ fn test_sebm0001_pack_roundtrip_matches_provider_at_z0_to_z2() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_unavailable_placeholder_tile_ignored_and_falls_back_to_ancestor() {
+    use strata_earth::is_unavailable_placeholder_tile;
 
+    let w = 256u32;
+    let h = 256u32;
+    let mut placeholder_rgba = vec![204u8; (w * h * 4) as usize];
+    for px in placeholder_rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    // Paint simulated "Map data not yet available" dark-grey text strokes in the center band.
+    for y in 114..142 {
+        for x in (48..208).step_by(3) {
+            let idx = ((y * w + x) * 4) as usize;
+            placeholder_rgba[idx] = 112;
+            placeholder_rgba[idx + 1] = 112;
+            placeholder_rgba[idx + 2] = 112;
+        }
+    }
+    assert!(
+        is_unavailable_placeholder_tile(w, h, &placeholder_rgba),
+        "must detect 'Map data not yet available' grey placeholder tile"
+    );
 
+    // Real satellite tile with color/texture variations must NOT be flagged.
+    let mut real_rgba = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            real_rgba.push(((x * 3 + y) & 0xFF) as u8);
+            real_rgba.push(((x + y * 5 + 60) & 0xFF) as u8);
+            real_rgba.push(((x * 2 + 120) & 0xFF) as u8);
+            real_rgba.push(255);
+        }
+    }
+    assert!(
+        !is_unavailable_placeholder_tile(w, h, &real_rgba),
+        "real satellite imagery must not be flagged as placeholder"
+    );
 
+    let temp_dir = std::env::temp_dir().join(format!(
+        "strata_placeholder_fallback_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    let parent_key = TileKey::new(13, 4100, 3050);
+    let child_key = TileKey::new(14, 8200, 6100);
+    let placeholder_png = encode_test_png(w, h, &placeholder_rgba);
+    let real_parent_png = encode_test_png(w, h, &real_rgba);
+
+    let mock = MockHttpTransport::new();
+    mock.set_response(
+        "https://tile.openstreetmap.org/14/8200/6100.png",
+        placeholder_png.clone(),
+    );
+    mock.set_response(
+        "https://tile.openstreetmap.org/13/4100/3050.png",
+        real_parent_png,
+    );
+
+    let mut source = NetworkTileSource::osm()
+        .with_transport(mock)
+        .with_disk_cache(&temp_dir);
+
+    // Pre-seed a stale placeholder file on disk to verify it gets purged on read.
+    let stale_disk_path = temp_dir
+        .join("providers")
+        .join(source.imagery_cache_namespace())
+        .join("14/8200/6100.png");
+    std::fs::create_dir_all(stale_disk_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_disk_path, &placeholder_png).unwrap();
+    assert!(stale_disk_path.is_file());
+
+    // Requesting child_key (z=14) must reject the placeholder, delete the stale disk file,
+    // and automatically enqueue the lower-res ancestor (z=13).
+    assert!(
+        source.imagery(child_key).unwrap().is_none(),
+        "placeholder child tile must be ignored"
+    );
+    assert!(
+        !stale_disk_path.is_file(),
+        "stale placeholder file on disk must be deleted"
+    );
+
+    let mut parent_loaded = None;
+    for _ in 0..80 {
+        let _ = source.imagery(child_key);
+        if let Some(img) = source.peek_cached_imagery(parent_key) {
+            parent_loaded = Some(img);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let parent_img = parent_loaded.expect("lower-res parent tile z=13 must be automatically loaded");
+    assert_eq!(parent_img.pixels, real_rgba);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
