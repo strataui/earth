@@ -471,6 +471,7 @@ impl EarthInput {
     pub fn globe() -> Self {
         Self {
             surface_mode: SurfaceMode::QuadtreeLod,
+            tile_grid: 17,
             ..Self::default()
         }
     }

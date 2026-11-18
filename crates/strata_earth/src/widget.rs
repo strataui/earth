@@ -118,6 +118,11 @@ impl EarthViewState {
         {
             effective_input.surface_mode = crate::scene::SurfaceMode::QuadtreeLod;
         }
+        if effective_input.surface_mode == crate::scene::SurfaceMode::QuadtreeLod
+            && effective_input.tile_grid <= 5
+        {
+            effective_input.tile_grid = 17;
+        }
         let viewport = EarthViewport::with_plugins(&effective_input, source, Some(tile_wakeup), plugins);
         let builtin_labels = builtin_world_labels();
         let live_labels = LiveMapLabelStore::new(Some(label_wakeup));

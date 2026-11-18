@@ -242,19 +242,20 @@ fn cc0_glb_weather_models_parse_and_spawn_only_in_25d() {
         "2.5D weather must not appear in full 3D globe mode"
     );
 
-    // Must emit 3 distinct CC0 layers when in 2.5D mode.
+    // Must emit only rain and snow CC0 layers when in 2.5D mode (clouds use the cloud texture shader, never 3D cloud models).
     let m_25d = build_25d_weather_meshes(focus, 1_800.0, 1.0, &weather, None, 2, &mut cache);
-    assert_eq!(m_25d.len(), 3);
+    assert_eq!(m_25d.len(), 2);
     for layer in &m_25d {
         assert!(!layer.vertices.is_empty() && !layer.indices.is_empty());
+        assert_ne!(layer.id, 0x9E47_0001, "3D cloud models must never spawn");
     }
 
-    // Disabling rain should leave only clouds and snow.
+    // Disabling rain should leave only snow.
     let mut weather_no_rain = weather.clone();
     weather_no_rain.rain = false;
     let m_filtered =
         build_25d_weather_meshes(focus, 1_800.0, 1.0, &weather_no_rain, None, 3, &mut cache);
-    assert_eq!(m_filtered.len(), 2);
+    assert_eq!(m_filtered.len(), 1);
 }
 
 #[test]
@@ -369,13 +370,13 @@ fn transitions_fade_terminator_city_lights_and_clouds_in_25d_and_toggles_work() 
     );
 
     let (frame_25d, _) = builder.build_frame(&input_25d, &mut src, 2, true);
-    assert_eq!(frame_25d.dynamic_meshes.len(), 3);
+    assert_eq!(frame_25d.dynamic_meshes.len(), 2);
     assert!(
         frame_25d
             .dynamic_meshes
             .iter()
-            .all(|m| (0x9E47_0001..=0x9E47_0003).contains(&m.id)),
-        "only 2.5D weather meshes should remain after orbital satellites fade away in 2.5D"
+            .all(|m| (0x9E47_0002..=0x9E47_0003).contains(&m.id)),
+        "only 2.5D rain/snow meshes should remain (no 3D cloud models)"
     );
 
     // Verify all toggles can disable cleanly even in 3D space.

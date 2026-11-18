@@ -75,18 +75,6 @@ fn lat_lon_to_unit_dir(lat_deg: f64, lon_deg: f64) -> [f64; 3] {
 }
 
 #[inline]
-fn heading_deg_from_dirs(lat_deg: f64, lon_deg: f64, up_dir: [f64; 3]) -> f64 {
-    let frame = LocalFrame::at(lat_deg, lon_deg);
-    let u = DVec3::new(up_dir[0], up_dir[1], up_dir[2]);
-    let proj = u.sub(frame.up.scale(u.dot(frame.up)));
-    if proj.length() < 1e-6 {
-        return 0.0;
-    }
-    let p = proj.normalize();
-    normalize_deg(p.dot(frame.east).atan2(p.dot(frame.north)).to_degrees())
-}
-
-#[inline]
 fn up_dir_from_heading(lat_deg: f64, lon_deg: f64, heading_deg: f64) -> [f64; 3] {
     let frame = LocalFrame::at(lat_deg, lon_deg);
     let h = heading_deg.to_radians();
@@ -172,7 +160,7 @@ impl EarthOrbitController {
         let (lat, lon) = unit_dir_to_lat_lon(self.eye_dir);
         self.lat_deg = lat;
         self.lon_deg = lon;
-        self.heading_deg = heading_deg_from_dirs(lat, lon, self.up_dir);
+        self.up_dir = up_dir_from_heading(lat, lon, self.heading_deg);
     }
 
     #[inline]
@@ -234,6 +222,21 @@ impl EarthOrbitController {
     }
 
     #[inline]
+    fn effective_heading_deg(&self, is_2d: bool) -> f64 {
+        if is_2d {
+            0.0
+        } else {
+            let local_w = (1.0 - smoothstep(40_000.0, LOCAL_TRANSITION_RANGE_M, self.range_m))
+                * smoothstep(8.0, 28.0, self.tilt_deg);
+            let mut h = normalize_deg(self.heading_deg);
+            if h > 180.0 {
+                h -= 360.0;
+            }
+            normalize_deg(h * local_w)
+        }
+    }
+
+    #[inline]
     fn raw_camera_and_up(&self, is_2d: bool, ground_elev_m: f64) -> (EarthCamera, Option<[f64; 3]>) {
         let gw = self.ground_focus_weight(is_2d);
         let focus_h = ground_elev_m * gw;
@@ -250,11 +253,8 @@ impl EarthOrbitController {
             self.tilt_deg.clamp(0.0, max_t)
         };
         let tilt_rad = eff_tilt.to_radians();
-        let h_rad = if is_2d {
-            0.0
-        } else {
-            self.heading_deg.to_radians()
-        };
+        let eff_heading = self.effective_heading_deg(is_2d);
+        let h_rad = eff_heading.to_radians();
 
         let horiz = self.range_m * tilt_rad.sin();
         let up_offset = self.range_m * tilt_rad.cos();
@@ -276,7 +276,7 @@ impl EarthOrbitController {
         let up_opt = if is_2d {
             None
         } else {
-            Some(up_dir_from_heading(lat, self.lon_deg, self.heading_deg))
+            Some(up_dir_from_heading(lat, self.lon_deg, eff_heading))
         };
         (cam, up_opt)
     }
@@ -446,15 +446,21 @@ impl EarthOrbitController {
     }
 
     fn orbit_25d_around_pivot(&mut self, dx: f64, dy: f64) {
-        let d_heading = dx * 0.28;
-        let d_tilt = -dy * 0.24;
-        self.heading_deg = normalize_deg(self.heading_deg + d_heading);
         let max_t = if self.is_2d_hint {
             0.0
         } else {
             84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4)
         };
+        let d_tilt = -dy * 0.24;
         self.tilt_deg = (self.tilt_deg + d_tilt).clamp(0.0, max_t);
+        let local_w = if self.is_2d_hint {
+            0.0
+        } else {
+            (1.0 - smoothstep(40_000.0, LOCAL_TRANSITION_RANGE_M, self.range_m))
+                * smoothstep(8.0, 28.0, self.tilt_deg)
+        };
+        let d_heading = dx * 0.28 * local_w;
+        self.heading_deg = normalize_deg(self.heading_deg + d_heading);
         self.orbit_vel_deg_s = (d_heading * 18.0, d_tilt * 18.0);
         self.sync_dirs_from_geo();
     }
@@ -472,48 +478,24 @@ impl EarthOrbitController {
     }
 
     fn drag_globe_arcball(&mut self, px: f64, py: f64, x: f64, y: f64) {
-        let (cam, up_opt) = self.raw_camera_and_up(false, self.focus_ground_m);
-        let up_v = up_opt.map(|u| DVec3::new(u[0], u[1], u[2]));
-        let (o1, d1) = screen_to_ray_with_up(px, py, self.viewport_w, self.viewport_h, &cam, up_v);
-        let (o2, d2) = screen_to_ray_with_up(x, y, self.viewport_w, self.viewport_h, &cam, up_v);
-
-        if let (Some(p1), Some(p2)) = (raycast_ellipsoid(o1, d1), raycast_ellipsoid(o2, d2)) {
-            let n1 = p1.normalize();
-            let n2 = p2.normalize();
-            let cross = n2.cross(n1);
-            let sin_a = cross.length();
-            let cos_a = n1.dot(n2).clamp(-1.0, 1.0);
-            let angle = sin_a.atan2(cos_a).clamp(-0.35, 0.35);
-            if sin_a > 1e-8 && angle.abs() > 1e-7 {
-                let axis = cross.scale(1.0 / sin_a);
-                let cur_eye = DVec3::new(self.eye_dir[0], self.eye_dir[1], self.eye_dir[2]);
-                let cur_up = DVec3::new(self.up_dir[0], self.up_dir[1], self.up_dir[2]);
-                let next_eye = rotate_vec_axis_angle(cur_eye, axis, angle).normalize();
-                let next_up = rotate_vec_axis_angle(cur_up, axis, angle).normalize();
-                self.eye_dir = [next_eye.x, next_eye.y, next_eye.z];
-                self.up_dir = [next_up.x, next_up.y, next_up.z];
-                self.spin_axis = [axis.x, axis.y, axis.z];
-                self.spin_vel_rad_s = (angle * 22.0).clamp(-3.5, 3.5);
-                self.sync_geo_from_dirs();
-                return;
-            }
-        }
-
-        // Limb fallback: rotate proportional to screen delta scaled by angular footprint.
-        let fov_rad = DEFAULT_FOV_Y_DEG.to_radians();
-        let deg_per_px = (2.0 * (fov_rad * 0.5).tan() * (self.range_m / wgs84::A)).to_degrees()
-            / self.viewport_h.max(1.0);
-        let h_rad = self.heading_deg.to_radians();
         let dx = x - px;
         let dy = y - py;
-        let step_east = -dx * h_rad.cos() - dy * h_rad.sin();
-        let step_north = -dx * h_rad.sin() + dy * h_rad.cos();
+        // Unified roll-free angular rotation calibrated at the sub-camera focus point so
+        // dragging inside the sphere, across the horizon limb, and outside the Earth boundary
+        // moves smoothly along the exact same screen axes with zero diagonal deflection or roll.
+        let fov_rad = DEFAULT_FOV_Y_DEG.to_radians();
+        let visible_arc_m = 2.0 * (fov_rad * 0.5).tan() * self.range_m.min(wgs84::A * 2.2);
+        let deg_per_px = (visible_arc_m / wgs84::A).to_degrees() / self.viewport_h.max(1.0);
+        let h_rad = self.effective_heading_deg(false).to_radians();
+        let step_east = -dx * h_rad.cos() + dy * h_rad.sin();
+        let step_north = dx * h_rad.sin() + dy * h_rad.cos();
         let d_lat = step_north * deg_per_px;
-        let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.2);
+        let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.25);
         let d_lon = step_east * deg_per_px / cos_lat;
         self.lat_deg = (self.lat_deg + d_lat).clamp(-89.95, 89.95);
         self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
         self.pan_vel_lon_lat_s = (d_lon * 16.0, d_lat * 16.0);
+        self.spin_vel_rad_s = 0.0;
         self.sync_dirs_from_geo();
     }
 
@@ -632,11 +614,8 @@ impl EarthOrbitController {
                 let d_angle = self.spin_vel_rad_s * dt;
                 let axis = DVec3::new(self.spin_axis[0], self.spin_axis[1], self.spin_axis[2]);
                 let cur_eye = DVec3::new(self.eye_dir[0], self.eye_dir[1], self.eye_dir[2]);
-                let cur_up = DVec3::new(self.up_dir[0], self.up_dir[1], self.up_dir[2]);
                 let next_eye = rotate_vec_axis_angle(cur_eye, axis, d_angle).normalize();
-                let next_up = rotate_vec_axis_angle(cur_up, axis, d_angle).normalize();
                 self.eye_dir = [next_eye.x, next_eye.y, next_eye.z];
-                self.up_dir = [next_up.x, next_up.y, next_up.z];
                 self.sync_geo_from_dirs();
                 self.spin_vel_rad_s *= decay;
                 if self.spin_vel_rad_s.abs() <= 1e-4 {
@@ -780,11 +759,8 @@ impl EarthOrbitController {
         if sin_a > 1e-8 && angle.abs() > 1e-7 {
             let axis = cross.scale(1.0 / sin_a);
             let cur_eye = DVec3::new(self.eye_dir[0], self.eye_dir[1], self.eye_dir[2]);
-            let cur_up = DVec3::new(self.up_dir[0], self.up_dir[1], self.up_dir[2]);
             let next_eye = rotate_vec_axis_angle(cur_eye, axis, angle).normalize();
-            let next_up = rotate_vec_axis_angle(cur_up, axis, angle).normalize();
             self.eye_dir = [next_eye.x, next_eye.y, next_eye.z];
-            self.up_dir = [next_up.x, next_up.y, next_up.z];
             self.sync_geo_from_dirs();
         }
         self.range_m = old_range;
@@ -896,5 +872,35 @@ mod tests {
 
         assert!((ctrl.heading_deg - before_heading).abs() > 1.0);
         assert!((ctrl.tilt_deg - before_tilt).abs() > 1.0);
+    }
+
+    #[test]
+    fn globe_left_drag_across_limb_keeps_vertical_axis_and_zero_roll() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
+
+        let start_lat = ctrl.lat_deg;
+        assert!(ctrl.handle_mouse_down(0, 720.0, 450.0));
+        // Drag straight left from screen center all the way across the limb into deep space (x=720 -> 80)
+        let mut x = 720.0;
+        let mut prev_lon = ctrl.lon_deg;
+        while x > 80.0 {
+            x -= 20.0;
+            assert!(ctrl.handle_mouse_move(x, 450.0));
+            assert!(
+                (ctrl.lat_deg - start_lat).abs() < 1e-9,
+                "pure horizontal drag must never deflect diagonally in latitude, got lat={}",
+                ctrl.lat_deg
+            );
+            assert!(
+                ctrl.heading_deg.abs() < 1e-9,
+                "3D globe drag must never roll camera heading, got heading={}",
+                ctrl.heading_deg
+            );
+            assert!(ctrl.lon_deg != prev_lon);
+            prev_lon = ctrl.lon_deg;
+        }
+        assert!(ctrl.handle_mouse_up(0));
     }
 }
