@@ -604,12 +604,13 @@ pub fn parse_celestrak_gp_json(json: &str, mark_stations: bool) -> Vec<Satellite
     out
 }
 
-/// Propagates `elem` with J2 secular perturbations at `unix_utc_s` and transforms ECI -> ECEF.
-pub fn propagate_satellite_ecef(
+/// Propagates `elem` with J2 secular perturbations at `unix_utc_s` and returns
+/// `(ecef_m, altitude_m, sunlit)` without heap allocations.
+pub(crate) fn propagate_satellite_ecef_core(
     elem: &SatelliteElement,
     unix_utc_s: f64,
     sun_dir_ecef: [f32; 3],
-) -> PropagatedSatellite {
+) -> ([f64; 3], f64, bool) {
     let n_rad_s = (elem.mean_motion_rev_day * std::f64::consts::TAU) / 86_400.0;
     let a_m = (MU_EARTH_M3_S2 / (n_rad_s * n_rad_s))
         .cbrt()
@@ -667,10 +668,20 @@ pub fn propagate_satellite_ecef(
     let r_perp_sq = (x * x + y * y + z * z) - s_dot_r * s_dot_r;
     let sunlit = s_dot_r >= 0.0 || r_perp_sq >= re * re * 0.99;
 
+    ([x, y, z], r - EARTH_RADIUS_M, sunlit)
+}
+
+/// Propagates `elem` with J2 secular perturbations at `unix_utc_s` and transforms ECI -> ECEF.
+pub fn propagate_satellite_ecef(
+    elem: &SatelliteElement,
+    unix_utc_s: f64,
+    sun_dir_ecef: [f32; 3],
+) -> PropagatedSatellite {
+    let (ecef_m, altitude_m, sunlit) = propagate_satellite_ecef_core(elem, unix_utc_s, sun_dir_ecef);
     PropagatedSatellite {
         name: elem.name.clone(),
-        ecef_m: [x, y, z],
-        altitude_m: r - EARTH_RADIUS_M,
+        ecef_m,
+        altitude_m,
         sunlit,
         is_station: elem.is_station,
     }
@@ -684,7 +695,7 @@ pub struct SatelliteCatalogStore {
 
 struct SatelliteCatalogState {
     revision: u64,
-    elements: Vec<SatelliteElement>,
+    elements: Arc<Vec<SatelliteElement>>,
     fetch_started: bool,
     cache_dir: Option<std::path::PathBuf>,
 }
@@ -707,7 +718,7 @@ impl SatelliteCatalogStore {
         Self {
             inner: Arc::new(Mutex::new(SatelliteCatalogState {
                 revision: 1,
-                elements,
+                elements: Arc::new(elements),
                 fetch_started: false,
                 cache_dir,
             })),
@@ -766,8 +777,9 @@ impl SatelliteCatalogStore {
                     }
                 }
                 if !combined.is_empty() {
+                    let shared = Arc::new(combined);
                     if let Ok(mut guard) = inner.lock() {
-                        guard.elements = combined;
+                        guard.elements = shared;
                         guard.revision += 1;
                     }
                     if let Some(w) = wake {
@@ -778,9 +790,9 @@ impl SatelliteCatalogStore {
             .ok();
     }
 
-    pub fn snapshot(&self) -> (u64, Vec<SatelliteElement>) {
+    pub fn snapshot(&self) -> (u64, Arc<Vec<SatelliteElement>>) {
         let guard = self.inner.lock().unwrap();
-        (guard.revision, guard.elements.clone())
+        (guard.revision, Arc::clone(&guard.elements))
     }
 }
 
@@ -844,6 +856,27 @@ fn append_octahedron(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OrbitRingCacheKey {
+    elem_count: usize,
+    catalog_hash: u64,
+    first_epoch_bits: u64,
+    time_bucket: i64,
+    ribbon_bucket: i64,
+}
+
+struct OrbitRingCacheEntry {
+    key: OrbitRingCacheKey,
+    revision: u64,
+    vertices: Arc<Vec<RteTileVertex>>,
+    indices: Arc<Vec<u32>>,
+}
+
+thread_local! {
+    static ORBIT_RING_CACHE: std::cell::RefCell<Option<OrbitRingCacheEntry>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Builds 3D dynamic meshes for real orbital satellites & station orbit tracks around Earth.
 ///
 /// Automatically fades away via `local_25d_blend` and produces zero meshes once entered into 2.5D.
@@ -877,72 +910,125 @@ pub fn build_3d_satellites_meshes(
     };
 
     let beacon_r = (satellite_scale_m as f64) * (camera_range_m / 11_000_000.0).clamp(0.18, 2.2);
-    let mut sunlit_verts = Vec::new();
-    let mut sunlit_inds = Vec::new();
+    let cap = elements.len().min(120);
+    let mut sunlit_verts = Vec::with_capacity(cap * 6);
+    let mut sunlit_inds = Vec::with_capacity(cap * 24);
     let mut eclipse_verts = Vec::new();
     let mut eclipse_inds = Vec::new();
-    let mut orbit_verts = Vec::new();
-    let mut orbit_inds = Vec::new();
 
-    for (idx, elem) in elements.iter().take(120).enumerate() {
-        let sat = propagate_satellite_ecef(elem, eff_t, sun_dir_ecef);
-        let pos = DVec3::new(sat.ecef_m[0], sat.ecef_m[1], sat.ecef_m[2]);
-        let r_scale = if sat.is_station {
+    for elem in elements.iter().take(120) {
+        let (ecef_m, _, sunlit) = propagate_satellite_ecef_core(elem, eff_t, sun_dir_ecef);
+        let pos = DVec3::new(ecef_m[0], ecef_m[1], ecef_m[2]);
+        let r_scale = if elem.is_station {
             beacon_r * 1.45
         } else {
             beacon_r
         };
-        if sat.sunlit {
+        if sunlit {
             append_octahedron(pos, r_scale, &mut sunlit_verts, &mut sunlit_inds);
         } else {
             append_octahedron(pos, r_scale * 0.85, &mut eclipse_verts, &mut eclipse_inds);
         }
-
-        // Draw subtle orbital ring ribbons for stations and the first 4 benchmark spacecraft
-        if orbits_visible && (sat.is_station || idx < 4) {
-            let period_s = 86_400.0 / elem.mean_motion_rev_day.max(0.1);
-            let segs = 48usize;
-            let ribbon_half = (beacon_r * 0.12).max(4_000.0);
-            let mut ring_pts = Vec::with_capacity(segs);
-            for s in 0..segs {
-                let sample_t = eff_t + (s as f64 / segs as f64) * period_s;
-                let p_s = propagate_satellite_ecef(elem, sample_t, sun_dir_ecef);
-                ring_pts.push(DVec3::new(p_s.ecef_m[0], p_s.ecef_m[1], p_s.ecef_m[2]));
-            }
-            let base = orbit_verts.len() as u32;
-            for i in 0..segs {
-                let p0 = ring_pts[i];
-                let p1 = ring_pts[(i + 1) % segs];
-                let radial = p0.normalize().scale(ribbon_half);
-                let a = p0.sub(radial);
-                let b = p0.add(radial);
-                let c = p1.add(radial);
-                let d = p1.sub(radial);
-                let v0 = orbit_verts.len() as u32;
-                for v in [a, b, c, d] {
-                    orbit_verts.push(RteTileVertex::new(
-                        [v.x as f32, v.y as f32, v.z as f32],
-                        [0.0, 0.0, 1.0],
-                        [0.5, 0.5],
-                    ));
-                }
-                orbit_inds.extend_from_slice(&[v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3]);
-            }
-            let _ = base;
-        }
     }
 
     let mut out = Vec::with_capacity(3);
-    if !orbit_verts.is_empty() {
-        out.push(RetainedDynamicMesh {
-            id: 0x9E47_1003,
-            revision,
-            anchor_ecef: [0.0, 0.0, 0.0],
-            vertices: Arc::new(orbit_verts),
-            indices: Arc::new(orbit_inds),
-            color: [0.36, 0.78, 0.98, 0.16 * space_fade],
-            unlit: true,
+    if orbits_visible {
+        let ribbon_half = (beacon_r * 0.12).max(4_000.0);
+        let mut catalog_hash: u64 = 0xcbf29ce484222325;
+        for el in &elements[..cap] {
+            for b in el.epoch_unix_s.to_le_bytes() {
+                catalog_hash ^= u64::from(b);
+                catalog_hash = catalog_hash.wrapping_mul(0x100000001b3);
+            }
+            for b in el.mean_motion_rev_day.to_le_bytes() {
+                catalog_hash ^= u64::from(b);
+                catalog_hash = catalog_hash.wrapping_mul(0x100000001b3);
+            }
+            for b in el.inclination_deg.to_le_bytes() {
+                catalog_hash ^= u64::from(b);
+                catalog_hash = catalog_hash.wrapping_mul(0x100000001b3);
+            }
+            for b in el.raan_deg.to_le_bytes() {
+                catalog_hash ^= u64::from(b);
+                catalog_hash = catalog_hash.wrapping_mul(0x100000001b3);
+            }
+            catalog_hash ^= u64::from(u8::from(el.is_station));
+            catalog_hash = catalog_hash.wrapping_mul(0x100000001b3);
+        }
+        let key = OrbitRingCacheKey {
+            elem_count: cap,
+            catalog_hash,
+            first_epoch_bits: elements[0].epoch_unix_s.to_bits(),
+            time_bucket: (eff_t / 2.0).floor() as i64,
+            ribbon_bucket: (ribbon_half / 500.0).round() as i64,
+        };
+        let (orb_rev, orb_verts, orb_inds) = ORBIT_RING_CACHE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if let Some(ref entry) = *slot {
+                if entry.key == key {
+                    let rev = if revision <= 2 {
+                        revision
+                    } else {
+                        entry.revision
+                    };
+                    return (rev, Arc::clone(&entry.vertices), Arc::clone(&entry.indices));
+                }
+            }
+            let segs = 48usize;
+            let mut orbit_verts = Vec::with_capacity(12 * segs * 4);
+            let mut orbit_inds = Vec::with_capacity(12 * segs * 6);
+            let mut ring_pts = Vec::with_capacity(segs);
+            for (idx, elem) in elements.iter().take(120).enumerate() {
+                if !elem.is_station && idx >= 4 {
+                    continue;
+                }
+                let period_s = 86_400.0 / elem.mean_motion_rev_day.max(0.1);
+                ring_pts.clear();
+                for s in 0..segs {
+                    let sample_t = eff_t + (s as f64 / segs as f64) * period_s;
+                    let (p_s, _, _) = propagate_satellite_ecef_core(elem, sample_t, sun_dir_ecef);
+                    ring_pts.push(DVec3::new(p_s[0], p_s[1], p_s[2]));
+                }
+                for i in 0..segs {
+                    let p0 = ring_pts[i];
+                    let p1 = ring_pts[(i + 1) % segs];
+                    let radial = p0.normalize().scale(ribbon_half);
+                    let a = p0.sub(radial);
+                    let b = p0.add(radial);
+                    let c = p1.add(radial);
+                    let d = p1.sub(radial);
+                    let v0 = orbit_verts.len() as u32;
+                    for v in [a, b, c, d] {
+                        orbit_verts.push(RteTileVertex::new(
+                            [v.x as f32, v.y as f32, v.z as f32],
+                            [0.0, 0.0, 1.0],
+                            [0.5, 0.5],
+                        ));
+                    }
+                    orbit_inds.extend_from_slice(&[v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3]);
+                }
+            }
+            let v_arc = Arc::new(orbit_verts);
+            let i_arc = Arc::new(orbit_inds);
+            *slot = Some(OrbitRingCacheEntry {
+                key,
+                revision,
+                vertices: Arc::clone(&v_arc),
+                indices: Arc::clone(&i_arc),
+            });
+            (revision, v_arc, i_arc)
         });
+        if !orb_verts.is_empty() {
+            out.push(RetainedDynamicMesh {
+                id: 0x9E47_1003,
+                revision: orb_rev,
+                anchor_ecef: [0.0, 0.0, 0.0],
+                vertices: orb_verts,
+                indices: orb_inds,
+                color: [0.36, 0.78, 0.98, 0.16 * space_fade],
+                unlit: true,
+            });
+        }
     }
     if !sunlit_verts.is_empty() {
         out.push(RetainedDynamicMesh {

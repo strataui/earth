@@ -2186,6 +2186,7 @@ pub struct NetworkTileSource {
     on_tile_ready: TileReadySlot,
     stats: NetworkTileStats,
     default_tile_size: u32,
+    sync_disk_budget: usize,
 }
 
 impl NetworkTileSource {
@@ -2264,6 +2265,7 @@ impl NetworkTileSource {
             on_tile_ready,
             stats: NetworkTileStats::default(),
             default_tile_size: 256,
+            sync_disk_budget: usize::MAX,
         }
     }
 
@@ -2715,6 +2717,22 @@ impl NetworkTileSource {
         transport: &Arc<dyn HttpTransport>,
         task: &FetchTask,
     ) -> Result<CachedTileData, TileError> {
+        if let Some(path) = &task.disk_cache_path {
+            if path.is_file() {
+                if let Ok(bytes) = std::fs::read(path) {
+                    let cached_res = if task.is_elevation {
+                        Self::decode_elevation_bytes(&bytes, task.elevation_encoding)
+                            .map(CachedTileData::Elevation)
+                    } else {
+                        Self::decode_imagery_bytes(&bytes, 256).map(CachedTileData::Imagery)
+                    };
+                    if let Ok(decoded) = cached_res {
+                        return Ok(decoded);
+                    }
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
         let bytes = transport.fetch(&task.url)?;
         let decoded = if task.is_elevation {
             let elev = Self::decode_elevation_bytes(&bytes, task.elevation_encoding)?;
@@ -2837,6 +2855,7 @@ impl NetworkTileSource {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_fetch(
         &mut self,
         data_key: TileDataKey,
@@ -2845,6 +2864,7 @@ impl NetworkTileSource {
         template: &str,
         is_elevation: bool,
         disk_cache_path: Option<PathBuf>,
+        is_disk_hit: bool,
     ) {
         let (lock, cv) = &*self.queue;
         let Ok(mut guard) = lock.lock() else {
@@ -2890,7 +2910,11 @@ impl NetworkTileSource {
             },
         );
         cv.notify_one();
-        self.stats.network_requests += 1;
+        if is_disk_hit {
+            self.stats.disk_cache_hits += 1;
+        } else {
+            self.stats.network_requests += 1;
+        }
     }
 
     fn is_key_not_found(&self, data_key: TileDataKey) -> bool {
@@ -2940,22 +2964,36 @@ impl NetworkTileSource {
             };
             if let Some(ref path) = parent_disk {
                 if path.is_file() {
-                    if let Ok(bytes) = std::fs::read(path) {
-                        match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
-                            Ok(img) => {
-                                if is_night {
-                                    self.cache.insert_night_lights(parent_key, img);
-                                } else {
-                                    self.cache.insert_imagery(parent_key, img);
+                    if self.sync_disk_budget > 0 {
+                        self.sync_disk_budget = self.sync_disk_budget.saturating_sub(1);
+                        if let Ok(bytes) = std::fs::read(path) {
+                            match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
+                                Ok(img) => {
+                                    if is_night {
+                                        self.cache.insert_night_lights(parent_key, img);
+                                    } else {
+                                        self.cache.insert_imagery(parent_key, img);
+                                    }
+                                    self.stats.disk_cache_hits += 1;
+                                    break;
                                 }
-                                self.stats.disk_cache_hits += 1;
-                                break;
-                            }
-                            Err(_) => {
-                                let _ = std::fs::remove_file(path);
-                                self.mark_key_not_found(parent_data_key);
+                                Err(_) => {
+                                    let _ = std::fs::remove_file(path);
+                                    self.mark_key_not_found(parent_data_key);
+                                }
                             }
                         }
+                    } else {
+                        self.enqueue_fetch(
+                            parent_data_key,
+                            parent_key,
+                            weight * 8.0,
+                            template,
+                            false,
+                            parent_disk,
+                            true,
+                        );
+                        break;
                     }
                 }
             }
@@ -2970,6 +3008,7 @@ impl NetworkTileSource {
                 template,
                 false,
                 parent_disk,
+                false,
             );
             break;
         }
@@ -3019,22 +3058,28 @@ impl NetworkTileSource {
 
         if let Some(ref path) = disk_path {
             if path.is_file() {
-                if let Ok(bytes) = std::fs::read(path) {
-                    match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
-                        Ok(img) => {
-                            if is_night {
-                                self.cache.insert_night_lights(key, img.clone());
-                            } else {
-                                self.cache.insert_imagery(key, img.clone());
+                if self.sync_disk_budget > 0 {
+                    self.sync_disk_budget = self.sync_disk_budget.saturating_sub(1);
+                    if let Ok(bytes) = std::fs::read(path) {
+                        match Self::decode_imagery_bytes(&bytes, self.default_tile_size) {
+                            Ok(img) => {
+                                if is_night {
+                                    self.cache.insert_night_lights(key, img.clone());
+                                } else {
+                                    self.cache.insert_imagery(key, img.clone());
+                                }
+                                self.stats.disk_cache_hits += 1;
+                                return Ok(Some(img));
                             }
-                            self.stats.disk_cache_hits += 1;
-                            return Ok(Some(img));
-                        }
-                        Err(_) => {
-                            let _ = std::fs::remove_file(path);
-                            self.mark_key_not_found(data_key);
+                            Err(_) => {
+                                let _ = std::fs::remove_file(path);
+                                self.mark_key_not_found(data_key);
+                            }
                         }
                     }
+                } else {
+                    self.enqueue_fetch(data_key, key, weight * 8.0, &template, false, disk_path, true);
+                    return Ok(None);
                 }
             }
         }
@@ -3045,7 +3090,7 @@ impl NetworkTileSource {
         }
 
         self.stats.cache_misses += 1;
-        self.enqueue_fetch(data_key, key, weight, &template, false, disk_path);
+        self.enqueue_fetch(data_key, key, weight, &template, false, disk_path, false);
         Ok(None)
     }
 }
@@ -3061,6 +3106,8 @@ impl Drop for NetworkTileSource {
 
 impl TileSource for NetworkTileSource {
     fn begin_frame(&mut self, focus: Geodetic, altitude_m: f64) {
+        const MAX_SYNC_DISK_DECODES_PER_FRAME: usize = 8;
+        self.sync_disk_budget = MAX_SYNC_DISK_DECODES_PER_FRAME;
         if let Ok(mut guard) = self.queue.0.lock() {
             guard.generation = guard.generation.wrapping_add(1).max(1);
             guard.focus_lat = focus.lat_deg;
@@ -3074,6 +3121,7 @@ impl TileSource for NetworkTileSource {
     }
 
     fn end_frame(&mut self) {
+        self.sync_disk_budget = usize::MAX;
         let cancelled = if let Ok(mut guard) = self.queue.0.lock() {
             let gen = guard.generation;
             let before = guard.tasks.len();
@@ -3118,21 +3166,36 @@ impl TileSource for NetworkTileSource {
         }
 
         let disk_path = self.elevation_disk_path(key);
+        let elev_weight = 100_000.0;
         if let Some(ref path) = disk_path {
             if path.is_file() {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(elev) = Self::decode_elevation_bytes(&bytes, self.elevation_encoding)
-                    {
-                        self.cache.insert_elevation(key, elev.clone());
-                        self.stats.disk_cache_hits += 1;
-                        return Ok(Some(elev));
+                if self.sync_disk_budget > 0 {
+                    self.sync_disk_budget = self.sync_disk_budget.saturating_sub(1);
+                    if let Ok(bytes) = std::fs::read(path) {
+                        if let Ok(elev) =
+                            Self::decode_elevation_bytes(&bytes, self.elevation_encoding)
+                        {
+                            self.cache.insert_elevation(key, elev.clone());
+                            self.stats.disk_cache_hits += 1;
+                            return Ok(Some(elev));
+                        }
                     }
+                } else {
+                    self.enqueue_fetch(
+                        TileDataKey::Elevation(key),
+                        key,
+                        elev_weight * 8.0,
+                        &template,
+                        true,
+                        disk_path,
+                        true,
+                    );
+                    return Ok(None);
                 }
             }
         }
 
         self.stats.cache_misses += 1;
-        let elev_weight = 100_000.0;
         self.enqueue_fetch(
             TileDataKey::Elevation(key),
             key,
@@ -3140,6 +3203,7 @@ impl TileSource for NetworkTileSource {
             &template,
             true,
             disk_path,
+            false,
         );
         Ok(None)
     }

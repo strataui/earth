@@ -723,14 +723,6 @@ impl RetainedTerrainBuilder {
                     }
                 }
             }
-            if let Some(img) = source.peek_cached_imagery(a) {
-                if !img.pixels.is_empty() {
-                    request_steps(source, a.level);
-                    let (id, rev, tex) = self.resolve_or_cache_texture(a, &img, stats);
-                    stats.ancestor_fallbacks += 1;
-                    return Some((a, id, rev, Self::ancestor_uv_rect(key, a), tex));
-                }
-            }
             if let Some(entry) = self.textures.get_mut(&a) {
                 request_steps(source, a.level);
                 entry.last_used_frame = self.frame_counter;
@@ -742,6 +734,14 @@ impl RetainedTerrainBuilder {
                     Self::ancestor_uv_rect(key, a),
                     Arc::clone(&entry.texture),
                 ));
+            }
+            if let Some(img) = source.peek_cached_imagery(a) {
+                if !img.pixels.is_empty() {
+                    request_steps(source, a.level);
+                    let (id, rev, tex) = self.resolve_or_cache_texture(a, &img, stats);
+                    stats.ancestor_fallbacks += 1;
+                    return Some((a, id, rev, Self::ancestor_uv_rect(key, a), tex));
+                }
             }
             anc = a.parent();
         }
@@ -776,6 +776,15 @@ impl RetainedTerrainBuilder {
             if a.level < 5 {
                 break;
             }
+            if let Some(entry) = self.night_textures.get_mut(&a) {
+                entry.last_used_frame = self.frame_counter;
+                return Some((
+                    entry.id,
+                    entry.revision,
+                    Self::ancestor_uv_rect(key, a),
+                    Arc::clone(&entry.texture),
+                ));
+            }
             if let Some(img) = source.peek_cached_night_lights(a) {
                 if !img.pixels.is_empty() {
                     let (id, rev, tex) = Self::cache_tile_texture(
@@ -788,15 +797,6 @@ impl RetainedTerrainBuilder {
                     );
                     return Some((id, rev, Self::ancestor_uv_rect(key, a), tex));
                 }
-            }
-            if let Some(entry) = self.night_textures.get_mut(&a) {
-                entry.last_used_frame = self.frame_counter;
-                return Some((
-                    entry.id,
-                    entry.revision,
-                    Self::ancestor_uv_rect(key, a),
-                    Arc::clone(&entry.texture),
-                ));
             }
             anc = a.parent();
         }
@@ -902,7 +902,7 @@ impl RetainedTerrainBuilder {
         &mut self,
         input: &EarthInput,
         frame_ctx: &EarthPluginFrameContext<'_>,
-    ) -> (Option<Arc<RetainedEnvironmentAssets>>, Vec<SatelliteElement>) {
+    ) -> (Option<Arc<RetainedEnvironmentAssets>>, Arc<Vec<SatelliteElement>>) {
         let ll = input.low_level_state();
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
         let weather_active = self.plugins.is_active(WeatherPlugin::ID);
@@ -1197,11 +1197,11 @@ impl RetainedTerrainBuilder {
                                     && c.elev_hash == elev_hash
                                     && c.morph_sig == morph_sig
                             })
-                        && has_resident_ancestor(&self.meshes, leaf, grid, with_skirts);
+                        && has_resident_ancestor(&self.meshes, leaf, grid, with_skirts, morph_sig);
 
                     if use_ancestor_mesh {
                         if let Some((anc_key, anc_mesh)) =
-                            find_resident_ancestor(&self.meshes, leaf, grid, with_skirts)
+                            find_resident_ancestor(&self.meshes, leaf, grid, with_skirts, morph_sig)
                         {
                             stats.ancestor_fallbacks += 1;
                             let anc_id = anc_mesh.key;
@@ -1621,10 +1621,14 @@ fn has_resident_ancestor(
     leaf: TileKey,
     grid: u32,
     skirts: bool,
+    morph_sig: u64,
 ) -> bool {
     let mut cur = leaf.parent();
     while let Some(anc) = cur {
-        if meshes.contains_key(&(TileKeyId::quadtree(anc.level, anc.x, anc.y), grid, skirts)) {
+        if meshes
+            .get(&(TileKeyId::quadtree(anc.level, anc.x, anc.y), grid, skirts))
+            .is_some_and(|e| e.morph_sig == morph_sig)
+        {
             return true;
         }
         cur = anc.parent();
@@ -1637,13 +1641,16 @@ fn find_resident_ancestor(
     leaf: TileKey,
     grid: u32,
     skirts: bool,
+    morph_sig: u64,
 ) -> Option<(TileKey, Arc<RetainedTileMesh>)> {
     let mut cur = leaf.parent();
     while let Some(anc) = cur {
         if let Some(entry) =
             meshes.get(&(TileKeyId::quadtree(anc.level, anc.x, anc.y), grid, skirts))
         {
-            return Some((anc, Arc::clone(&entry.mesh)));
+            if entry.morph_sig == morph_sig {
+                return Some((anc, Arc::clone(&entry.mesh)));
+            }
         }
         cur = anc.parent();
     }

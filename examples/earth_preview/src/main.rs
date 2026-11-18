@@ -386,6 +386,9 @@ fn main() -> Result<(), String> {
     let fps_for_frame = fps_readout;
     let mut fps_frames = 0u32;
     let mut fps_window_start = std::time::Instant::now();
+    let mut max_dt_ms = 0.0f64;
+    let mut max_step_ms = 0.0f64;
+    let perf_fps = std::env::var_os("STRATA_PERF_LOG").is_some();
 
     launch_with_frame(
         build_root,
@@ -393,13 +396,23 @@ fn main() -> Result<(), String> {
         |_, _| false,
         None,
         move |info: AppFrameInfo, _rt: &mut AppRuntime| -> FrameOutcome {
+            let t_s = std::time::Instant::now();
             let dt = info.dt.as_secs_f64();
+            max_dt_ms = max_dt_ms.max(dt * 1000.0);
             fps_frames += 1;
             let mut fps_dirty = false;
             let elapsed_s = fps_window_start.elapsed().as_secs_f64();
             if elapsed_s >= 0.45 {
                 let fps = ((fps_frames as f64) / elapsed_s).round().clamp(1.0, 999.0) as u32;
                 let ms = (elapsed_s * 1000.0) / (fps_frames.max(1) as f64);
+                if perf_fps {
+                    eprintln!(
+                        "[perf] fps={} avg={:.2}ms max_dt={:.2}ms max_step={:.2}ms frames={}",
+                        fps, ms, max_dt_ms, max_step_ms, fps_frames
+                    );
+                }
+                max_dt_ms = 0.0;
+                max_step_ms = 0.0;
                 let prev = *fps_for_frame.borrow();
                 if prev.0 != fps || (prev.1 - ms).abs() >= 0.3 {
                     *fps_for_frame.borrow_mut() = (fps, ms);
@@ -417,6 +430,7 @@ fn main() -> Result<(), String> {
                 });
             }
             let outcome = earth_for_frame.step_frame(dt);
+            max_step_ms = max_step_ms.max(t_s.elapsed().as_secs_f64() * 1000.0);
             if fps_dirty {
                 FrameOutcome::Dirty
             } else {
