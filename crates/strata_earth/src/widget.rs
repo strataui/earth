@@ -261,17 +261,20 @@ impl EarthViewState {
             inp.layers.labels as u64,
             self.overlay_plugin_rev,
             self.has_active_overlay_plugins() as u64,
-            (self.orbit.eye_dir[0] * 1_000_000.0).round() as i64 as u64,
-            (self.orbit.eye_dir[1] * 1_000_000.0).round() as i64 as u64,
-            (self.orbit.eye_dir[2] * 1_000_000.0).round() as i64 as u64,
-            (self.orbit.up_dir[0] * 1_000_000.0).round() as i64 as u64,
-            (self.orbit.up_dir[1] * 1_000_000.0).round() as i64 as u64,
-            (self.orbit.up_dir[2] * 1_000_000.0).round() as i64 as u64,
-            (self.orbit.range_m.ln() * 4_000.0).round() as u64,
-            (self.orbit.tilt_deg * 100.0).round() as u64,
+            (self.orbit.lat_deg * 1e7).round() as i64 as u64,
+            (self.orbit.lon_deg * 1e7).round() as i64 as u64,
+            (self.orbit.heading_deg * 1e4).round() as i64 as u64,
+            (self.orbit.tilt_deg * 1e4).round() as i64 as u64,
+            (self.orbit.eye_dir[0] * 1_000_000_000.0).round() as i64 as u64,
+            (self.orbit.eye_dir[1] * 1_000_000_000.0).round() as i64 as u64,
+            (self.orbit.eye_dir[2] * 1_000_000_000.0).round() as i64 as u64,
+            (self.orbit.up_dir[0] * 1_000_000_000.0).round() as i64 as u64,
+            (self.orbit.up_dir[1] * 1_000_000_000.0).round() as i64 as u64,
+            (self.orbit.up_dir[2] * 1_000_000_000.0).round() as i64 as u64,
+            (self.orbit.range_m.ln() * 200_000.0).round() as u64,
             self.orbit.viewport_w.round() as u64,
             self.orbit.viewport_h.round() as u64,
-            (inp.view_morph * 1_000.0).round() as u64,
+            (inp.view_morph * 10_000.0).round() as u64,
             nearby_count,
         ];
         for p in parts {
@@ -367,18 +370,13 @@ impl EarthViewState {
 
         let new_sig = self.label_state_signature();
         let labels_changed = new_sig != self.last_label_sig;
-        let now = Instant::now();
-        let camera_moving = self.orbit.is_dragging() || orbit_dirty || trans_dirty;
         let refresh_due = toggled_labels
             || label_dirty
-            || (labels_changed
-                && (labels_enabled || overlay_plugins_active)
-                && (!camera_moving
-                    || now.duration_since(self.last_label_refresh) >= Duration::from_millis(66)));
+            || (labels_changed && (labels_enabled || overlay_plugins_active));
 
         if refresh_due {
             self.last_label_sig = new_sig;
-            self.last_label_refresh = now;
+            self.last_label_refresh = Instant::now();
             self.notify_ui_changed();
             FrameOutcome::Dirty
         } else {
@@ -648,7 +646,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             rsx! {
                 <div
                     class={format!("absolute px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide select-none shadow-md {}", shield_cls)}
-                    style={format!("left: {:.1}px; top: {:.1}px; opacity: {};", x - 18.0, y - 9.0, op)}
+                    style={format!("left: {:.2}px; top: {:.2}px; opacity: {};", x - 18.0, y - 9.0, op)}
                 >
                     <span>{lbl.text.clone()}</span>
                 </div>
@@ -658,7 +656,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             rsx! {
                 <div
                     class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
+                    style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
                     <span class="font-medium">{lbl.text.clone()}</span>
                     <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="currentColor">
@@ -671,7 +669,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             rsx! {
                 <div
                     class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
+                    style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
                     <span class="font-medium">{lbl.text.clone()}</span>
                     <svg class="w-3 h-3 shrink-0" viewBox="0 0 24 24" fill="currentColor">
@@ -684,7 +682,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             rsx! {
                 <div
                     class="absolute flex items-center gap-1.5 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
-                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, bg_op, r, g, b, op, lbl.font_px)}
+                    style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
                     <div class="w-1.5 h-1.5 rounded-full bg-white/95" />
                     <span class="font-medium">{lbl.text.clone()}</span>
@@ -701,7 +699,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             rsx! {
                 <div
                     class={format!("absolute px-1 py-0.5 rounded select-none whitespace-nowrap {}", extra_cls)}
-                    style={format!("left: {:.1}px; top: {:.1}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, bg25_op, r, g, b, op, lbl.font_px)}
+                    style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, bg25_op, r, g, b, op, lbl.font_px)}
                 >
                     <span>{lbl.text.clone()}</span>
                 </div>
@@ -1055,6 +1053,69 @@ mod tests {
             dom_ms,
             dom_ms / 200.0,
         );
+    }
+
+    #[test]
+    fn orbit_camera_motion_updates_labels_every_frame_smoothly_without_66ms_stepping() {
+        let mut orbit = EarthOrbitController::new();
+        orbit.jump_to(40.1, 25.5, 580_000.0, 0.0, 0.0);
+        orbit.set_viewport_size(1920.0, 1080.0);
+        let (cam, up) = orbit.to_camera_and_up(false, 0.0);
+        let mut input = EarthInput::globe();
+        input.camera = cam;
+        input.camera_up_ecef = up;
+        input.viewport = strata::layout::Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        input.elevation_enabled = false;
+        input.layers.labels = true;
+        let earth = EarthView::with_orbit(&input, Box::new(MemoryTileSource::default()), orbit);
+
+        // Initial projection populates visible labels.
+        let _ = earth.view();
+        let tracked_text = earth.with_state(|st| {
+            st.compute_projected_labels()
+                .first()
+                .expect("expected visible labels over Aegean at 580 km")
+                .text
+                .clone()
+        });
+
+        let mut xs = Vec::new();
+        for _ in 0..16 {
+            earth.with_state_mut(|st| {
+                let lat = st.orbit.lat_deg;
+                let lon = st.orbit.lon_deg + 0.012;
+                let rng = st.orbit.range_m;
+                st.orbit.jump_to(lat, lon, rng, 0.0, 0.0);
+                st.sync_camera();
+            });
+            let outcome = earth.step_frame(1.0 / 144.0);
+            assert_eq!(
+                outcome,
+                strata::FrameOutcome::Dirty,
+                "144Hz orbit increments must mark overlay Dirty every frame without 66ms throttling"
+            );
+            let x = earth.with_state(|st| {
+                st.compute_projected_labels()
+                    .into_iter()
+                    .find(|l| l.text == tracked_text)
+                    .expect("tracked label should remain deterministically visible across small orbit")
+                    .screen_x
+            });
+            xs.push(x);
+        }
+
+        for pair in xs.windows(2) {
+            let dx = pair[1] - pair[0];
+            assert!(
+                dx < -0.2 && dx > -12.0,
+                "expected smooth subpixel westward motion per 144Hz frame, got dx={dx} ({pair:?})"
+            );
+        }
     }
 }
 
