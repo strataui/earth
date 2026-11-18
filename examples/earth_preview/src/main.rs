@@ -3,7 +3,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
 
 use strata::prelude::*;
 use strata::WindowConfig;
@@ -392,7 +391,7 @@ fn main() -> Result<(), String> {
         build_root,
         config,
         |_, _| false,
-        Some(Duration::from_millis(16)),
+        None,
         move |info: AppFrameInfo, _rt: &mut AppRuntime| -> FrameOutcome {
             let dt = info.dt.as_secs_f64();
             fps_frames += 1;
