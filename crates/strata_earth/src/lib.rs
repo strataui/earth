@@ -114,11 +114,11 @@ pub use scene::{
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{
     decode_png_to_rgba, decode_terrain_rgb, decode_terrarium, format_slippy_url, format_tile_url,
-    tile_key_to_quadkey, tile_sampler, DirectoryTileSource, ElevationEncoding, HttpTransport,
-    LruTileCache, LruTileCacheSource, MemoryTileSource, MockHttpTransport, NetworkTileSource,
-    NetworkTileStats, StandardHttpTransport, TextureSlot, TileElevation, TileElevationPreset,
-    TileError, TileImage, TileProviderConfig, TileProviderPreset, TileRegistry, TileSource,
-    DEFAULT_MAX_CACHE_BYTES,
+    is_unavailable_placeholder_tile, tile_key_to_quadkey, tile_sampler, DirectoryTileSource,
+    ElevationEncoding, HttpTransport, LruTileCache, LruTileCacheSource, MemoryTileSource,
+    MockHttpTransport, NetworkTileSource, NetworkTileStats, StandardHttpTransport, TextureSlot,
+    TileElevation, TileElevationPreset, TileError, TileImage, TileProviderConfig,
+    TileProviderPreset, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
 };
 pub use controller::{
     EarthOrbitController, DEFAULT_FOV_Y_DEG, GROUND_CLEARANCE_M, LOCAL_TRANSITION_RANGE_M,
