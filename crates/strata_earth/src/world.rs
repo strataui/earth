@@ -856,6 +856,13 @@ impl EarthWorld {
         self.objects.iter().map(|(&id, s)| (id, &s.object))
     }
 
+    /// Returns `true` if any visible object uses `min_pixel_size > 0.0` (requiring distance-dependent scale).
+    pub fn has_pixel_sized_objects(&self) -> bool {
+        self.objects
+            .values()
+            .any(|s| s.object.visible && s.object.min_pixel_size > 0.0)
+    }
+
     /// Evaluates the exact world transform for a single [`EarthObjectId`] under the given
     /// camera, heightmap toggle, surface morph, and live DEM sampler.
     pub fn resolve_object_transform(

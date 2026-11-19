@@ -105,6 +105,8 @@ pub struct EarthViewState {
     pub ui_rev: Signal<u64>,
     overlay_plugins: Vec<Box<dyn EarthOverlayPlugin>>,
     overlay_plugin_rev: u64,
+    cached_labels: Vec<ProjectedEarthLabel>,
+    cached_nearby_sector: Option<((i32, i32), u64, Vec<EarthMapLabel>)>,
     last_label_sig: u64,
     last_label_refresh: Instant,
     last_labels_enabled: bool,
@@ -177,8 +179,10 @@ impl EarthViewState {
             ui_rev: Signal::new(0),
             overlay_plugins: Vec::new(),
             overlay_plugin_rev: 0,
+            cached_labels: Vec::new(),
+            cached_nearby_sector: None,
             last_label_sig: 0,
-            last_label_refresh: Instant::now(),
+            last_label_refresh: Instant::now() - Duration::from_secs(1),
             last_labels_enabled: effective_input.layers.labels,
             last_camera_sync: None,
             camera_sync_pending: false,
@@ -194,7 +198,9 @@ impl EarthViewState {
         };
         st.sync_camera();
         st.last_camera_sync = None;
-        st.last_label_sig = st.label_state_signature();
+        let (labels, sig) = st.project_and_hash_labels();
+        st.cached_labels = labels;
+        st.last_label_sig = sig;
         st
     }
 
@@ -266,6 +272,9 @@ impl EarthViewState {
         self.orbit
             .jump_to(lat_deg, lon_deg, range_m, heading_deg, tilt_deg);
         self.sync_camera();
+        let (labels, sig) = self.project_and_hash_labels();
+        self.cached_labels = labels;
+        self.last_label_sig = sig;
         self.notify_ui_changed();
     }
 
@@ -320,43 +329,75 @@ impl EarthViewState {
         false
     }
 
-    fn label_state_signature(&self) -> u64 {
-        let inp = self.viewport.input();
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
-        let nearby_count = if inp.layers.labels && self.orbit.range_m < 250_000.0 {
-            self.live_labels
-                .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg)
-                .len() as u64
+    /// Projects visible labels and hashes ONLY their screen-visible half-pixel positions & alpha,
+    /// so sub-pixel zoom/momentum tails and zero-label street views trigger zero DOM/Cairo rebuilds.
+    fn project_and_hash_labels(&mut self) -> (Vec<ProjectedEarthLabel>, u64) {
+        let labels_on = self.viewport.input().layers.labels;
+        let plugins_on = self.has_active_overlay_plugins();
+        let projected = if !labels_on {
+            Vec::new()
+        } else if self.orbit.range_m < 250_000.0 {
+            let sector = (
+                (self.orbit.lat_deg * 2.0).floor() as i32,
+                (self.orbit.lon_deg * 2.0).floor() as i32,
+            );
+            let store_rev = self.live_labels.revision();
+            let need_reload = match &self.cached_nearby_sector {
+                Some((s, r, _)) => *s != sector || *r != store_rev,
+                None => true,
+            };
+            if need_reload {
+                let nearby = self
+                    .live_labels
+                    .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg);
+                self.cached_nearby_sector = Some((sector, store_rev, nearby));
+            }
+            let nearby_slice = self
+                .cached_nearby_sector
+                .as_ref()
+                .map(|(_, _, v)| v.as_slice())
+                .unwrap_or(&[]);
+            let inp = self.viewport.input();
+            if nearby_slice.is_empty() {
+                project_earth_labels(inp, &self.builtin_labels, 36)
+            } else {
+                let mut combined = Vec::with_capacity(self.builtin_labels.len() + nearby_slice.len());
+                combined.extend_from_slice(&self.builtin_labels);
+                combined.extend_from_slice(nearby_slice);
+                project_earth_labels(inp, &combined, 38)
+            }
         } else {
-            0
+            project_earth_labels(self.viewport.input(), &self.builtin_labels, 36)
         };
-        let parts = [
-            inp.layers.labels as u64,
-            self.overlay_plugin_rev,
-            self.has_active_overlay_plugins() as u64,
-            (self.orbit.lat_deg * 1e7).round() as i64 as u64,
-            (self.orbit.lon_deg * 1e7).round() as i64 as u64,
-            (self.orbit.heading_deg * 1e4).round() as i64 as u64,
-            (self.orbit.tilt_deg * 1e4).round() as i64 as u64,
-            (self.orbit.eye_dir[0] * 1_000_000_000.0).round() as i64 as u64,
-            (self.orbit.eye_dir[1] * 1_000_000_000.0).round() as i64 as u64,
-            (self.orbit.eye_dir[2] * 1_000_000_000.0).round() as i64 as u64,
-            (self.orbit.up_dir[0] * 1_000_000_000.0).round() as i64 as u64,
-            (self.orbit.up_dir[1] * 1_000_000_000.0).round() as i64 as u64,
-            (self.orbit.up_dir[2] * 1_000_000_000.0).round() as i64 as u64,
-            (self.orbit.range_m.ln() * 200_000.0).round() as u64,
-            self.orbit.viewport_w.round() as u64,
-            self.orbit.viewport_h.round() as u64,
-            (inp.view_morph * 10_000.0).round() as u64,
-            nearby_count,
-        ];
-        for p in parts {
-            h ^= p;
+
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |v: u64| {
+            h ^= v;
             h = h.wrapping_mul(0x100_0000_01b3);
+        };
+        mix(labels_on as u64);
+        mix(self.overlay_plugin_rev);
+        mix(plugins_on as u64);
+        mix(projected.len() as u64);
+        for lbl in &projected {
+            mix(lbl.id);
+            mix((lbl.screen_x * 2.0).round() as i32 as u64);
+            mix((lbl.screen_y * 2.0).round() as i32 as u64);
+            mix((lbl.alpha * 40.0).round() as i32 as u64);
         }
-        h
+        if plugins_on {
+            let inp = self.viewport.input();
+            mix((self.orbit.lat_deg * 1e5).round() as i64 as u64);
+            mix((self.orbit.lon_deg * 1e5).round() as i64 as u64);
+            mix((self.orbit.heading_deg * 100.0).round() as i64 as u64);
+            mix((self.orbit.tilt_deg * 100.0).round() as i64 as u64);
+            mix((self.orbit.range_m.ln() * 2_000.0).round() as u64);
+            mix((inp.view_morph * 1_000.0).round() as u64);
+        }
+        (projected, h)
     }
 
+    #[cfg(test)]
     fn compute_projected_labels(&self) -> Vec<ProjectedEarthLabel> {
         let inp = self.viewport.input();
         if !inp.layers.labels {
@@ -416,7 +457,8 @@ impl EarthViewState {
             .orbit
             .step_damping(dt_s, is_2d, |lat, lon| vp_ref.sample_ground_elevation_m(lat, lon));
 
-        if self.camera_sync_pending || orbit_dirty || trans_dirty {
+        let camera_moving = self.camera_sync_pending || orbit_dirty || trans_dirty;
+        if camera_moving {
             self.sync_camera();
         }
 
@@ -436,14 +478,18 @@ impl EarthViewState {
         self.last_labels_enabled = labels_enabled;
         let overlay_plugins_active = self.has_active_overlay_plugins();
 
-        let new_sig = self.label_state_signature();
-        let labels_changed = new_sig != self.last_label_sig;
-        let refresh_due = toggled_labels
-            || label_dirty
-            || (labels_changed && (labels_enabled || overlay_plugins_active));
+        if !toggled_labels && !label_dirty && !labels_enabled && !overlay_plugins_active {
+            return FrameOutcome::Unchanged;
+        }
 
-        if refresh_due {
+        let (projected, new_sig) = self.project_and_hash_labels();
+        let sig_changed = new_sig != self.last_label_sig;
+        if sig_changed {
+            self.cached_labels = projected;
             self.last_label_sig = new_sig;
+        }
+
+        if toggled_labels || label_dirty || sig_changed {
             self.last_label_refresh = Instant::now();
             self.notify_ui_changed();
             FrameOutcome::Dirty
@@ -1003,13 +1049,20 @@ impl EarthView {
                 .map(|(lx, ly)| (x - lx, y - ly))
                 .unwrap_or((0.0, 0.0));
             st.last_cursor_px = Some((x, y));
+            let mut set_grabbing = false;
             let btn = if let Some(ref mut cand) = st.press_candidate {
                 let dist = (x - cand.start_x).hypot(y - cand.start_y);
                 cand.max_travel_px = cand.max_travel_px.max(dist);
+                if cand.camera_active && cand.max_travel_px > CLICK_MAX_TRAVEL_PX {
+                    set_grabbing = true;
+                }
                 cand.button
             } else {
                 EarthMouseButton::Left
             };
+            if set_grabbing && !st.is_grabbing.untracked_get() {
+                st.is_grabbing.set(true);
+            }
             (
                 st.orbit.viewport_w,
                 st.orbit.viewport_h,
@@ -1086,8 +1139,8 @@ impl EarthView {
                 let mut dbl_click = false;
                 if clean_click && button == EarthMouseButton::Left {
                     if let Some((prev_t, px, py)) = st.last_left_click {
-                        if now.duration_since(prev_t) <= Duration::from_millis(320)
-                            && (x - px).hypot(y - py) <= 6.0
+                        if now.duration_since(prev_t) <= Duration::from_millis(350)
+                            && (x - px).hypot(y - py) <= 12.0
                         {
                             dbl_click = true;
                             st.last_left_click = None;
@@ -1125,9 +1178,9 @@ impl EarthView {
         if is_clean_click {
             match button {
                 EarthMouseButton::Left => {
+                    let click_ev = EarthPointerEvent::new(x, y, 0.0, 0.0, vw, vh, button, mods);
                     let cb_click = self.listeners.borrow().on_click.clone();
                     if let Some(cb) = cb_click {
-                        let click_ev = EarthPointerEvent::new(x, y, 0.0, 0.0, vw, vh, button, mods);
                         cb(&click_ev);
                     }
                     if is_double_click {
@@ -1136,7 +1189,10 @@ impl EarthView {
                         if let Some(cb) = cb_dbl {
                             cb(&dbl_ev);
                         }
-                        if dbl_zoom_enabled && !dbl_ev.is_default_camera_prevented() {
+                        if dbl_zoom_enabled
+                            && !click_ev.is_default_camera_prevented()
+                            && !dbl_ev.is_default_camera_prevented()
+                        {
                             self.zoom_at_screen_px(-std::f64::consts::LN_2, x, y);
                         }
                     }
@@ -1199,7 +1255,7 @@ impl EarthView {
             (
                 st.viewport.retained_scene(),
                 grabbing,
-                st.compute_projected_labels(),
+                st.cached_labels.clone(),
                 st.compute_plugin_overlay_nodes(),
                 st.uncapped,
             )
