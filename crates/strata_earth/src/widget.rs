@@ -634,6 +634,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
     let bg_op = format!("{:.2}", alpha * 0.35);
     let bg25_op = format!("{:.2}", alpha * 0.25);
 
+    let key_id = lbl.id.to_string();
     match lbl.icon {
         EarthLabelIcon::HighwayShield => {
             let shield_cls = if lbl.text.starts_with('I') {
@@ -645,6 +646,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             };
             rsx! {
                 <div
+                    key={key_id}
                     class={format!("absolute px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide select-none shadow-md {}", shield_cls)}
                     style={format!("left: {:.2}px; top: {:.2}px; opacity: {};", x - 18.0, y - 9.0, op)}
                 >
@@ -655,6 +657,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
         EarthLabelIcon::MountainRight => {
             rsx! {
                 <div
+                    key={key_id}
                     class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
                     style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 42.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
@@ -668,6 +671,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
         EarthLabelIcon::ParkLeafRight => {
             rsx! {
                 <div
+                    key={key_id}
                     class="absolute flex items-center gap-1 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
                     style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 44.0, y - 10.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
@@ -681,6 +685,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
         EarthLabelIcon::CityDot => {
             rsx! {
                 <div
+                    key={key_id}
                     class="absolute flex items-center gap-1.5 px-1.5 py-0.5 rounded select-none whitespace-nowrap"
                     style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 26.0, y - 9.0, bg_op, r, g, b, op, lbl.font_px)}
                 >
@@ -698,6 +703,7 @@ fn render_earth_label(lbl: &ProjectedEarthLabel) -> View {
             };
             rsx! {
                 <div
+                    key={key_id}
                     class={format!("absolute px-1 py-0.5 rounded select-none whitespace-nowrap {}", extra_cls)}
                     style={format!("left: {:.2}px; top: {:.2}px; background-color: rgba(0,0,0,{}); color: rgba({},{},{},{}); font-size: {:.1}px;", x - 34.0, y - 9.0, bg25_op, r, g, b, op, lbl.font_px)}
                 >
@@ -1117,5 +1123,115 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn orbit_and_zoom_reconciliation_never_renders_black_label_text_or_icons() {
+        use strata_render::compositor::DrawCommand;
+
+        let mut input = EarthInput::default();
+        input.elevation_enabled = false;
+        input.layers.labels = true;
+        let source = Box::new(MemoryTileSource::default());
+        let earth = EarthView::new(&input, source);
+
+        let mut runtime = strata::runtime::AppRuntime::new(earth.view(), 1920.0, 1080.0, 1.0);
+
+        // Sweep across global oceans/continents, Mediterranean countries/seas,
+        // Aegean cities/mountains, and US highways/parks so every EarthLabelIcon
+        // variant and horizon-alpha transition exercises DOM reconciliation.
+        let camera_keyframes = [
+            (20.0, 0.0, 18_000_000.0, 0.0, 0.0),
+            (25.0, 15.0, 12_000_000.0, 0.0, 10.0),
+            (38.0, 24.0, 3_200_000.0, 12.0, 20.0),
+            (38.2, 24.5, 620_000.0, -8.0, 32.0),
+            (38.25, 24.8, 580_000.0, 0.0, 35.0),
+            (37.7749, -122.4194, 420_000.0, 15.0, 40.0),
+            (37.7749, -122.4194, 95_000.0, 0.0, 45.0),
+            (38.0, 23.7, 750_000.0, 0.0, 25.0),
+        ];
+
+        let mut total_checked_labels = 0usize;
+        for &(lat, lon, range_m, heading, tilt) in &camera_keyframes {
+            earth.with_state_mut(|st| {
+                st.orbit.jump_to(lat, lon, range_m, heading, tilt);
+                st.sync_camera();
+            });
+            let _ = earth.step_frame(1.0 / 144.0);
+            runtime.update_view(earth.view());
+            assert!(
+                runtime.last_update_reconciled(),
+                "EarthView HUD updates should reconcile in-place"
+            );
+
+            let projected = earth.with_state(|st| st.compute_projected_labels());
+            assert!(
+                !projected.is_empty(),
+                "expected projected labels at ({lat}, {lon}, range={range_m})"
+            );
+
+            for lbl in &projected {
+                let mut matched = false;
+                for cmd in runtime.display_list.commands() {
+                    match cmd {
+                        DrawCommand::DrawText { text, color, .. } if text == &lbl.text => {
+                            matched = true;
+                            assert_ne!(
+                                (color.r, color.g, color.b),
+                                (0, 0, 0),
+                                "label {:?} rendered with black DrawText color {color:?}",
+                                lbl.text
+                            );
+                        }
+                        DrawCommand::DrawTextFragments { fragments } => {
+                            for frag in fragments {
+                                if frag.text == lbl.text {
+                                    matched = true;
+                                    let c = frag.style.color;
+                                    assert_ne!(
+                                        (c.r, c.g, c.b),
+                                        (0, 0, 0),
+                                        "label {:?} rendered with black fragment color {c:?}",
+                                        lbl.text
+                                    );
+                                    if lbl.alpha > 0.5 && lbl.icon != crate::labels::EarthLabelIcon::HighwayShield {
+                                        assert!(
+                                            c.a >= 100,
+                                            "bright label {:?} (alpha={:.2}) stuck at faint alpha {c:?}",
+                                            lbl.text,
+                                            lbl.alpha
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    matched,
+                    "projected label {:?} missing from compiled DisplayList",
+                    lbl.text
+                );
+                total_checked_labels += 1;
+            }
+
+            for cmd in runtime.display_list.commands() {
+                if let DrawCommand::DrawSvgPath {
+                    fill_color: Some(fill),
+                    stroke_color: None,
+                    ..
+                } = cmd
+                {
+                    assert_ne!(
+                        (fill.r, fill.g, fill.b),
+                        (0, 0, 0),
+                        "SVG fill='currentColor' icon lost inherited color and turned black: {fill:?}"
+                    );
+                }
+            }
+        }
+        assert!(total_checked_labels >= 20);
+    }
 }
+
 
