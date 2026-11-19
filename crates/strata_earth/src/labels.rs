@@ -1882,6 +1882,7 @@ pub fn builtin_world_labels() -> Vec<EarthMapLabel> {
 /// town/suburb names (`place`), and highway route codes (`highway` `ref`, e.g. `CT05`, `US-101`).
 pub struct LiveMapLabelStore {
     inner: Arc<Mutex<LiveLabelState>>,
+    revision: Arc< std::sync::atomic::AtomicU64 >,
     wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -1897,8 +1898,14 @@ impl LiveMapLabelStore {
                 sectors: HashMap::new(),
                 in_flight: HashMap::new(),
             })),
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wakeup,
         }
+    }
+
+    #[inline]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Triggers a background Overpass fetch for the `0.5 deg` sector around `(lat_deg, lon_deg)`
@@ -1937,6 +1944,7 @@ impl LiveMapLabelStore {
             url_encode_minimal(&query)
         );
         let inner = Arc::clone(&self.inner);
+        let rev = Arc::clone(&self.revision);
         let wake = self.wakeup.clone();
         std::thread::Builder::new()
             .name("strata-earth-labels".to_string())
@@ -1951,12 +1959,16 @@ impl LiveMapLabelStore {
                         labels = parse_overpass_labels_json(&text);
                     }
                 }
+                let added = !labels.is_empty();
                 if let Ok(mut guard) = inner.lock() {
                     guard.in_flight.remove(&sector);
                     guard.sectors.insert(sector, labels);
                 }
-                if let Some(w) = wake {
-                    w();
+                if added {
+                    rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    if let Some(w) = wake {
+                        w();
+                    }
                 }
             })
             .ok();

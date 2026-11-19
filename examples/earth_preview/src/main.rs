@@ -140,6 +140,7 @@ fn main() -> Result<(), String> {
         let status_sig = last_ray_status.clone();
         earth.on_click(move |ev| {
             if place_sig.untracked_get() || ev.modifiers.shift {
+                ev.prevent_default_camera();
                 if let Some(hit) = earth_click.raycast(ev.x, ev.y) {
                     earth_click.spawn_object(
                         EarthObject::new(
@@ -281,7 +282,7 @@ fn main() -> Result<(), String> {
                 clear_status_sig.set(None);
             })
         } else {
-            rsx! { <span class="hidden" /> }
+            View::new(strata_dom::NodeBlueprint::fragment(Vec::new()))
         };
 
         let e3 = earth_for_view.clone();
@@ -492,7 +493,7 @@ fn main() -> Result<(), String> {
                     <span>{msg}</span>
                 </div>
             },
-            None => rsx! { <span class="hidden" /> },
+            None => View::new(strata_dom::NodeBlueprint::fragment(Vec::new())),
         };
 
         rsx! {

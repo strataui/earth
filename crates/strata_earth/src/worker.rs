@@ -2490,6 +2490,19 @@ impl EarthViewport {
         self.update_camera_with_up(camera, self.input.camera_up_ecef, viewport_w, viewport_h);
     }
 
+    fn publish_camera_and_world(&mut self) {
+        let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
+            &self.input,
+            &self.plugins,
+            self.input.weather.weather_time_s,
+            self.overlay_rev,
+            false,
+        );
+        let (assets, instances) = self.compile_world_retained();
+        self.retained
+            .update_camera_and_geo_objects(cam_u, assets, instances);
+    }
+
     /// Updates camera and optional explicit ECEF camera-up hint in O(1).
     pub fn update_camera_with_up(
         &mut self,
@@ -2508,19 +2521,26 @@ impl EarthViewport {
             && self.plugins.is_active(OceanWavesPlugin::ID)
             && camera.altitude_m() < 520_000.0;
 
-        let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
+        let (has_world, has_px_sized) = self
+            .world
+            .read()
+            .map(|w| (!w.is_empty(), w.has_pixel_sized_objects()))
+            .unwrap_or((false, false));
         let need_geo_refresh = if has_world {
             let cur_sig = mesh_morph_signature(self.current_surface_morph());
             let cur_dist = camera.eye_distance_m();
             cur_sig != self.last_geo_morph_sig
-                || (cur_dist - self.last_geo_eye_dist_m).abs()
-                    > self.last_geo_eye_dist_m.max(1.0) * 0.006
+                || (has_px_sized
+                    && (cur_dist - self.last_geo_eye_dist_m).abs()
+                        > self.last_geo_eye_dist_m.max(1.0) * 0.025)
         } else {
             false
         };
 
-        if (flat_t - self.last_overlay_flat_t).abs() > 0.015 || ocean_active || need_geo_refresh {
+        if (flat_t - self.last_overlay_flat_t).abs() > 0.015 || ocean_active {
             self.publish_camera_and_overlays();
+        } else if need_geo_refresh {
+            self.publish_camera_and_world();
         } else {
             let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
                 &self.input,

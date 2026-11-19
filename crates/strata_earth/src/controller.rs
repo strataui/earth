@@ -285,6 +285,17 @@ impl EarthOrbitController {
         self.active_transit = None;
     }
 
+    /// Immediately zeroes any coasting arcball spin, pan inertia, or heading/pitch orbit momentum.
+    #[inline]
+    pub fn stop_momentum(&mut self) {
+        self.spin_vel_rad_s = 0.0;
+        self.pan_vel_gc_deg_s = (0.0, 0.0);
+        self.orbit_vel_deg_s = (0.0, 0.0);
+        self.carry_pan_vel = (0.0, 0.0);
+        self.carry_orbit_vel = (0.0, 0.0);
+        self.drag_samples.clear();
+    }
+
     /// Applies an exponential natural-log range step (`delta_ln < 0.0` zooms in closer;
     /// `delta_ln > 0.0` zooms out farther) centered on the current focus point.
     #[inline]
@@ -293,6 +304,7 @@ impl EarthOrbitController {
             return;
         }
         self.active_transit = None;
+        self.stop_momentum();
         self.zoom_cursor_px = None;
         self.target_range_m =
             (self.target_range_m * delta_ln.exp()).clamp(MIN_RANGE_M, MAX_RANGE_M);
@@ -313,6 +325,7 @@ impl EarthOrbitController {
             return;
         }
         self.active_transit = None;
+        self.stop_momentum();
         self.target_range_m =
             (self.target_range_m * delta_ln.exp()).clamp(MIN_RANGE_M, MAX_RANGE_M);
         self.zoom_cursor_px = Some((x, y));
@@ -983,6 +996,7 @@ impl EarthOrbitController {
             return;
         }
         self.active_transit = None;
+        self.stop_momentum();
         let steps = (delta_y / 110.0).clamp(-3.5, 3.5);
         let factor = (steps * 0.18).exp();
         self.target_range_m = (self.target_range_m * factor).clamp(MIN_RANGE_M, MAX_RANGE_M);
@@ -1139,7 +1153,7 @@ impl EarthOrbitController {
         // 2. Momentum damping when pointer is released
         if self.drag_action.is_none() {
             let decay = (-2.6 * dt).exp();
-            if self.spin_vel_rad_s.abs() > 1e-4 {
+            if self.spin_vel_rad_s.abs() > 2.5e-4 {
                 let d_angle = self.spin_vel_rad_s * dt;
                 let axis = DVec3::new(self.spin_axis[0], self.spin_axis[1], self.spin_axis[2]);
                 let cur_eye = DVec3::new(self.eye_dir[0], self.eye_dir[1], self.eye_dir[2]);
@@ -1147,13 +1161,17 @@ impl EarthOrbitController {
                 self.eye_dir = [next_eye.x, next_eye.y, next_eye.z];
                 self.sync_geo_from_dirs();
                 self.spin_vel_rad_s *= decay;
-                if self.spin_vel_rad_s.abs() <= 1e-4 {
+                if self.spin_vel_rad_s.abs() <= 2.5e-4 {
                     self.spin_vel_rad_s = 0.0;
                 }
                 changed = true;
+            } else {
+                self.spin_vel_rad_s = 0.0;
             }
 
-            if self.pan_vel_gc_deg_s.0.abs() > 1e-6 || self.pan_vel_gc_deg_s.1.abs() > 1e-6 {
+            let pan_stop = ((self.range_m / wgs84::A).to_degrees() * 0.002).max(1e-5);
+            if self.pan_vel_gc_deg_s.0.abs() > pan_stop || self.pan_vel_gc_deg_s.1.abs() > pan_stop
+            {
                 let lat_lim = if is_2d { 85.05112878 } else { 89.95 };
                 let min_cos =
                     if is_2d || self.range_m <= LOCAL_TRANSITION_RANGE_M || self.tilt_deg >= 4.0 {
@@ -1172,17 +1190,19 @@ impl EarthOrbitController {
                 }
                 self.pan_vel_gc_deg_s.0 *= decay;
                 self.pan_vel_gc_deg_s.1 *= decay;
-                if self.pan_vel_gc_deg_s.0.abs() <= 1e-6 {
+                if self.pan_vel_gc_deg_s.0.abs() <= pan_stop {
                     self.pan_vel_gc_deg_s.0 = 0.0;
                 }
-                if self.pan_vel_gc_deg_s.1.abs() <= 1e-6 {
+                if self.pan_vel_gc_deg_s.1.abs() <= pan_stop {
                     self.pan_vel_gc_deg_s.1 = 0.0;
                 }
                 self.sync_dirs_from_geo();
                 changed = true;
+            } else {
+                self.pan_vel_gc_deg_s = (0.0, 0.0);
             }
 
-            if !is_2d && (self.orbit_vel_deg_s.0.abs() > 1e-3 || self.orbit_vel_deg_s.1.abs() > 1e-3)
+            if !is_2d && (self.orbit_vel_deg_s.0.abs() > 1e-2 || self.orbit_vel_deg_s.1.abs() > 1e-2)
             {
                 let max_t =
                     84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4);
@@ -1194,14 +1214,16 @@ impl EarthOrbitController {
                 }
                 self.orbit_vel_deg_s.0 *= decay;
                 self.orbit_vel_deg_s.1 *= decay;
-                if self.orbit_vel_deg_s.0.abs() <= 1e-3 {
+                if self.orbit_vel_deg_s.0.abs() <= 1e-2 {
                     self.orbit_vel_deg_s.0 = 0.0;
                 }
-                if self.orbit_vel_deg_s.1.abs() <= 1e-3 {
+                if self.orbit_vel_deg_s.1.abs() <= 1e-2 {
                     self.orbit_vel_deg_s.1 = 0.0;
                 }
                 self.sync_dirs_from_geo();
                 changed = true;
+            } else if !is_2d {
+                self.orbit_vel_deg_s = (0.0, 0.0);
             }
         }
 
@@ -1220,10 +1242,12 @@ impl EarthOrbitController {
             }
             self.range_m = new_range;
             changed = true;
-        } else if (self.range_m - self.target_range_m).abs() > 1e-3 {
-            self.range_m = self.target_range_m.clamp(MIN_RANGE_M, MAX_RANGE_M);
+        } else {
+            if (self.range_m - self.target_range_m).abs() > 1e-6 {
+                self.range_m = self.target_range_m.clamp(MIN_RANGE_M, MAX_RANGE_M);
+                changed = true;
+            }
             self.zoom_cursor_px = None;
-            changed = true;
         }
 
         // 4. Enforce tilt ceiling & strict ground collision safety in 3D/2.5D
@@ -1273,6 +1297,60 @@ impl EarthOrbitController {
             self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
             self.lat_deg = (self.lat_deg + d_lat).clamp(-85.05112878, 85.05112878);
             self.sync_dirs_from_geo();
+            return;
+        }
+
+        // In close tilted 2.5D view, anchor against the local terrain tangent plane rather than
+        // grazing horizon ellipsoid rays so zooming never causes multi-km horizon jumps.
+        if old_range < LOCAL_TRANSITION_RANGE_M && self.tilt_deg > 10.0 {
+            let gw = self.ground_focus_weight(false);
+            let plane_h = self.focus_ground_m * gw;
+            let frame = LocalFrame::at(self.lat_deg, self.lon_deg);
+            let origin = geodetic_to_ecef(Geodetic::new(self.lat_deg, self.lon_deg, plane_h));
+
+            let (cam_b, up_b) = self.raw_camera_and_up(false, self.focus_ground_m);
+            let (o1, d1) = screen_to_ray_with_up(
+                cx,
+                cy,
+                self.viewport_w,
+                self.viewport_h,
+                &cam_b,
+                up_b.map(|u| DVec3::new(u[0], u[1], u[2])),
+            );
+            self.range_m = new_range;
+            let (cam_a, up_a) = self.raw_camera_and_up(false, self.focus_ground_m);
+            let (o2, d2) = screen_to_ray_with_up(
+                cx,
+                cy,
+                self.viewport_w,
+                self.viewport_h,
+                &cam_a,
+                up_a.map(|u| DVec3::new(u[0], u[1], u[2])),
+            );
+            self.range_m = old_range;
+
+            let denom1 = d1.dot(frame.up);
+            let denom2 = d2.dot(frame.up);
+            if denom1 < -0.08 && denom2 < -0.08 {
+                let t1 = origin.sub(o1).dot(frame.up) / denom1;
+                let t2 = origin.sub(o2).dot(frame.up) / denom2;
+                let max_t = old_range * 5.0 + 2_000.0;
+                if t1 > 0.0 && t2 > 0.0 && t1 < max_t && t2 < max_t {
+                    let p1 = o1.add(d1.scale(t1));
+                    let p2 = o2.add(d2.scale(t2));
+                    let delta = p1.sub(p2);
+                    let max_shift_m = (old_range - new_range).abs() * 1.25;
+                    let d_east = delta.dot(frame.east).clamp(-max_shift_m, max_shift_m);
+                    let d_north = delta.dot(frame.north).clamp(-max_shift_m, max_shift_m);
+                    let m_per_deg_lat = wgs84::A.to_radians();
+                    let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.15);
+                    self.lat_deg = (self.lat_deg + d_north / m_per_deg_lat).clamp(-89.95, 89.95);
+                    self.lon_deg = ((self.lon_deg + d_east / (m_per_deg_lat * cos_lat)) + 180.0)
+                        .rem_euclid(360.0)
+                        - 180.0;
+                    self.sync_dirs_from_geo();
+                }
+            }
             return;
         }
 
@@ -1682,6 +1760,39 @@ mod tests {
         // Manual mouse press cancels fly_to immediately so user retains instant control.
         ctrl.handle_mouse_down(0, 720.0, 450.0);
         assert!(!ctrl.is_flying());
+    }
+
+    #[test]
+    fn zooming_from_far_orbit_immediately_resets_orbit_and_spin_momentum() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(25.0, 15.0, 15_000_000.0, 0.0, 0.0);
+
+        let t0 = Instant::now();
+        ctrl.handle_mouse_down_at(0, 720.0, 450.0, t0);
+        ctrl.handle_mouse_move_at(820.0, 450.0, t0 + Duration::from_millis(16));
+        ctrl.handle_mouse_move_at(920.0, 450.0, t0 + Duration::from_millis(32));
+        ctrl.handle_mouse_up_at(0, t0 + Duration::from_millis(36));
+
+        assert!(
+            ctrl.pan_vel_gc_deg_s.0.abs() > 1.0 || ctrl.spin_vel_rad_s.abs() > 0.01,
+            "globe fling should have active momentum before zooming"
+        );
+
+        // Starting scroll zoom at screen center must immediately arrest coasting momentum.
+        ctrl.handle_scroll(-120.0, 720.0, 450.0);
+        assert_eq!(ctrl.pan_vel_gc_deg_s, (0.0, 0.0));
+        assert_eq!(ctrl.spin_vel_rad_s, 0.0);
+        assert_eq!(ctrl.orbit_vel_deg_s, (0.0, 0.0));
+
+        let lon_at_zoom_start = ctrl.lon_deg;
+        for _ in 0..20 {
+            ctrl.step_damping(1.0 / 120.0, false, |_, _| 0.0);
+        }
+        assert!(
+            (ctrl.lon_deg - lon_at_zoom_start).abs() < 1e-3,
+            "focus longitude must not keep drifting sideways once centered zoom begins"
+        );
     }
 }
 
