@@ -8,7 +8,7 @@ license.workspace = true
 description = "Golden-image capture for the strata_earth camera regimes"
 
 [dependencies]
-strata_earth = { workspace = true }
-strata_render = { workspace = true }
-strata_layout = { workspace = true }
-strata_style = { workspace = true }
+strata-earth = { workspace = true }
+strata-render = { workspace = true }
+strata-layout = { workspace = true }
+strata-style = { workspace = true }

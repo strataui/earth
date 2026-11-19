@@ -18,8 +18,9 @@ keywords = ["geospatial", "3d", "globe", "tiles", "strata"]
 categories = ["graphics", "rendering", "science"]
 
 [workspace.dependencies]
-strata_earth = { package = "strata-earth", path = "crates/strata_earth", version = "0.1.0" }
-strata_primitives = { version = "0.1.0", path = "../strata/crates/core/strata_primitives" }
-strata_style = { version = "0.1.0", path = "../strata/crates/core/strata_style" }
-strata_layout = { version = "0.1.0", path = "../strata/crates/core/strata_layout" }
-strata_render = { version = "0.1.0", path = "../strata/crates/render/strata_render" }
+strata-earth = { path = "crates/strata_earth", version = "0.1.0" }
+strata-primitives = { version = "0.1.0", path = "../strata/crates/core/strata_primitives" }
+strata-style = { version = "0.1.0", path = "../strata/crates/core/strata_style" }
+strata-layout = { version = "0.1.0", path = "../strata/crates/core/strata_layout" }
+strata-render = { version = "0.1.0", path = "../strata/crates/render/strata_render" }
+strata-ui = { version = "0.1.0", path = "../strata/crates/strata" }
