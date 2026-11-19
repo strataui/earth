@@ -253,7 +253,7 @@ fn parse_overpass_buildings_and_network_building_source() {
     };
     let mut img_src = EmbeddedBaseMapSource::new();
     scene.build(&input, &mut img_src);
-    assert!(!scene.scene().meshes.is_empty());
+    assert!(scene.stats().draw_calls > 0);
 }
 
 #[test]

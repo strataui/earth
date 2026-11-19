@@ -1,16 +1,17 @@
 //! Frame assembly: turn an [`EarthInput`] into a renderer-ready scene.
 
 use crate::geodesy::{
-    geodetic_to_ecef, resolve_tile_imagery, EarthCamera, Geodetic, TileKey, TileTextureResolution,
+    geodetic_to_ecef, resolve_tile_imagery, stabilized_surface_morph, EarthCamera, Geodetic,
+    TileKey, TileTextureResolution,
 };
 pub use crate::geodesy::{tile_bounds, PatchBounds};
+use crate::raycast::{raycast_surface_ray, raycast_viewport, EarthRayHit};
 use crate::tiles::{TextureSlot, TileRegistry, TileSource};
+use crate::world::{EarthObject, EarthObjectId, EarthWorld, ResolvedObjectTransform};
 use strata_layout::Rect;
 use strata_render::camera64::{Camera64, DVec3, RenderFrame64};
 use strata_render::compositor::{DisplayList, DrawCommand};
-use strata_render::overlay3d::{
-    LabelAnchor, MarkerKind, Overlay3D, OverlayPrimitive, OverlayTextStyle,
-};
+use strata_render::overlay3d::{LabelAnchor, Overlay3D, OverlayPrimitive, OverlayTextStyle};
 use strata_render::rasterizer::FrameBuffer;
 use strata_render::scene3d::{
     Background3D, Camera3D, CelestialBody3D, CloudShell3D, Material3D, Mesh3D, Scene3D,
@@ -42,14 +43,6 @@ impl Default for LayerToggles {
             celestial: true,
         }
     }
-}
-
-/// An entity marker drawn by the overlay pass.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EntityMarker {
-    pub position: Geodetic,
-    pub label: String,
-    pub color: Color,
 }
 
 /// High-level view mode exposed to application callers.
@@ -320,7 +313,6 @@ pub struct EarthInput {
     /// Patch size multiplier relative to the camera's ground coverage. Larger
     /// values mean fewer, bigger patches.
     pub patch_scale: f64,
-    pub markers: Vec<EntityMarker>,
     /// Geometry mode for surface rendering.
     pub surface_mode: SurfaceMode,
     /// Low-level attribute allowing explicit internal surface regime override/inspection.
@@ -451,7 +443,6 @@ impl Default for EarthInput {
             max_tile_level: 18,
             tile_grid: 5,
             patch_scale: 0.25,
-            markers: Vec::new(),
             surface_mode: SurfaceMode::default(),
             low_level_surface_override: None,
             sse_threshold: 4.0,
@@ -491,27 +482,28 @@ pub struct FrameStats {
     pub draw_calls: usize,
 }
 
-type RetainedLeafSig = (
-    SurfaceMode,
-    u32,
-    u8,
-    f64,
-    bool,
-    crate::geodesy::TileProjection,
-    u32,
-    u32,
-    i64,
-    i64,
-    Vec<TileKey>,
-);
+#[derive(Debug, Clone, PartialEq)]
+struct RetainedLeafSig {
+    mode: SurfaceMode,
+    tile_grid: u32,
+    max_tile_level: u8,
+    sse_threshold: f64,
+    with_skirts: bool,
+    tile_projection: crate::geodesy::TileProjection,
+    flat_q: u32,
+    morph_q: u32,
+    focus_lat_q: i64,
+    focus_lon_q: i64,
+    world_rev: u64,
+    elevation_enabled: bool,
+    leaves: Vec<TileKey>,
+}
 
-/// The plugin's reusable frame builder.
-///
-/// One instance is held by the host and reused every frame so mesh buffers and
-/// the texture registry keep their capacity.
+/// The planetary engine's reusable frame and geodetic [`EarthWorld`] builder.
 #[derive(Debug)]
 pub struct EarthScene {
     scene: Scene3D,
+    world: std::sync::Arc<std::sync::RwLock<EarthWorld>>,
     terrain: MeshBuilder,
     buildings: MeshBuilder,
     tiles: TileRegistry,
@@ -536,8 +528,12 @@ impl Default for EarthScene {
 
 impl EarthScene {
     pub fn new() -> Self {
+        let world = std::sync::Arc::new(std::sync::RwLock::new(EarthWorld::new()));
+        let mut retained_builder = crate::worker::RetainedTerrainBuilder::new();
+        retained_builder.set_world(std::sync::Arc::clone(&world));
         Self {
             scene: Scene3D::new(),
+            world,
             terrain: MeshBuilder::new(),
             buildings: MeshBuilder::new(),
             tiles: TileRegistry::new(),
@@ -547,7 +543,7 @@ impl EarthScene {
             frame_height: 900.0,
             rtc_origin: geodetic_to_ecef(Geodetic::default()),
             building_source: None,
-            retained_builder: crate::worker::RetainedTerrainBuilder::new(),
+            retained_builder,
             retained_handle: strata_render::scene3d::RetainedScene3D::new(
                 strata_render::scene3d::RetainedCameraUniforms::default(),
             ),
@@ -567,8 +563,7 @@ impl EarthScene {
         self.stats
     }
 
-    /// The scene produced by the most recent build.
-    pub fn scene(&self) -> &Scene3D {
+    pub(crate) fn internal_scene(&self) -> &Scene3D {
         &self.scene
     }
 
@@ -976,7 +971,33 @@ impl EarthScene {
         stats.building_triangles = self.buildings.triangle_count();
         stats.draw_calls = self.patches.len() + usize::from(stats.building_triangles > 0);
 
-        // 5. Overlay: graticule, markers, labels.
+        // 5. Retained GPU frame + geodetic EarthWorld compilation.
+        self.retained_geom_rev += 1;
+        let (retained_frame, r_stats) =
+            self.retained_builder
+                .build_frame(input, source, self.retained_geom_rev, false);
+        self.last_retained_stats = r_stats;
+        self.retained_handle
+            .update_terrain(std::sync::Arc::clone(&retained_frame));
+
+        let low_state = input.low_level_state();
+        let flat_t = low_state.local_25d_blend.max(low_state.map_2d_morph);
+        let morph = stabilized_surface_morph(
+            input.camera.focus,
+            flat_t as f64,
+            low_state.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let elev_enabled = input.elevation_enabled;
+        let rb_ref = &self.retained_builder;
+        let dem_sampler = |lat: f64, lon: f64| -> f64 {
+            if elev_enabled {
+                rb_ref.sample_ground_elevation_m(lat, lon)
+            } else {
+                0.0
+            }
+        };
+
         let mut overlay = Overlay3D::new();
         if input.layers.graticule {
             push_graticule(
@@ -986,39 +1007,78 @@ impl EarthScene {
                 placement.eye.sub(origin),
             );
         }
-        if input.layers.labels {
-            for marker in &input.markers {
-                let anchor = geodetic_to_ecef(marker.position).sub(origin);
-                overlay.push(OverlayPrimitive::Marker {
-                    anchor,
-                    kind: MarkerKind::Diamond,
-                    color: marker.color,
-                    size: 7.0,
-                });
-                overlay.push(OverlayPrimitive::Label {
-                    anchor,
-                    text: marker.label.clone(),
-                    style: OverlayTextStyle {
-                        color: marker.color,
-                        scale: 1,
-                    },
-                    placement: LabelAnchor::Above,
-                    leader: true,
-                });
+
+        if let Ok(mut world_guard) = self.world.write() {
+            if !world_guard.is_empty() {
+                let cpu_meshes = world_guard.emit_cpu_meshes(
+                    origin,
+                    placement.eye,
+                    input.viewport.height.max(1.0) as f64,
+                    input.camera.fov_y_deg,
+                    elev_enabled,
+                    morph,
+                    &dem_sampler,
+                );
+                for (geom, mat) in cpu_meshes {
+                    let m3d = if mat.unlit {
+                        Material3D::Basic { color: mat.color }
+                    } else {
+                        Material3D::Standard {
+                            color: mat.color,
+                            roughness: mat.roughness,
+                            metalness: mat.metalness,
+                            emissive: (mat.emissive.a() > 0.001).then_some(mat.emissive),
+                        }
+                    };
+                    scene.meshes.push(Mesh3D::new(geom, m3d));
+                    stats.draw_calls += 1;
+                }
+
+                if input.layers.labels {
+                    for (id, obj) in world_guard.iter() {
+                        if !obj.visible {
+                            continue;
+                        }
+                        if let Some(ref text) = obj.label {
+                            if !text.is_empty() {
+                                if let Some(tf) = world_guard.resolve_object_transform(
+                                    id,
+                                    placement.eye,
+                                    input.viewport.height.max(1.0) as f64,
+                                    input.camera.fov_y_deg,
+                                    elev_enabled,
+                                    morph,
+                                    &dem_sampler,
+                                ) {
+                                    let anchor = DVec3::new(
+                                        tf.anchor_ecef[0],
+                                        tf.anchor_ecef[1],
+                                        tf.anchor_ecef[2],
+                                    )
+                                    .sub(origin);
+                                    overlay.push(OverlayPrimitive::Label {
+                                        anchor,
+                                        text: text.clone(),
+                                        style: OverlayTextStyle {
+                                            color: obj.material.color,
+                                            scale: 1,
+                                        },
+                                        placement: LabelAnchor::Above,
+                                        leader: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+
         stats.overlay_primitives = overlay.primitives.len();
         if !overlay.is_empty() {
             scene = scene.with_overlay(overlay);
         }
 
-        self.retained_geom_rev += 1;
-        let (retained_frame, r_stats) =
-            self.retained_builder
-                .build_frame(input, source, self.retained_geom_rev, false);
-        self.last_retained_stats = r_stats;
-        self.retained_handle
-            .update_terrain(std::sync::Arc::clone(&retained_frame));
         scene.set_retained_terrain(Some(retained_frame));
         scene.set_retained_handle(Some(self.retained_handle.clone()));
 
@@ -1041,7 +1101,7 @@ impl EarthScene {
     }
 
     /// GPU-first retained build that updates camera uniforms in O(1) when visible LOD leaves
-    /// remain identical, and skips CPU [`MeshBuilder`] construction altogether.
+    /// and world revision remain identical, and skips CPU [`MeshBuilder`] construction altogether.
     pub fn build_retained(&mut self, input: &EarthInput, source: &mut dyn TileSource) {
         let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
         let effective_mode = input.effective_surface_mode();
@@ -1056,6 +1116,8 @@ impl EarthScene {
         } else {
             (0, 0)
         };
+        let world_rev = self.world.read().map(|w| w.revision()).unwrap_or(0);
+        let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
         if input.layers.terrain && effective_mode == SurfaceMode::QuadtreeLod {
             let leaves = crate::geodesy::traverse_quadtree_lod_frustum6_projected(
                 &input.camera,
@@ -1069,30 +1131,33 @@ impl EarthScene {
                 input.tile_projection,
             );
             let with_skirts = input.terrain_skirts.unwrap_or(true);
-            let sig = (
-                effective_mode,
-                input.tile_grid.max(2),
-                input.max_tile_level,
-                input.sse_threshold,
+            let sig = RetainedLeafSig {
+                mode: effective_mode,
+                tile_grid: input.tile_grid.max(2),
+                max_tile_level: input.max_tile_level,
+                sse_threshold: input.sse_threshold,
                 with_skirts,
-                input.tile_projection,
+                tile_projection: input.tile_projection,
                 flat_q,
                 morph_q,
                 focus_lat_q,
                 focus_lon_q,
+                world_rev,
+                elevation_enabled: input.elevation_enabled,
                 leaves,
-            );
-            if self.last_retained_leaves.as_ref() == Some(&sig)
+            };
+            if !has_world
+                && self.last_retained_leaves.as_ref() == Some(&sig)
                 && self.last_retained_stats.ancestor_fallbacks == 0
                 && self.retained_builder.frame_cache_valid_for_fast_path(input)
                 && self.retained_handle.snapshot_terrain().is_some()
             {
                 self.retained_handle.update_camera(cam_u);
                 self.last_retained_stats = crate::worker::RetainedBuildStats {
-                    visible_tiles: sig.10.len(),
-                    mesh_cache_hits: sig.10.len(),
+                    visible_tiles: sig.leaves.len(),
+                    mesh_cache_hits: sig.leaves.len(),
                     mesh_cache_misses: 0,
-                    texture_cache_hits: sig.10.len(),
+                    texture_cache_hits: sig.leaves.len(),
                     texture_cache_misses: 0,
                     ancestor_fallbacks: 0,
                 };
@@ -1161,105 +1226,144 @@ impl EarthScene {
         })
     }
 
-    /// Mutable access to the built scene so callers can append custom meshes,
-    /// lights, or overlay primitives without cloning terrain buffers.
-    pub fn scene_mut(&mut self) -> &mut Scene3D {
-        &mut self.scene
-    }
-
-    /// Mutable access to the scene overlay (creating it when absent).
-    pub fn overlay_mut(&mut self) -> &mut Overlay3D {
-        self.scene.overlay_mut()
-    }
-
-    /// Moves the built scene out, leaving an empty one. Zero-copy handoff to
-    /// `<SceneViewport scene={...}>`; the next `build` repopulates the scene.
-    pub fn take_scene(&mut self) -> Scene3D {
-        std::mem::take(&mut self.scene)
-    }
-
-    /// Like [`EarthScene::take_scene`], wrapped in an `Arc` for viewport props.
-    pub fn take_scene_arc(&mut self) -> std::sync::Arc<Scene3D> {
-        std::sync::Arc::new(self.take_scene())
-    }
-
     /// Registers the building footprint provider. Without one, no buildings are
     /// generated even when `layers.buildings` is on.
     pub fn set_building_source(&mut self, source: Option<Box<dyn BuildingSource>>) {
         self.building_source = source;
     }
 
-    /// The ECEF origin the last build's scene coordinates are relative to.
-    pub fn rtc_origin(&self) -> DVec3 {
-        self.rtc_origin
+    /// Borrows the geodetic [`EarthWorld`] owned by this scene.
+    pub fn world<R>(&self, f: impl FnOnce(&EarthWorld) -> R) -> R {
+        let guard = self.world.read().expect("EarthWorld lock poisoned");
+        f(&guard)
     }
 
-    /// Scene-space (relative-to-centre) position of a geodetic point. The
-    /// subtraction happens in f64 before narrowing to f32.
-    pub fn rtc_position(&self, pos: Geodetic) -> [f32; 3] {
-        geodetic_to_ecef(pos).sub(self.rtc_origin).as_f32()
+    /// Mutates the geodetic [`EarthWorld`] owned by this scene.
+    pub fn world_mut<R>(&mut self, f: impl FnOnce(&mut EarthWorld) -> R) -> R {
+        let mut guard = self.world.write().expect("EarthWorld lock poisoned");
+        f(&mut guard)
     }
 
-    /// Transform placing a mesh at `pos` oriented in the local east-north-up
-    /// tangent frame. Model axes are +X east, +Y up, -Z north.
-    ///
-    /// `yaw_pitch_roll_deg` are intrinsic navigation angles: yaw is a compass
-    /// heading clockwise from north, pitch is nose-up positive, roll is
-    /// right-wing-down positive.
-    pub fn rtc_transform(
+    /// Spawns a geodetic [`EarthObject`] into this scene's [`EarthWorld`].
+    pub fn spawn_object(&mut self, object: EarthObject) -> EarthObjectId {
+        self.world_mut(|w| w.spawn(object))
+    }
+
+    /// Removes a geodetic [`EarthObject`] by ID, returning `true` if it existed.
+    pub fn remove_object(&mut self, id: EarthObjectId) -> bool {
+        self.world_mut(|w| w.remove(id))
+    }
+
+    /// Clears all geodetic [`EarthObject`]s from this scene's [`EarthWorld`].
+    pub fn clear_objects(&mut self) {
+        self.world_mut(|w| w.clear());
+    }
+
+    /// Evaluates the world transform of `id` (including live `Terrain` vs `SeaLevel` altitude)
+    /// against `input` and the most recently loaded DEM elevation snapshot.
+    pub fn resolve_object_transform(
         &self,
-        pos: Geodetic,
-        yaw_pitch_roll_deg: [f64; 3],
-        scale: [f32; 3],
-    ) -> Transform3D {
-        let frame = crate::geodesy::LocalFrame::at(pos.lat_deg, pos.lon_deg);
-        let neg_north = frame.north.scale(-1.0);
-        // Columns of the model-to-ECEF basis.
-        let basis = [
-            [frame.east.x, frame.up.x, neg_north.x],
-            [frame.east.y, frame.up.y, neg_north.y],
-            [frame.east.z, frame.up.z, neg_north.z],
-        ];
-        let [yaw, pitch, roll] = yaw_pitch_roll_deg.map(f64::to_radians);
-        let (sy, cy) = (-yaw).sin_cos();
-        let (sx, cx) = pitch.sin_cos();
-        let (sz, cz) = (-roll).sin_cos();
-        let ry = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
-        let rx = [[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]];
-        let rz = [[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]];
-        let r = mat3_mul(&basis, &mat3_mul(&ry, &mat3_mul(&rx, &rz)));
-
-        // Decompose into the engine's YZX Euler order: R = Ry * Rz * Rx.
-        let sin_z = r[1][0].clamp(-1.0, 1.0);
-        let (rot_x, rot_y, rot_z) = if sin_z.abs() < 1.0 - 1e-9 {
-            (
-                (-r[1][2]).atan2(r[1][1]),
-                (-r[2][0]).atan2(r[0][0]),
-                sin_z.asin(),
-            )
-        } else {
-            (
-                0.0,
-                r[0][2].atan2(r[2][2]),
-                std::f64::consts::FRAC_PI_2.copysign(sin_z),
-            )
-        };
-
-        Transform3D {
-            position: self.rtc_position(pos),
-            rotation: [rot_x as f32, rot_y as f32, rot_z as f32],
-            scale,
-        }
+        id: EarthObjectId,
+        input: &EarthInput,
+    ) -> Option<ResolvedObjectTransform> {
+        let low = input.low_level_state();
+        let flat_t = low.local_25d_blend.max(low.map_2d_morph);
+        let morph = stabilized_surface_morph(
+            input.camera.focus,
+            flat_t as f64,
+            low.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let up = input.camera_up_ecef.map(|[x, y, z]| DVec3::new(x, y, z));
+        let placement = input.camera.placement_with_up(up);
+        let elev_on = input.elevation_enabled;
+        let rb = &self.retained_builder;
+        let guard = self.world.read().ok()?;
+        guard.resolve_object_transform(
+            id,
+            placement.eye,
+            input.viewport.height.max(1.0) as f64,
+            input.camera.fov_y_deg,
+            elev_on,
+            morph,
+            &|lat, lon| {
+                if elev_on {
+                    rb.sample_ground_elevation_m(lat, lon)
+                } else {
+                    0.0
+                }
+            },
+        )
     }
 
-    /// Alias of [`EarthScene::rtc_transform`].
-    pub fn local_transform(
+    /// Raycasts `(screen_x, screen_y)` against both pickable [`EarthWorld`] objects and the
+    /// planetary surface using the DEM snapshot from the latest build.
+    pub fn raycast(&self, screen_x: f64, screen_y: f64, input: &EarthInput) -> Option<EarthRayHit> {
+        let low = input.low_level_state();
+        let flat_t = low.local_25d_blend.max(low.map_2d_morph);
+        let morph = stabilized_surface_morph(
+            input.camera.focus,
+            flat_t as f64,
+            low.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let up = input.camera_up_ecef.map(|[x, y, z]| DVec3::new(x, y, z));
+        let elev_on = input.elevation_enabled;
+        let rb = &self.retained_builder;
+        let guard = self.world.read().ok()?;
+        raycast_viewport(
+            screen_x,
+            screen_y,
+            input.viewport.width as f64,
+            input.viewport.height as f64,
+            &input.camera,
+            up,
+            elev_on,
+            morph,
+            Some(&guard),
+            &|lat, lon| {
+                if elev_on {
+                    rb.sample_ground_elevation_m(lat, lon)
+                } else {
+                    0.0
+                }
+            },
+        )
+    }
+
+    /// Raycasts `(screen_x, screen_y)` strictly against the planetary surface.
+    pub fn raycast_terrain(
         &self,
-        pos: Geodetic,
-        yaw_pitch_roll_deg: [f64; 3],
-        scale: [f32; 3],
-    ) -> Transform3D {
-        self.rtc_transform(pos, yaw_pitch_roll_deg, scale)
+        screen_x: f64,
+        screen_y: f64,
+        input: &EarthInput,
+    ) -> Option<EarthRayHit> {
+        let low = input.low_level_state();
+        let flat_t = low.local_25d_blend.max(low.map_2d_morph);
+        let morph = stabilized_surface_morph(
+            input.camera.focus,
+            flat_t as f64,
+            low.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let up = input.camera_up_ecef.map(|[x, y, z]| DVec3::new(x, y, z));
+        let (ray_origin, ray_dir) = crate::geodesy::screen_to_ray_with_up(
+            screen_x,
+            screen_y,
+            input.viewport.width as f64,
+            input.viewport.height as f64,
+            &input.camera,
+            up,
+        );
+        let elev_on = input.elevation_enabled;
+        let rb = &self.retained_builder;
+        raycast_surface_ray(ray_origin, ray_dir, elev_on, morph, &|lat, lon| {
+            if elev_on {
+                rb.sample_ground_elevation_m(lat, lon)
+            } else {
+                0.0
+            }
+        })
     }
 
     /// Converts the current 3D scene into a compositor `DrawViewport3D` command.
@@ -1306,16 +1410,6 @@ impl EarthScene {
         let fb = self.render_to_framebuffer(width, height);
         presenter.present(&fb, damage)
     }
-}
-
-fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut out = [[0.0; 3]; 3];
-    for (i, row) in out.iter_mut().enumerate() {
-        for (j, cell) in row.iter_mut().enumerate() {
-            *cell = (0..3).map(|k| a[i][k] * b[k][j]).sum();
-        }
-    }
-    out
 }
 
 /// Shared terrain triangles: one patch per tile, two triangles per grid cell.

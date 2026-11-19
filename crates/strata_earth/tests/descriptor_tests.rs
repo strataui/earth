@@ -1,8 +1,9 @@
 //! Golden descriptor: canonical JSON, round-trip, and replay.
 
 use strata_earth::{
-    replay, EarthCamera, EarthInput, EarthScene, EntityMarker, FrameDescriptor, Geodetic,
-    MemoryTileSource, TileElevation, TileImage, TileKey,
+    replay, AltitudeMode, EarthCamera, EarthGeometry, EarthInput, EarthMaterial, EarthObject,
+    EarthScene, FrameDescriptor, GeoPosition, Geodetic, MemoryTileSource, TileElevation, TileImage,
+    TileKey,
 };
 use strata_layout::Rect;
 use strata_style::types::Color;
@@ -50,11 +51,6 @@ fn input() -> EarthInput {
         cloud_cover: 0.4,
         daylight: 0.7,
         tile_grid: 5,
-        markers: vec![EntityMarker {
-            position: Geodetic::new(37.7749, -122.4194, 0.0),
-            label: "SF".to_string(),
-            color: Color::rgba(56, 189, 248, 255),
-        }],
         ..Default::default()
     }
 }
@@ -64,6 +60,14 @@ fn descriptor_round_trips_through_json() {
     let (mut source, _) = source();
     let input = input();
     let mut scene = EarthScene::new();
+    scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::terrain(37.7749, -122.4194, 5.0),
+            EarthGeometry::beacon_pin(20.0, 5.0),
+        )
+        .with_label("SF")
+        .with_material(EarthMaterial::standard(Color::rgba(56, 189, 248, 255))),
+    );
     scene.build(&input, &mut source);
 
     let descriptor = FrameDescriptor::capture(&scene, &input);
@@ -76,13 +80,15 @@ fn descriptor_round_trips_through_json() {
         "serialization must be canonical"
     );
 
-    // Core inputs survive the round trip, not just the JSON shape.
+    // Core inputs and geodetic world objects survive the round trip, not just the JSON shape.
     let rebuilt = parsed.earth_input();
     assert_eq!(rebuilt.camera.focus.lat_deg, input.camera.focus.lat_deg);
     assert_eq!(rebuilt.camera.eye_offset_m, input.camera.eye_offset_m);
     assert_eq!(rebuilt.layers, input.layers);
-    assert_eq!(rebuilt.markers.len(), 1);
-    assert_eq!(rebuilt.markers[0].label, "SF");
+    assert_eq!(parsed.objects.len(), 1);
+    assert_eq!(parsed.objects[0].label.as_deref(), Some("SF"));
+    assert_eq!(parsed.objects[0].altitude_mode, AltitudeMode::Terrain);
+    assert!((parsed.objects[0].position[2] - 5.0).abs() < 1e-6);
 }
 
 #[test]

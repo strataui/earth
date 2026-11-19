@@ -1,29 +1,59 @@
-//! Embeddable Strata `<EarthView>` UI component built on [`EarthViewport`] and [`EarthOrbitController`].
-//!
-//! Uses only standard Strata component APIs ([`Canvas3D`], [`Signal`], `ev.offset_x/y`,
-//! `ev.width/height`, `ev.button`, `ev.delta_y`, `ev.set_pointer_capture`, `ev.prevent_default`,
-//! and `ev.stop_propagation`) with zero global window event hooks, allowing drop-in placement inside
-//! any layout container of any size.
+//! Embeddable Strata `<EarthView>` UI component built on [`EarthViewport`], [`EarthWorld`],
+//! [`EarthOrbitController`], and first-class external interaction events.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use strata::platform::{KeyCode, PlatformEvent};
 use strata::prelude::*;
 use strata::render::scene3d::Canvas3D;
 use strata::FrameOutcome;
 
 use crate::controller::EarthOrbitController;
+use crate::events::{
+    parse_dom_key_to_keycode, EarthCameraState, EarthControlsConfig, EarthKeyEvent,
+    EarthModifiers, EarthMouseButton, EarthPointerEvent, EarthWheelEvent,
+};
 use crate::labels::{
     builtin_world_labels, project_earth_labels, EarthLabelIcon, EarthLabelKind, EarthMapLabel,
     EarthScreenProjector, LiveMapLabelStore, ProjectedEarthLabel,
 };
 use crate::plugins::{EarthPlugin, EarthPluginRegistry};
+use crate::raycast::EarthRayHit;
 use crate::scene::{EarthInput, EarthViewMode, OceanWavesConfig};
 use crate::tiles::TileSource;
 use crate::worker::EarthViewport;
+use crate::world::{EarthObject, EarthObjectId, EarthWorld, ResolvedObjectTransform};
+
+/// Maximum pointer excursion (in logical pixels) between press and release still classified as a click.
+pub const CLICK_MAX_TRAVEL_PX: f64 = 5.0;
+
+#[derive(Debug, Clone, Copy)]
+struct ActivePressCandidate {
+    button: EarthMouseButton,
+    start_x: f64,
+    start_y: f64,
+    max_travel_px: f64,
+    camera_active: bool,
+}
+
+#[derive(Default)]
+struct EarthEventListeners {
+    on_click: Option<Rc<dyn Fn(&EarthPointerEvent)>>,
+    on_double_click: Option<Rc<dyn Fn(&EarthPointerEvent)>>,
+    on_context_menu: Option<Rc<dyn Fn(&EarthPointerEvent)>>,
+    on_pointer_down: Option<Rc<dyn Fn(&EarthPointerEvent)>>,
+    on_pointer_move: Option<Rc<dyn Fn(&EarthPointerEvent)>>,
+    on_pointer_up: Option<Rc<dyn Fn(&EarthPointerEvent)>>,
+    on_wheel: Option<Rc<dyn Fn(&EarthWheelEvent)>>,
+    on_key_down: Option<Rc<dyn Fn(&EarthKeyEvent)>>,
+    on_key_up: Option<Rc<dyn Fn(&EarthKeyEvent)>>,
+    on_camera_change: Option<Rc<dyn Fn(&EarthCameraState)>>,
+}
 
 /// Context provided to UI [`EarthOverlayPlugin`] components rendered inside [`EarthView`].
 pub struct EarthOverlayContext<'a> {
@@ -68,6 +98,7 @@ pub trait EarthOverlayPlugin: 'static {
 pub struct EarthViewState {
     pub viewport: EarthViewport,
     pub orbit: EarthOrbitController,
+    pub controls: EarthControlsConfig,
     pub builtin_labels: Vec<EarthMapLabel>,
     pub live_labels: LiveMapLabelStore,
     pub is_grabbing: Signal<bool>,
@@ -82,6 +113,12 @@ pub struct EarthViewState {
     tile_ready: Arc<AtomicBool>,
     label_ready: Arc<AtomicBool>,
     uncapped: bool,
+    last_cursor_px: Option<(f64, f64)>,
+    press_candidate: Option<ActivePressCandidate>,
+    last_left_click: Option<(Instant, f64, f64)>,
+    live_modifiers: EarthModifiers,
+    held_keys: HashMap<KeyCode, Instant>,
+    last_emitted_cam: Option<EarthCameraState>,
 }
 
 impl EarthViewState {
@@ -125,13 +162,15 @@ impl EarthViewState {
         {
             effective_input.tile_grid = 17;
         }
-        let viewport = EarthViewport::with_plugins(&effective_input, source, Some(tile_wakeup), plugins);
+        let viewport =
+            EarthViewport::with_plugins(&effective_input, source, Some(tile_wakeup), plugins);
         let builtin_labels = builtin_world_labels();
         let live_labels = LiveMapLabelStore::new(Some(label_wakeup));
 
         let mut st = Self {
             viewport,
             orbit,
+            controls: EarthControlsConfig::default(),
             builtin_labels,
             live_labels,
             is_grabbing: Signal::new(false),
@@ -146,11 +185,34 @@ impl EarthViewState {
             tile_ready,
             label_ready,
             uncapped: false,
+            last_cursor_px: None,
+            press_candidate: None,
+            last_left_click: None,
+            live_modifiers: EarthModifiers::default(),
+            held_keys: HashMap::new(),
+            last_emitted_cam: None,
         };
         st.sync_camera();
         st.last_camera_sync = None;
         st.last_label_sig = st.label_state_signature();
         st
+    }
+
+    #[inline]
+    pub fn camera_state(&self) -> EarthCameraState {
+        EarthCameraState {
+            lat_deg: self.orbit.lat_deg,
+            lon_deg: self.orbit.lon_deg,
+            range_m: self.orbit.range_m,
+            heading_deg: self.orbit.heading_deg,
+            tilt_deg: self.orbit.tilt_deg,
+            view_mode: self.viewport.view_mode(),
+            zoom_2d: self.orbit.zoom_2d(),
+        }
+    }
+
+    fn update_modifier_from_dom_key(&mut self, dom_key: &str, pressed: bool) {
+        crate::events::update_modifiers_from_dom_key(&mut self.live_modifiers, dom_key, pressed);
     }
 
     /// Synchronizes `viewport` camera uniforms and worker LOD target from `orbit` with strict
@@ -340,11 +402,6 @@ impl EarthViewState {
 
     /// Advances smooth zoom/inertia damping, transitions, ocean/weather/satellite animations,
     /// and label/plugin overlay projection updates for one frame tick.
-    ///
-    /// Returns [`FrameOutcome::Dirty`] only when the 2D HUD / projected label overlay tree changed
-    /// and needs a DOM rebuild. Pure-3D updates (orbit damping, clouds, ocean waves, terrain tiles)
-    /// bump [`RetainedScene3D`] generations in place so Strata's `poll_retained_3d_dirty()`
-    /// presents them with zero 2D HUD rebuilds.
     pub fn step_frame(&mut self, dt_s: f64) -> FrameOutcome {
         let _tile_dirty = self.tile_ready.swap(false, Ordering::AcqRel);
         let label_dirty = self.label_ready.swap(false, Ordering::AcqRel);
@@ -400,6 +457,7 @@ impl EarthViewState {
 #[derive(Clone)]
 pub struct EarthView {
     state: Rc<RefCell<EarthViewState>>,
+    listeners: Rc<RefCell<EarthEventListeners>>,
 }
 
 impl EarthView {
@@ -416,6 +474,7 @@ impl EarthView {
     ) -> Self {
         Self {
             state: Rc::new(RefCell::new(EarthViewState::new(input, source, orbit))),
+            listeners: Rc::new(RefCell::new(EarthEventListeners::default())),
         }
     }
 
@@ -430,6 +489,7 @@ impl EarthView {
             state: Rc::new(RefCell::new(EarthViewState::new_with_plugins(
                 input, source, orbit, plugins,
             ))),
+            listeners: Rc::new(RefCell::new(EarthEventListeners::default())),
         }
     }
 
@@ -466,6 +526,288 @@ impl EarthView {
         self.state.borrow_mut().uncapped = uncapped;
         self
     }
+
+    /// Configures built-in mouse/wheel navigation permissions via builder style.
+    pub fn with_controls_config(self, config: EarthControlsConfig) -> Self {
+        self.set_controls_config(config);
+        self
+    }
+
+    pub fn set_controls_config(&self, config: EarthControlsConfig) {
+        self.state.borrow_mut().controls = config;
+    }
+
+    pub fn controls_config(&self) -> EarthControlsConfig {
+        self.state.borrow().controls
+    }
+
+    // -------------------------------------------------------------------------
+    // External Event Listeners (Builder & Runtime)
+    // -------------------------------------------------------------------------
+
+    /// Registers a primary-button click listener. Fires strictly on mouse release when
+    /// press-to-release pointer travel `<= 5.0 px`, so orbiting or panning never triggers false clicks.
+    pub fn on_click(&self, handler: impl Fn(&EarthPointerEvent) + 'static) {
+        self.listeners.borrow_mut().on_click = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_click(self, handler: impl Fn(&EarthPointerEvent) + 'static) -> Self {
+        self.on_click(handler);
+        self
+    }
+
+    /// Registers a primary-button double-click listener.
+    pub fn on_double_click(&self, handler: impl Fn(&EarthPointerEvent) + 'static) {
+        self.listeners.borrow_mut().on_double_click = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_double_click(self, handler: impl Fn(&EarthPointerEvent) + 'static) -> Self {
+        self.on_double_click(handler);
+        self
+    }
+
+    /// Registers a secondary-button (right-click) listener (`<= 5.0 px` travel).
+    pub fn on_context_menu(&self, handler: impl Fn(&EarthPointerEvent) + 'static) {
+        self.listeners.borrow_mut().on_context_menu = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_context_menu(self, handler: impl Fn(&EarthPointerEvent) + 'static) -> Self {
+        self.on_context_menu(handler);
+        self
+    }
+
+    pub fn on_pointer_down(&self, handler: impl Fn(&EarthPointerEvent) + 'static) {
+        self.listeners.borrow_mut().on_pointer_down = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_pointer_down(self, handler: impl Fn(&EarthPointerEvent) + 'static) -> Self {
+        self.on_pointer_down(handler);
+        self
+    }
+
+    pub fn on_pointer_move(&self, handler: impl Fn(&EarthPointerEvent) + 'static) {
+        self.listeners.borrow_mut().on_pointer_move = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_pointer_move(self, handler: impl Fn(&EarthPointerEvent) + 'static) -> Self {
+        self.on_pointer_move(handler);
+        self
+    }
+
+    pub fn on_pointer_up(&self, handler: impl Fn(&EarthPointerEvent) + 'static) {
+        self.listeners.borrow_mut().on_pointer_up = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_pointer_up(self, handler: impl Fn(&EarthPointerEvent) + 'static) -> Self {
+        self.on_pointer_up(handler);
+        self
+    }
+
+    pub fn on_wheel(&self, handler: impl Fn(&EarthWheelEvent) + 'static) {
+        self.listeners.borrow_mut().on_wheel = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_wheel(self, handler: impl Fn(&EarthWheelEvent) + 'static) -> Self {
+        self.on_wheel(handler);
+        self
+    }
+
+    pub fn on_key_down(&self, handler: impl Fn(&EarthKeyEvent) + 'static) {
+        self.listeners.borrow_mut().on_key_down = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_key_down(self, handler: impl Fn(&EarthKeyEvent) + 'static) -> Self {
+        self.on_key_down(handler);
+        self
+    }
+
+    pub fn on_key_up(&self, handler: impl Fn(&EarthKeyEvent) + 'static) {
+        self.listeners.borrow_mut().on_key_up = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_key_up(self, handler: impl Fn(&EarthKeyEvent) + 'static) -> Self {
+        self.on_key_up(handler);
+        self
+    }
+
+    pub fn on_camera_change(&self, handler: impl Fn(&EarthCameraState) + 'static) {
+        self.listeners.borrow_mut().on_camera_change = Some(Rc::new(handler));
+    }
+
+    pub fn with_on_camera_change(self, handler: impl Fn(&EarthCameraState) + 'static) -> Self {
+        self.on_camera_change(handler);
+        self
+    }
+
+    /// Forwards a window-level [`PlatformEvent`] (such as `KeyDown`, `KeyUp`, or `WindowFocused(false)`)
+    /// into [`EarthView`]'s external key listeners and live modifier tracker when no text input is focused.
+    ///
+    /// Automatically deduplicates against DOM `onkeydown`/`onkeyup` and synthesizes clean `on_key_up`
+    /// releases for any held keys if the window loses focus (`WindowFocused(false)`).
+    pub fn dispatch_platform_event(&self, event: &PlatformEvent) {
+        match event {
+            PlatformEvent::KeyDown { key, modifiers } => {
+                let now = Instant::now();
+                let mods = EarthModifiers::from_platform(*modifiers);
+                let (skip_dup, repeat) = {
+                    let mut st = self.state.borrow_mut();
+                    st.live_modifiers = mods;
+                    if *key == KeyCode::Unknown {
+                        (false, false)
+                    } else {
+                        match st.held_keys.get(key).copied() {
+                            Some(prev) if now.duration_since(prev) < Duration::from_millis(8) => {
+                                (true, false)
+                            }
+                            Some(_) => {
+                                st.held_keys.insert(*key, now);
+                                (false, true)
+                            }
+                            None => {
+                                st.held_keys.insert(*key, now);
+                                (false, false)
+                            }
+                        }
+                    }
+                };
+                if !skip_dup {
+                    let cb = self.listeners.borrow().on_key_down.clone();
+                    if let Some(cb) = cb {
+                        let ev = EarthKeyEvent::new(*key, format!("{key:?}"), mods, repeat);
+                        cb(&ev);
+                    }
+                }
+            }
+            PlatformEvent::KeyUp { key, modifiers } => {
+                let mods = EarthModifiers::from_platform(*modifiers);
+                let was_held = {
+                    let mut st = self.state.borrow_mut();
+                    st.live_modifiers = mods;
+                    if *key == KeyCode::Unknown {
+                        true
+                    } else {
+                        st.held_keys.remove(key).is_some()
+                    }
+                };
+                if was_held {
+                    let cb = self.listeners.borrow().on_key_up.clone();
+                    if let Some(cb) = cb {
+                        let ev = EarthKeyEvent::new(*key, format!("{key:?}"), mods, false);
+                        cb(&ev);
+                    }
+                }
+            }
+            PlatformEvent::WindowFocused(false) => {
+                let released: Vec<KeyCode> = {
+                    let mut st = self.state.borrow_mut();
+                    st.live_modifiers = EarthModifiers::default();
+                    st.held_keys.drain().map(|(k, _)| k).collect()
+                };
+                if !released.is_empty() {
+                    let cb = self.listeners.borrow().on_key_up.clone();
+                    if let Some(cb) = cb {
+                        for key in released {
+                            let ev = EarthKeyEvent::new(
+                                key,
+                                format!("{key:?}"),
+                                EarthModifiers::default(),
+                                false,
+                            );
+                            cb(&ev);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_camera_change_if_needed(&self) {
+        let cb = self.listeners.borrow().on_camera_change.clone();
+        let Some(cb) = cb else {
+            return;
+        };
+        let state_opt = {
+            let mut st = self.state.borrow_mut();
+            let cur = st.camera_state();
+            if st.last_emitted_cam == Some(cur) {
+                None
+            } else {
+                st.last_emitted_cam = Some(cur);
+                Some(cur)
+            }
+        };
+        if let Some(cam) = state_opt {
+            cb(&cam);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Native Geodetic World & Terrain/Object Raycasting APIs
+    // -------------------------------------------------------------------------
+
+    /// Raycasts component-local pixel `(x, y)` against pickable [`EarthWorld`] 3D objects and
+    /// the planetary surface (terrain heightmap when `elevation_enabled`, sea level when off).
+    pub fn raycast(&self, x: f64, y: f64) -> Option<EarthRayHit> {
+        self.state.borrow().viewport.raycast(x, y)
+    }
+
+    /// Raycasts component-local pixel `(x, y)` strictly against the planetary surface.
+    pub fn raycast_terrain(&self, x: f64, y: f64) -> Option<EarthRayHit> {
+        self.state.borrow().viewport.raycast_terrain(x, y)
+    }
+
+    /// Borrows the geodetic [`EarthWorld`] read-only.
+    pub fn world<R>(&self, f: impl FnOnce(&EarthWorld) -> R) -> R {
+        self.state.borrow().viewport.world(f)
+    }
+
+    /// Mutates the geodetic [`EarthWorld`] and immediately publishes updated GPU instances.
+    pub fn world_mut<R>(&self, f: impl FnOnce(&mut EarthWorld) -> R) -> R {
+        self.state.borrow_mut().viewport.world_mut(f)
+    }
+
+    /// Spawns a geodetic [`EarthObject`] into the world and returns its [`EarthObjectId`].
+    pub fn spawn_object(&self, object: EarthObject) -> EarthObjectId {
+        self.state.borrow_mut().viewport.spawn_object(object)
+    }
+
+    /// Removes an [`EarthObject`] by ID, returning `true` if it existed.
+    pub fn remove_object(&self, id: EarthObjectId) -> bool {
+        self.state.borrow_mut().viewport.remove_object(id)
+    }
+
+    /// Removes all [`EarthObject`]s from the world.
+    pub fn clear_objects(&self) {
+        self.state.borrow_mut().viewport.clear_objects();
+    }
+
+    /// Returns the number of [`EarthObject`]s currently in the world.
+    pub fn object_count(&self) -> usize {
+        self.world(|w| w.len())
+    }
+
+    /// Evaluates the live world transform (including resolved `Terrain` vs `SeaLevel` altitude)
+    /// for `id` under the current heightmap and view-morph state.
+    pub fn resolve_object_transform(&self, id: EarthObjectId) -> Option<ResolvedObjectTransform> {
+        self.state.borrow().viewport.resolve_object_transform(id)
+    }
+
+    /// Enables or disables heightmap (DEM) relief and immediately updates all
+    /// [`crate::geodesy::AltitudeMode::Terrain`] objects (`DEM + alt` when `true`, `0.0 + alt` when `false`).
+    pub fn set_elevation_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_elevation_enabled(enabled);
+        st.sync_camera();
+    }
+
+    pub fn elevation_enabled(&self) -> bool {
+        self.state.borrow().viewport.elevation_enabled()
+    }
+
+    // -------------------------------------------------------------------------
+    // Plugin & Camera Control APIs
+    // -------------------------------------------------------------------------
 
     /// Registers (or replaces) a world-pipeline [`EarthPlugin`] on this component.
     pub fn register_plugin<P: EarthPlugin>(&self, plugin: P) {
@@ -529,16 +871,326 @@ impl EarthView {
     /// or the equivalent 2D zoom value in 2D map mode).
     pub fn fly_to(&self, lat_deg: f64, lon_deg: f64, altitude_m: Option<f64>) {
         self.state.borrow_mut().fly_to(lat_deg, lon_deg, altitude_m);
+        self.emit_camera_change_if_needed();
+    }
+
+    /// Immediately jumps camera focus, range, heading, and pitch.
+    pub fn jump_to(
+        &self,
+        lat_deg: f64,
+        lon_deg: f64,
+        range_m: f64,
+        heading_deg: f64,
+        tilt_deg: f64,
+    ) {
+        self.state
+            .borrow_mut()
+            .jump_to(lat_deg, lon_deg, range_m, heading_deg, tilt_deg);
+        self.emit_camera_change_if_needed();
+    }
+
+    /// Applies a smooth exponential natural-log zoom step (`delta_ln < 0.0` zooms in;
+    /// `delta_ln > 0.0` zooms out).
+    pub fn zoom_by_ln(&self, delta_ln: f64) {
+        self.state.borrow_mut().orbit.zoom_by_ln(delta_ln);
+    }
+
+    /// Applies a smooth exponential natural-log zoom step anchored toward component pixel `(x, y)`.
+    pub fn zoom_at_screen_px(&self, delta_ln: f64, x: f64, y: f64) {
+        self.state
+            .borrow_mut()
+            .orbit
+            .zoom_at_screen_px(delta_ln, x, y);
+    }
+
+    pub fn pan_by_deg(&self, d_lat_deg: f64, d_lon_deg: f64) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.orbit.pan_by_deg(d_lat_deg, d_lon_deg);
+            st.sync_camera();
+        }
+        self.emit_camera_change_if_needed();
+    }
+
+    pub fn orbit_by_deg(&self, d_heading_deg: f64, d_tilt_deg: f64) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.orbit.orbit_by_deg(d_heading_deg, d_tilt_deg);
+            st.sync_camera();
+        }
+        self.emit_camera_change_if_needed();
     }
 
     /// Advances smooth damping, transitions, weather, ocean waves, and label updates by `dt_s` seconds.
     pub fn step_frame(&self, dt_s: f64) -> FrameOutcome {
-        self.state.borrow_mut().step_frame(dt_s)
+        let outcome = self.state.borrow_mut().step_frame(dt_s);
+        self.emit_camera_change_if_needed();
+        outcome
+    }
+
+    /// Dispatches a component-local pointer press (`(x, y)` in logical viewport pixels) through
+    /// [`Self::on_pointer_down`], click-travel tracking, and built-in camera pan/orbit controls.
+    pub fn dispatch_pointer_down(
+        &self,
+        button: EarthMouseButton,
+        x: f64,
+        y: f64,
+        dom_mods: EarthModifiers,
+    ) {
+        let (vw, vh, dx, dy, mods) = {
+            let mut st = self.state.borrow_mut();
+            let (dx, dy) = st
+                .last_cursor_px
+                .map(|(lx, ly)| (x - lx, y - ly))
+                .unwrap_or((0.0, 0.0));
+            st.last_cursor_px = Some((x, y));
+            let mods = st.live_modifiers.merge(dom_mods);
+            st.press_candidate = Some(ActivePressCandidate {
+                button,
+                start_x: x,
+                start_y: y,
+                max_travel_px: 0.0,
+                camera_active: false,
+            });
+            (st.orbit.viewport_w, st.orbit.viewport_h, dx, dy, mods)
+        };
+
+        let ptr_ev = EarthPointerEvent::new(x, y, dx, dy, vw, vh, button, mods);
+        let cb_down = self.listeners.borrow().on_pointer_down.clone();
+        if let Some(cb) = cb_down {
+            cb(&ptr_ev);
+        }
+
+        if !ptr_ev.is_default_camera_prevented() {
+            let cam_changed = {
+                let mut st = self.state.borrow_mut();
+                let allowed = match button {
+                    EarthMouseButton::Left => st.controls.pan_enabled,
+                    EarthMouseButton::Middle | EarthMouseButton::Right => st.controls.orbit_enabled,
+                    EarthMouseButton::Other(_) => false,
+                };
+                if allowed {
+                    let btn_idx = button.controller_button_index();
+                    if st.orbit.handle_mouse_down(btn_idx, x, y) {
+                        st.sync_camera();
+                        if let Some(ref mut cand) = st.press_candidate {
+                            cand.camera_active = true;
+                        }
+                        if !st.is_grabbing.untracked_get() {
+                            st.is_grabbing.set(true);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if cam_changed {
+                self.emit_camera_change_if_needed();
+            }
+        }
+    }
+
+    /// Dispatches a component-local pointer move (`(x, y)` in logical viewport pixels) through
+    /// [`Self::on_pointer_move`], click-travel tracking, and built-in camera drag controls.
+    pub fn dispatch_pointer_move(&self, x: f64, y: f64, dom_mods: EarthModifiers) {
+        let (vw, vh, dx, dy, button, mods) = {
+            let mut st = self.state.borrow_mut();
+            let (dx, dy) = st
+                .last_cursor_px
+                .map(|(lx, ly)| (x - lx, y - ly))
+                .unwrap_or((0.0, 0.0));
+            st.last_cursor_px = Some((x, y));
+            let btn = if let Some(ref mut cand) = st.press_candidate {
+                let dist = (x - cand.start_x).hypot(y - cand.start_y);
+                cand.max_travel_px = cand.max_travel_px.max(dist);
+                cand.button
+            } else {
+                EarthMouseButton::Left
+            };
+            (
+                st.orbit.viewport_w,
+                st.orbit.viewport_h,
+                dx,
+                dy,
+                btn,
+                st.live_modifiers.merge(dom_mods),
+            )
+        };
+
+        let ptr_ev = EarthPointerEvent::new(x, y, dx, dy, vw, vh, button, mods);
+        let cb_move = self.listeners.borrow().on_pointer_move.clone();
+        if let Some(cb) = cb_move {
+            cb(&ptr_ev);
+        }
+
+        if !ptr_ev.is_default_camera_prevented() {
+            let cam_changed = {
+                let mut st = self.state.borrow_mut();
+                if st.orbit.handle_mouse_move(x, y) {
+                    st.sync_camera_throttled();
+                    true
+                } else {
+                    false
+                }
+            };
+            if cam_changed {
+                self.emit_camera_change_if_needed();
+            }
+        }
+    }
+
+    /// Dispatches a component-local pointer release (`(x, y)` in logical viewport pixels) through
+    /// camera release momentum, [`Self::on_pointer_up`], and travel-discriminated [`Self::on_click`],
+    /// [`Self::on_double_click`], and [`Self::on_context_menu`].
+    pub fn dispatch_pointer_up(
+        &self,
+        button: EarthMouseButton,
+        x: f64,
+        y: f64,
+        dom_mods: EarthModifiers,
+    ) {
+        let now = Instant::now();
+        let (vw, vh, dx, dy, mods, is_clean_click, is_double_click, dbl_zoom_enabled, cam_changed) =
+            {
+                let mut st = self.state.borrow_mut();
+                let (dx, dy) = st
+                    .last_cursor_px
+                    .map(|(lx, ly)| (x - lx, y - ly))
+                    .unwrap_or((0.0, 0.0));
+                st.last_cursor_px = Some((x, y));
+                let mods = st.live_modifiers.merge(dom_mods);
+
+                let btn_idx = button.controller_button_index();
+                let cam_changed = if st.orbit.handle_mouse_up(btn_idx) {
+                    st.sync_camera();
+                    true
+                } else {
+                    false
+                };
+                if st.is_grabbing.untracked_get() {
+                    st.is_grabbing.set(false);
+                }
+
+                let mut clean_click = false;
+                if let Some(cand) = st.press_candidate.take() {
+                    let end_dist = (x - cand.start_x).hypot(y - cand.start_y);
+                    let travel = cand.max_travel_px.max(end_dist);
+                    if cand.button == button && travel <= CLICK_MAX_TRAVEL_PX {
+                        clean_click = true;
+                    }
+                }
+
+                let mut dbl_click = false;
+                if clean_click && button == EarthMouseButton::Left {
+                    if let Some((prev_t, px, py)) = st.last_left_click {
+                        if now.duration_since(prev_t) <= Duration::from_millis(320)
+                            && (x - px).hypot(y - py) <= 6.0
+                        {
+                            dbl_click = true;
+                            st.last_left_click = None;
+                        } else {
+                            st.last_left_click = Some((now, x, y));
+                        }
+                    } else {
+                        st.last_left_click = Some((now, x, y));
+                    }
+                }
+
+                (
+                    st.orbit.viewport_w,
+                    st.orbit.viewport_h,
+                    dx,
+                    dy,
+                    mods,
+                    clean_click,
+                    dbl_click,
+                    st.controls.double_click_zoom_enabled && st.controls.zoom_enabled,
+                    cam_changed,
+                )
+            };
+
+        if cam_changed {
+            self.emit_camera_change_if_needed();
+        }
+
+        let ptr_ev = EarthPointerEvent::new(x, y, dx, dy, vw, vh, button, mods);
+        let cb_up = self.listeners.borrow().on_pointer_up.clone();
+        if let Some(cb) = cb_up {
+            cb(&ptr_ev);
+        }
+
+        if is_clean_click {
+            match button {
+                EarthMouseButton::Left => {
+                    let cb_click = self.listeners.borrow().on_click.clone();
+                    if let Some(cb) = cb_click {
+                        let click_ev = EarthPointerEvent::new(x, y, 0.0, 0.0, vw, vh, button, mods);
+                        cb(&click_ev);
+                    }
+                    if is_double_click {
+                        let dbl_ev = EarthPointerEvent::new(x, y, 0.0, 0.0, vw, vh, button, mods);
+                        let cb_dbl = self.listeners.borrow().on_double_click.clone();
+                        if let Some(cb) = cb_dbl {
+                            cb(&dbl_ev);
+                        }
+                        if dbl_zoom_enabled && !dbl_ev.is_default_camera_prevented() {
+                            self.zoom_at_screen_px(-std::f64::consts::LN_2, x, y);
+                        }
+                    }
+                }
+                EarthMouseButton::Right => {
+                    let cb_ctx = self.listeners.borrow().on_context_menu.clone();
+                    if let Some(cb) = cb_ctx {
+                        let ctx_ev = EarthPointerEvent::new(x, y, 0.0, 0.0, vw, vh, button, mods);
+                        cb(&ctx_ev);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Dispatches a component-local scroll-wheel tick through [`Self::on_wheel`] and built-in zoom.
+    pub fn dispatch_wheel(
+        &self,
+        delta_x: f64,
+        delta_y: f64,
+        x: f64,
+        y: f64,
+        dom_mods: EarthModifiers,
+    ) {
+        let (vw, vh, mods, zoom_enabled) = {
+            let st = self.state.borrow();
+            (
+                st.orbit.viewport_w,
+                st.orbit.viewport_h,
+                st.live_modifiers.merge(dom_mods),
+                st.controls.zoom_enabled,
+            )
+        };
+
+        let wheel_ev = EarthWheelEvent::new(x, y, delta_x, delta_y, vw, vh, mods);
+        let cb_wheel = self.listeners.borrow().on_wheel.clone();
+        if let Some(cb) = cb_wheel {
+            cb(&wheel_ev);
+        }
+
+        if zoom_enabled && !wheel_ev.is_default_camera_prevented() {
+            {
+                let mut st = self.state.borrow_mut();
+                st.orbit.handle_scroll(delta_y, x, y);
+                st.sync_camera_throttled();
+            }
+            self.emit_camera_change_if_needed();
+        }
     }
 
     /// Returns a self-contained Strata [`View`] (`w-full h-full overflow-hidden`) binding all
-    /// pointer drag, right/middle orbit, scroll wheel, pointer capture, and reactive cursor states
-    /// directly via Strata's `<Canvas3D>` component APIs.
+    /// pointer drag, right/middle orbit, scroll wheel, click discrimination, keyboard hooks,
+    /// pointer capture, and reactive cursor states directly via Strata's component APIs.
     pub fn view(&self) -> View {
         let (retained, grabbing, labels, plugin_overlays, uncapped) = {
             let st = self.state.borrow();
@@ -559,11 +1211,13 @@ impl EarthView {
             "absolute inset-0 w-full h-full z-0 cursor-grab"
         };
 
-        let st_down = Rc::clone(&self.state);
-        let st_move = Rc::clone(&self.state);
-        let st_up = Rc::clone(&self.state);
-        let st_wheel = Rc::clone(&self.state);
-        let st_resize = Rc::clone(&self.state);
+        let self_down = self.clone();
+        let self_move = self.clone();
+        let self_up = self.clone();
+        let self_wheel = self.clone();
+        let self_resize = self.clone();
+        let self_key_down = self.clone();
+        let self_key_up = self.clone();
 
         let canvas = Canvas3D::builder()
             .retained(retained)
@@ -571,12 +1225,20 @@ impl EarthView {
             .class(cursor_cls)
             .onresize(move |ev: strata_dom::Event| {
                 if ev.width > 0.0 && ev.height > 0.0 {
-                    let mut st = st_resize.borrow_mut();
-                    if (st.orbit.viewport_w - ev.width).abs() > 0.25
-                        || (st.orbit.viewport_h - ev.height).abs() > 0.25
-                    {
-                        st.orbit.set_viewport_size(ev.width, ev.height);
-                        st.sync_camera();
+                    let changed = {
+                        let mut st = self_resize.state.borrow_mut();
+                        if (st.orbit.viewport_w - ev.width).abs() > 0.25
+                            || (st.orbit.viewport_h - ev.height).abs() > 0.25
+                        {
+                            st.orbit.set_viewport_size(ev.width, ev.height);
+                            st.sync_camera();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        self_resize.emit_camera_change_if_needed();
                     }
                 }
             })
@@ -584,55 +1246,168 @@ impl EarthView {
                 ev.stop_propagation();
                 ev.prevent_default();
                 ev.set_pointer_capture(ev.pointer_id);
-                let mut st = st_down.borrow_mut();
-                st.orbit.set_viewport_size(ev.width, ev.height);
-                let btn = ev.button.max(0) as u32;
-                if st.orbit.handle_mouse_down(btn, ev.offset_x, ev.offset_y) {
-                    st.sync_camera();
-                    if !st.is_grabbing.untracked_get() {
-                        st.is_grabbing.set(true);
-                    }
-                }
+                self_down
+                    .state
+                    .borrow_mut()
+                    .orbit
+                    .set_viewport_size(ev.width, ev.height);
+                self_down.dispatch_pointer_down(
+                    EarthMouseButton::from_dom_button(ev.button),
+                    ev.offset_x,
+                    ev.offset_y,
+                    EarthModifiers {
+                        shift: ev.shift_key,
+                        ctrl: ev.ctrl_key,
+                        alt: ev.alt_key,
+                        meta: ev.meta_key,
+                    },
+                );
             })
             .onmousemove(move |ev: strata_dom::Event| {
                 ev.stop_propagation();
-                let mut st = st_move.borrow_mut();
-                st.orbit.set_viewport_size(ev.width, ev.height);
-                if st.orbit.handle_mouse_move(ev.offset_x, ev.offset_y) {
-                    st.sync_camera_throttled();
-                }
+                self_move
+                    .state
+                    .borrow_mut()
+                    .orbit
+                    .set_viewport_size(ev.width, ev.height);
+                self_move.dispatch_pointer_move(
+                    ev.offset_x,
+                    ev.offset_y,
+                    EarthModifiers {
+                        shift: ev.shift_key,
+                        ctrl: ev.ctrl_key,
+                        alt: ev.alt_key,
+                        meta: ev.meta_key,
+                    },
+                );
             })
             .onmouseup(move |ev: strata_dom::Event| {
                 ev.stop_propagation();
                 ev.release_pointer_capture(ev.pointer_id);
-                let mut st = st_up.borrow_mut();
-                st.orbit.set_viewport_size(ev.width, ev.height);
-                let btn = ev.button.max(0) as u32;
-                if st.orbit.handle_mouse_up(btn) {
-                    st.sync_camera();
-                }
-                if st.is_grabbing.untracked_get() {
-                    st.is_grabbing.set(false);
-                }
+                self_up
+                    .state
+                    .borrow_mut()
+                    .orbit
+                    .set_viewport_size(ev.width, ev.height);
+                self_up.dispatch_pointer_up(
+                    EarthMouseButton::from_dom_button(ev.button),
+                    ev.offset_x,
+                    ev.offset_y,
+                    EarthModifiers {
+                        shift: ev.shift_key,
+                        ctrl: ev.ctrl_key,
+                        alt: ev.alt_key,
+                        meta: ev.meta_key,
+                    },
+                );
             })
             .onwheel(move |ev: strata_dom::Event| {
                 ev.stop_propagation();
                 ev.prevent_default();
-                let mut st = st_wheel.borrow_mut();
-                st.orbit.set_viewport_size(ev.width, ev.height);
-                st.orbit
-                    .handle_scroll(ev.delta_y, ev.offset_x, ev.offset_y);
-                st.sync_camera_throttled();
+                self_wheel
+                    .state
+                    .borrow_mut()
+                    .orbit
+                    .set_viewport_size(ev.width, ev.height);
+                self_wheel.dispatch_wheel(
+                    ev.delta_x,
+                    ev.delta_y,
+                    ev.offset_x,
+                    ev.offset_y,
+                    EarthModifiers {
+                        shift: ev.shift_key,
+                        ctrl: ev.ctrl_key,
+                        alt: ev.alt_key,
+                        meta: ev.meta_key,
+                    },
+                );
             })
             .build();
 
-        let label_nodes: Vec<strata_dom::NodeBlueprint> =
-            labels.iter().map(|lbl| render_earth_label(lbl).into_node_blueprint()).collect();
+        let label_nodes: Vec<strata_dom::NodeBlueprint> = labels
+            .iter()
+            .map(|lbl| render_earth_label(lbl).into_node_blueprint())
+            .collect();
         let labels_fragment = strata_dom::NodeBlueprint::fragment(label_nodes);
         let plugins_fragment = strata_dom::NodeBlueprint::fragment(plugin_overlays);
 
         rsx! {
-            <div class="relative w-full h-full bg-black overflow-hidden">
+            <div
+                tabindex="0"
+                class="relative w-full h-full bg-black overflow-hidden outline-none"
+                onkeydown={move |ev: strata_dom::Event| {
+                    let key = parse_dom_key_to_keycode(&ev.key);
+                    let dom_mods = EarthModifiers {
+                        shift: ev.shift_key,
+                        ctrl: ev.ctrl_key,
+                        alt: ev.alt_key,
+                        meta: ev.meta_key,
+                    };
+                    let now = Instant::now();
+                    let (skip_dup, repeat, mods) = {
+                        let mut st = self_key_down.state.borrow_mut();
+                        st.live_modifiers = st.live_modifiers.merge(dom_mods);
+                        st.update_modifier_from_dom_key(&ev.key, true);
+                        let mods = st.live_modifiers;
+                        if key == KeyCode::Unknown {
+                            (false, ev.repeat, mods)
+                        } else {
+                            match st.held_keys.get(&key).copied() {
+                                Some(prev) if now.duration_since(prev) < Duration::from_millis(8) => (true, false, mods),
+                                Some(_) => {
+                                    st.held_keys.insert(key, now);
+                                    (false, true, mods)
+                                }
+                                None => {
+                                    st.held_keys.insert(key, now);
+                                    (false, ev.repeat, mods)
+                                }
+                            }
+                        }
+                    };
+                    if !skip_dup {
+                        let cb = self_key_down.listeners.borrow().on_key_down.clone();
+                        if let Some(cb) = cb {
+                            let kev = EarthKeyEvent::new(key, ev.key.clone(), mods, repeat);
+                            cb(&kev);
+                            if kev.is_default_prevented() {
+                                ev.prevent_default();
+                            }
+                        }
+                    }
+                }}
+                onkeyup={move |ev: strata_dom::Event| {
+                    let key = parse_dom_key_to_keycode(&ev.key);
+                    let dom_mods = EarthModifiers {
+                        shift: ev.shift_key,
+                        ctrl: ev.ctrl_key,
+                        alt: ev.alt_key,
+                        meta: ev.meta_key,
+                    };
+                    let (was_held, mods) = {
+                        let mut st = self_key_up.state.borrow_mut();
+                        st.live_modifiers = dom_mods;
+                        st.update_modifier_from_dom_key(&ev.key, false);
+                        let mods = st.live_modifiers;
+                        let held = if key == KeyCode::Unknown {
+                            true
+                        } else {
+                            st.held_keys.remove(&key).is_some()
+                        };
+                        (held, mods)
+                    };
+                    if was_held {
+                        let cb = self_key_up.listeners.borrow().on_key_up.clone();
+                        if let Some(cb) = cb {
+                            let kev = EarthKeyEvent::new(key, ev.key.clone(), mods, false);
+                            cb(&kev);
+                            if kev.is_default_prevented() {
+                                ev.prevent_default();
+                            }
+                        }
+                    }
+                }}
+            >
                 {canvas}
                 <div class="absolute inset-0 z-10 pointer-events-none overflow-hidden">
                     {labels_fragment}

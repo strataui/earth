@@ -639,6 +639,88 @@ pub fn compute_seamless_25d_blend(altitude_m: f64) -> f32 {
     (u * u * (3.0 - 2.0 * u)) as f32
 }
 
+/// Altitude reference frame for geodetic objects in [`crate::world::EarthWorld`].
+///
+/// Stored live on each [`GeoPosition`] (never eagerly baked into absolute altitude) so toggling
+/// terrain elevation dynamically transitions [`AltitudeMode::Terrain`] objects between ground-relative
+/// and sea-level-relative height without mutating user positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AltitudeMode {
+    /// Metres relative to the WGS84 sea-level surface (`0.0 m`). Independent of heightmap state.
+    SeaLevel,
+    /// Metres relative to active ground (`sampled_dem + altitude_m` when heightmap is enabled;
+    /// `0.0 + altitude_m` when heightmap is disabled).
+    #[default]
+    Terrain,
+}
+
+/// Native geodetic 3D coordinate in `strata_earth` (`f64` degrees and metres).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GeoPosition {
+    pub lat_deg: f64,
+    pub lon_deg: f64,
+    pub altitude_m: f64,
+    pub altitude_mode: AltitudeMode,
+}
+
+impl Default for GeoPosition {
+    fn default() -> Self {
+        Self {
+            lat_deg: 0.0,
+            lon_deg: 0.0,
+            altitude_m: 0.0,
+            altitude_mode: AltitudeMode::Terrain,
+        }
+    }
+}
+
+impl GeoPosition {
+    /// Creates a geodetic coordinate with an explicit [`AltitudeMode`].
+    #[inline]
+    pub const fn new(
+        lat_deg: f64,
+        lon_deg: f64,
+        altitude_m: f64,
+        altitude_mode: AltitudeMode,
+    ) -> Self {
+        Self {
+            lat_deg,
+            lon_deg,
+            altitude_m,
+            altitude_mode,
+        }
+    }
+
+    /// Creates a terrain-relative coordinate (`altitude_m` above ground when heightmap is on,
+    /// or `altitude_m` above sea level when heightmap is off).
+    #[inline]
+    pub const fn terrain(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> Self {
+        Self::new(lat_deg, lon_deg, altitude_m, AltitudeMode::Terrain)
+    }
+
+    /// Creates a sea-level-relative coordinate (`altitude_m` relative to `0.0 m` WGS84 ellipsoid).
+    #[inline]
+    pub const fn sea_level(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> Self {
+        Self::new(lat_deg, lon_deg, altitude_m, AltitudeMode::SeaLevel)
+    }
+
+    /// Evaluates the live world height above the WGS84 ellipsoid given heightmap state and DEM sample.
+    #[inline]
+    pub fn resolve_height_m(&self, elevation_enabled: bool, sampled_terrain_m: f64) -> f64 {
+        let base_m = match self.altitude_mode {
+            AltitudeMode::SeaLevel => 0.0,
+            AltitudeMode::Terrain => {
+                if elevation_enabled {
+                    sampled_terrain_m
+                } else {
+                    0.0
+                }
+            }
+        };
+        base_m + self.altitude_m
+    }
+}
+
 /// Parameters controlling continuous vertex morphing across 3D globe, local 2.5D ground plane,
 /// and flattened 2D map projection.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -660,6 +742,153 @@ impl Default for SurfaceMorphParams {
             projection: TileProjection::WebMercator,
         }
     }
+}
+
+/// Computes the canonical quantized [`SurfaceMorphParams`] shared identically across terrain tile
+/// mesh generation, [`crate::world::EarthWorld`] 3D object placement, and world raycasting.
+#[inline]
+pub fn stabilized_surface_morph(
+    focus: Geodetic,
+    flat_blend: f64,
+    map_2d_morph: f64,
+    projection: TileProjection,
+) -> SurfaceMorphParams {
+    let anchor = if flat_blend >= 0.99 && map_2d_morph <= 1e-4 {
+        Geodetic::new(
+            (focus.lat_deg * 50.0).round() / 50.0,
+            (focus.lon_deg * 50.0).round() / 50.0,
+            0.0,
+        )
+    } else if flat_blend > 1e-6 {
+        Geodetic::new(
+            (focus.lat_deg * 200.0).round() / 200.0,
+            (focus.lon_deg * 200.0).round() / 200.0,
+            0.0,
+        )
+    } else {
+        focus
+    };
+    SurfaceMorphParams {
+        focus: anchor,
+        flat_blend,
+        map_2d_morph,
+        projection,
+    }
+}
+
+/// Projects `(lat_deg, lon_deg, height_m)` into world ECEF/morphed coordinates and computes the
+/// matching orthonormal local East-North-Up basis under `morph`.
+///
+/// Matches [`build_tile_local_rtc_mesh_morphed`] identically across 3D globe, 2.5D tangent plane,
+/// and 2D flat map views so 3D objects sit flush on terrain with zero drift.
+#[inline]
+pub fn project_morphed_point_and_frame(
+    lat_deg: f64,
+    lon_deg: f64,
+    height_m: f64,
+    morph: SurfaceMorphParams,
+) -> (DVec3, LocalFrame) {
+    let flat_t = morph.flat_blend.clamp(0.0, 1.0);
+    let map_2d = morph.map_2d_morph.clamp(0.0, 1.0);
+    let curved_frame = LocalFrame::at(lat_deg, lon_deg);
+    let p_curved = geodetic_to_ecef(Geodetic::new(lat_deg, lon_deg, height_m));
+    if flat_t <= 1e-6 {
+        return (p_curved, curved_frame);
+    }
+
+    let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
+    let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
+    let focus_ecef = geodetic_to_ecef(focus_surface);
+    let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
+    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+
+    let dlon_deg = wrap_longitude(lon_deg - morph.focus.lon_deg);
+    let dlat_deg = lat_deg - morph.focus.lat_deg;
+    let east_m = dlon_deg.to_radians() * wgs84::A * cos_scale;
+    let north_m = dlat_deg.to_radians() * wgs84::A;
+    let up_h = height_m * (1.0 - map_2d);
+    let p_flat = focus_ecef
+        .add(focus_frame.east.scale(east_m))
+        .add(focus_frame.north.scale(north_m))
+        .add(focus_frame.up.scale(up_h));
+
+    let p_morphed = DVec3::new(
+        p_curved.x + (p_flat.x - p_curved.x) * flat_t,
+        p_curved.y + (p_flat.y - p_curved.y) * flat_t,
+        p_curved.z + (p_flat.z - p_curved.z) * flat_t,
+    );
+
+    let up = DVec3::new(
+        curved_frame.up.x + (focus_frame.up.x - curved_frame.up.x) * flat_t,
+        curved_frame.up.y + (focus_frame.up.y - curved_frame.up.y) * flat_t,
+        curved_frame.up.z + (focus_frame.up.z - curved_frame.up.z) * flat_t,
+    )
+    .normalize();
+    let east_raw = DVec3::new(
+        curved_frame.east.x + (focus_frame.east.x - curved_frame.east.x) * flat_t,
+        curved_frame.east.y + (focus_frame.east.y - curved_frame.east.y) * flat_t,
+        curved_frame.east.z + (focus_frame.east.z - curved_frame.east.z) * flat_t,
+    );
+    let east_ortho = east_raw.sub(up.scale(east_raw.dot(up)));
+    let east = if east_ortho.length() > 1e-8 {
+        east_ortho.normalize()
+    } else {
+        focus_frame.east
+    };
+    let north = up.cross(east).normalize();
+
+    (p_morphed, LocalFrame { east, north, up })
+}
+
+/// Inverts [`project_morphed_point_and_frame`] for a world point at known `height_m`, returning
+/// `(lat_deg, lon_deg)`. Exact in pure 3D (`flat_blend == 0`) and pure flat (`flat_blend == 1`),
+/// and sub-millimetre across intermediate morph transitions.
+pub fn unproject_morphed_surface_lat_lon(
+    point_ecef: DVec3,
+    height_m: f64,
+    morph: SurfaceMorphParams,
+) -> (f64, f64) {
+    let flat_t = morph.flat_blend.clamp(0.0, 1.0);
+    if flat_t <= 1e-6 {
+        let g = ecef_to_geodetic(point_ecef);
+        return (g.lat_deg, wrap_longitude(g.lon_deg));
+    }
+
+    let map_2d = morph.map_2d_morph.clamp(0.0, 1.0);
+    let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
+    let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
+    let focus_ecef = geodetic_to_ecef(focus_surface);
+    let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
+    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+
+    if flat_t >= 1.0 - 1e-6 {
+        let rel = point_ecef.sub(focus_ecef);
+        let east_m = rel.dot(focus_frame.east);
+        let north_m = rel.dot(focus_frame.north);
+        let lat_deg = morph.focus.lat_deg + (north_m / wgs84::A).to_degrees();
+        let lon_deg = wrap_longitude(
+            morph.focus.lon_deg + (east_m / (wgs84::A * cos_scale.max(1e-6))).to_degrees(),
+        );
+        return (lat_deg, lon_deg);
+    }
+
+    let init = ecef_to_geodetic(point_ecef);
+    let mut lat = init.lat_deg.clamp(-89.95, 89.95);
+    let mut lon = wrap_longitude(init.lon_deg);
+    for _ in 0..4 {
+        let (p_est, frame) = project_morphed_point_and_frame(lat, lon, height_m, morph);
+        let err = point_ecef.sub(p_est);
+        let de = err.dot(frame.east);
+        let dn = err.dot(frame.north);
+        if de * de + dn * dn < 1e-8 {
+            break;
+        }
+        let cos_lat = lat.to_radians().cos().abs().max(0.05);
+        let m_east = wgs84::A * ((1.0 - flat_t) * cos_lat + flat_t * cos_scale);
+        lat = (lat + (dn / wgs84::A).to_degrees()).clamp(-89.95, 89.95);
+        lon = wrap_longitude(lon + (de / m_east.max(1.0)).to_degrees());
+    }
+    (lat, lon)
 }
 
 /// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)

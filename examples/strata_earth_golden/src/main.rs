@@ -18,12 +18,12 @@
 use std::path::PathBuf;
 
 use strata_earth::{
-    requested_tile, surrounding_patches, tile_patch_span_deg, EarthCamera, EarthInput, EarthScene,
-    EntityMarker, FrameDescriptor, Geodetic, MemoryTileSource, TileElevation, TileImage, TileKey,
+    requested_tile, surrounding_patches, tile_patch_span_deg, EarthCamera, EarthGeometry,
+    EarthInput, EarthObject, EarthScene, FrameDescriptor, GeoPosition, Geodetic, MemoryTileSource,
+    TileElevation, TileImage, TileKey,
 };
 use strata_layout::Rect;
 use strata_render::rasterizer::FrameBuffer;
-use strata_render::rasterizer3d::render_scene_3d_with_textures;
 use strata_style::types::Color;
 
 const W: usize = 1440;
@@ -138,20 +138,27 @@ fn input_for(regime: &Regime, focus: Geodetic) -> EarthInput {
         patch_scale: regime.patch_scale,
         graticule_step_deg: 30.0,
         max_tile_level: 18,
-        markers: vec![
-            EntityMarker {
-                position: Geodetic::new(37.7749, -122.4194, 0.0),
-                label: "SF".to_string(),
-                color: Color::rgba(56, 189, 248, 255),
-            },
-            EntityMarker {
-                position: Geodetic::new(37.3382, -121.8863, 0.0),
-                label: "SJC".to_string(),
-                color: Color::rgba(248, 113, 113, 255),
-            },
-        ],
         ..Default::default()
     }
+}
+
+fn populate_golden_objects(scene: &mut EarthScene) {
+    scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::terrain(37.7749, -122.4194, 5.0),
+            EarthGeometry::beacon_pin(28.0, 7.0),
+        )
+        .with_label("SF")
+        .with_color(Color::rgba(56, 189, 248, 255)),
+    );
+    scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::terrain(37.3382, -121.8863, 5.0),
+            EarthGeometry::beacon_pin(28.0, 7.0),
+        )
+        .with_label("SJC")
+        .with_color(Color::rgba(248, 113, 113, 255)),
+    );
 }
 
 fn capture(
@@ -181,17 +188,11 @@ fn capture(
         );
     }
     let mut scene = EarthScene::new();
+    populate_golden_objects(&mut scene);
     scene.build(input, &mut source);
     let descriptor = FrameDescriptor::capture(&scene, input);
     let stats = scene.stats();
-    let mut fb = FrameBuffer::new(W, H);
-    render_scene_3d_with_textures(
-        &mut fb,
-        input.viewport,
-        scene.scene(),
-        None,
-        Some(scene.tile_registry().store()),
-    );
+    let fb = scene.render_to_framebuffer(W as u32, H as u32);
 
     // Terrain coverage is structural: render the same frame with the terrain
     // layer disabled and count the pixels that change. A bright-colour proxy
@@ -199,15 +200,9 @@ fn capture(
     let mut without_terrain = input.clone();
     without_terrain.layers.terrain = false;
     let mut bare_scene = EarthScene::new();
+    populate_golden_objects(&mut bare_scene);
     bare_scene.build(&without_terrain, &mut source);
-    let mut bare = FrameBuffer::new(W, H);
-    render_scene_3d_with_textures(
-        &mut bare,
-        without_terrain.viewport,
-        bare_scene.scene(),
-        None,
-        Some(bare_scene.tile_registry().store()),
-    );
+    let bare = bare_scene.render_to_framebuffer(W as u32, H as u32);
     let cover = fb
         .pixels
         .as_chunks::<4>()
