@@ -82,10 +82,25 @@ fn up_dir_from_heading(lat_deg: f64, lon_deg: f64, heading_deg: f64) -> [f64; 3]
     [dir.x, dir.y, dir.z]
 }
 
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+/// Continuous exponential zoom rate (natural-log range units per second) when holding zoom keys.
+pub const KEY_ZOOM_LN_PER_SEC: f64 = 2.6;
+
+const DRAG_VELOCITY_WINDOW: Duration = Duration::from_millis(90);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragAction {
     PanOrArcball,
     OrbitTilt,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DragVelSample {
+    t: Instant,
+    dx: f64,
+    dy: f64,
 }
 
 /// Interactive camera controller supporting 3D globe arcball, 2.5D close terrain orbit,
@@ -108,11 +123,19 @@ pub struct EarthOrbitController {
     zoom_cursor_px: Option<(f64, f64)>,
     spin_axis: [f64; 3],
     spin_vel_rad_s: f64,
-    pan_vel_lon_lat_s: (f64, f64),
+    /// Surface pan/orbit angular velocity in `(east_great_circle_deg_s, north_deg_s)`.
+    pan_vel_gc_deg_s: (f64, f64),
     orbit_vel_deg_s: (f64, f64),
+    drag_samples: VecDeque<DragVelSample>,
+    drag_start_instant: Option<Instant>,
+    carry_pan_vel: (f64, f64),
+    carry_orbit_vel: (f64, f64),
+    zoom_in_held: bool,
+    zoom_out_held: bool,
+    zoom_fast_modifier: bool,
     is_2d_hint: bool,
     ground_needs_snap: bool,
-    last_middle_click: Option<(std::time::Instant, f64, f64)>,
+    last_middle_click: Option<(Instant, f64, f64)>,
     middle_press_origin: Option<(f64, f64)>,
 }
 
@@ -135,8 +158,15 @@ impl Default for EarthOrbitController {
             zoom_cursor_px: None,
             spin_axis: [0.0, 0.0, 1.0],
             spin_vel_rad_s: 0.0,
-            pan_vel_lon_lat_s: (0.0, 0.0),
+            pan_vel_gc_deg_s: (0.0, 0.0),
             orbit_vel_deg_s: (0.0, 0.0),
+            drag_samples: VecDeque::with_capacity(32),
+            drag_start_instant: None,
+            carry_pan_vel: (0.0, 0.0),
+            carry_orbit_vel: (0.0, 0.0),
+            zoom_in_held: false,
+            zoom_out_held: false,
+            zoom_fast_modifier: false,
             is_2d_hint: false,
             ground_needs_snap: true,
             last_middle_click: None,
@@ -170,6 +200,44 @@ impl EarthOrbitController {
     #[inline]
     pub fn is_dragging(&self) -> bool {
         self.drag_action.is_some()
+    }
+
+    /// Sets whether the continuous zoom-in key (e.g. `K`) is currently held down.
+    #[inline]
+    pub fn set_zoom_in_held(&mut self, held: bool) {
+        self.zoom_in_held = held;
+        if held {
+            self.zoom_cursor_px = None;
+        }
+    }
+
+    /// Sets whether the continuous zoom-out key (e.g. `L`) is currently held down.
+    #[inline]
+    pub fn set_zoom_out_held(&mut self, held: bool) {
+        self.zoom_out_held = held;
+        if held {
+            self.zoom_cursor_px = None;
+        }
+    }
+
+    /// Sets whether a fast-zoom modifier (e.g. `Shift`) is active during held keyboard zoom.
+    #[inline]
+    pub fn set_zoom_fast_modifier(&mut self, fast: bool) {
+        self.zoom_fast_modifier = fast;
+    }
+
+    /// Releases all held continuous keyboard inputs (e.g. when the window loses focus).
+    #[inline]
+    pub fn clear_held_keys(&mut self) {
+        self.zoom_in_held = false;
+        self.zoom_out_held = false;
+        self.zoom_fast_modifier = false;
+    }
+
+    /// Returns `true` if either continuous zoom key is currently held down.
+    #[inline]
+    pub fn is_zoom_key_held(&self) -> bool {
+        self.zoom_in_held || self.zoom_out_held
     }
 
     #[inline]
@@ -209,8 +277,12 @@ impl EarthOrbitController {
         self.focus_ground_m = 0.0;
         self.ground_needs_snap = true;
         self.spin_vel_rad_s = 0.0;
-        self.pan_vel_lon_lat_s = (0.0, 0.0);
+        self.pan_vel_gc_deg_s = (0.0, 0.0);
         self.orbit_vel_deg_s = (0.0, 0.0);
+        self.drag_samples.clear();
+        self.drag_start_instant = None;
+        self.carry_pan_vel = (0.0, 0.0);
+        self.carry_orbit_vel = (0.0, 0.0);
         self.zoom_cursor_px = None;
         self.sync_dirs_from_geo();
     }
@@ -391,6 +463,9 @@ impl EarthOrbitController {
         let changed = self.tilt_deg.abs() > 1e-6 || self.orbit_vel_deg_s.1.abs() > 1e-6;
         self.tilt_deg = 0.0;
         self.orbit_vel_deg_s = (0.0, 0.0);
+        self.carry_orbit_vel = (0.0, 0.0);
+        self.drag_samples.clear();
+        self.drag_start_instant = None;
         self.drag_action = None;
         self.last_pointer = None;
         self.middle_press_origin = None;
@@ -398,19 +473,106 @@ impl EarthOrbitController {
         changed
     }
 
+    #[inline]
+    fn record_drag_sample_at(&mut self, now: Instant, dx: f64, dy: f64) {
+        self.drag_samples.push_back(DragVelSample { t: now, dx, dy });
+        while self
+            .drag_samples
+            .front()
+            .is_some_and(|s| now.saturating_duration_since(s.t) > DRAG_VELOCITY_WINDOW)
+        {
+            self.drag_samples.pop_front();
+        }
+    }
+
+    fn commit_release_momentum_at(&mut self, action: DragAction, now: Instant) {
+        while self
+            .drag_samples
+            .front()
+            .is_some_and(|s| now.saturating_duration_since(s.t) > DRAG_VELOCITY_WINDOW)
+        {
+            self.drag_samples.pop_front();
+        }
+        let Some(oldest) = self.drag_samples.front().copied() else {
+            return;
+        };
+
+        let mut sum_x = 0.0f64;
+        let mut sum_y = 0.0f64;
+        for s in &self.drag_samples {
+            sum_x += s.dx;
+            sum_y += s.dy;
+        }
+
+        let raw_span_s = now.saturating_duration_since(oldest.t).as_secs_f64();
+        let (dt_window, release_gain) = if self.drag_samples.len() <= 1 && raw_span_s < 0.005 {
+            (0.050, 1.0)
+        } else {
+            (raw_span_s.max(0.028), 0.45)
+        };
+        let mut vx = (sum_x / dt_window) * release_gain;
+        let mut vy = (sum_y / dt_window) * release_gain;
+
+        let stroke_s = self
+            .drag_start_instant
+            .map(|t0| now.saturating_duration_since(t0).as_secs_f64())
+            .unwrap_or(0.0);
+
+        let carry = match action {
+            DragAction::PanOrArcball => self.carry_pan_vel,
+            DragAction::OrbitTilt => self.carry_orbit_vel,
+        };
+        if stroke_s < 0.38 {
+            let carry_decay = (-1.5 * stroke_s).exp();
+            let cx = carry.0 * carry_decay;
+            let cy = carry.1 * carry_decay;
+            let dot = vx * cx + vy * cy;
+            let v_mag_sq = vx * vx + vy * vy;
+            if dot > 0.0 && v_mag_sq > 1e-9 {
+                let proj_scale = (dot / v_mag_sq).clamp(0.0, 5.0) * 0.90;
+                vx += vx * proj_scale;
+                vy += vy * proj_scale;
+            }
+        }
+
+        match action {
+            DragAction::PanOrArcball => {
+                let max_gc_deg_s =
+                    ((self.range_m / wgs84::A).to_degrees() * 11.0).clamp(0.002, 620.0);
+                let mag = vx.hypot(vy);
+                if mag > max_gc_deg_s && mag > 1e-12 {
+                    let s = max_gc_deg_s / mag;
+                    vx *= s;
+                    vy *= s;
+                }
+                self.pan_vel_gc_deg_s = (vx, vy);
+            }
+            DragAction::OrbitTilt => {
+                self.orbit_vel_deg_s = (vx.clamp(-620.0, 620.0), vy.clamp(-240.0, 240.0));
+            }
+        }
+    }
+
     /// Starts a pointer interaction (`0` = Left pan/arcball, `1`/`2` = Middle/Right heading+tilt orbit).
     /// Double middle-clicking (`button == 1`) in 3D mode resets camera pitch (`tilt_deg`) to `0.0`.
     pub fn handle_mouse_down(&mut self, button: u32, x: f64, y: f64) -> bool {
+        self.handle_mouse_down_at(button, x, y, Instant::now())
+    }
+
+    fn handle_mouse_down_at(&mut self, button: u32, x: f64, y: f64, now: Instant) -> bool {
         self.last_pointer = Some((x, y));
+        self.carry_pan_vel = self.pan_vel_gc_deg_s;
+        self.carry_orbit_vel = self.orbit_vel_deg_s;
+        self.drag_samples.clear();
+        self.drag_start_instant = Some(now);
         self.spin_vel_rad_s = 0.0;
-        self.pan_vel_lon_lat_s = (0.0, 0.0);
+        self.pan_vel_gc_deg_s = (0.0, 0.0);
         self.orbit_vel_deg_s = (0.0, 0.0);
         self.zoom_cursor_px = None;
 
         if button == 1 && !self.is_2d_hint {
-            let now = std::time::Instant::now();
             if let Some((prev_time, px, py)) = self.last_middle_click {
-                if now.duration_since(prev_time) <= std::time::Duration::from_millis(450)
+                if now.saturating_duration_since(prev_time) <= Duration::from_millis(450)
                     && (x - px).hypot(y - py) <= 24.0
                 {
                     self.last_middle_click = None;
@@ -433,24 +595,42 @@ impl EarthOrbitController {
         self.drag_action.is_some()
     }
 
-    /// Releases an active pointer drag interaction.
-    pub fn handle_mouse_up(&mut self, _button: u32) -> bool {
-        let was_dragging = self.drag_action.is_some();
-        self.drag_action = None;
+    /// Releases an active pointer drag interaction, transferring recent flick velocity into smooth momentum.
+    pub fn handle_mouse_up(&mut self, button: u32) -> bool {
+        self.handle_mouse_up_at(button, Instant::now())
+    }
+
+    fn handle_mouse_up_at(&mut self, _button: u32, now: Instant) -> bool {
+        let prev_action = self.drag_action.take();
+        if let Some(action) = prev_action {
+            self.commit_release_momentum_at(action, now);
+        }
+        self.drag_samples.clear();
+        self.drag_start_instant = None;
+        self.carry_pan_vel = (0.0, 0.0);
+        self.carry_orbit_vel = (0.0, 0.0);
         self.last_pointer = None;
         self.middle_press_origin = None;
-        was_dragging
+        prev_action.is_some()
     }
 
     /// Cancels pointer tracking if the cursor leaves without pointer capture.
     pub fn handle_cursor_left(&mut self) {
         self.drag_action = None;
+        self.drag_samples.clear();
+        self.drag_start_instant = None;
+        self.carry_pan_vel = (0.0, 0.0);
+        self.carry_orbit_vel = (0.0, 0.0);
         self.last_pointer = None;
         self.middle_press_origin = None;
     }
 
     /// Applies pointer drag motion using component-local `(x, y)` coordinates.
     pub fn handle_mouse_move(&mut self, x: f64, y: f64) -> bool {
+        self.handle_mouse_move_at(x, y, Instant::now())
+    }
+
+    fn handle_mouse_move_at(&mut self, x: f64, y: f64, now: Instant) -> bool {
         let Some(action) = self.drag_action else {
             self.last_pointer = Some((x, y));
             return false;
@@ -474,29 +654,31 @@ impl EarthOrbitController {
 
         match action {
             DragAction::OrbitTilt => {
-                self.orbit_25d_around_pivot(dx, dy);
+                self.orbit_25d_around_pivot(dx, dy, now);
             }
             DragAction::PanOrArcball => {
                 if self.is_2d_hint {
-                    self.pan_2d(dx, dy);
+                    self.pan_2d(dx, dy, now);
                 } else if self.range_m > LOCAL_TRANSITION_RANGE_M && self.tilt_deg < 4.0 {
-                    self.drag_globe_arcball(px, py, x, y);
+                    self.drag_globe_arcball(px, py, x, y, now);
                 } else {
-                    self.drag_local_tangent_plane(px, py, x, y);
+                    self.drag_local_tangent_plane(px, py, x, y, now);
                 }
             }
         }
         true
     }
 
-    fn orbit_25d_around_pivot(&mut self, dx: f64, dy: f64) {
+    fn orbit_25d_around_pivot(&mut self, dx: f64, dy: f64, now: Instant) {
         let max_t = if self.is_2d_hint {
             0.0
         } else {
             84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4)
         };
         let d_tilt = -dy * 0.24;
+        let prev_tilt = self.tilt_deg;
         self.tilt_deg = (self.tilt_deg + d_tilt).clamp(0.0, max_t);
+        let applied_tilt = self.tilt_deg - prev_tilt;
         let local_w = if self.is_2d_hint {
             0.0
         } else {
@@ -505,11 +687,11 @@ impl EarthOrbitController {
         };
         let d_heading = dx * 0.28 * local_w;
         self.heading_deg = normalize_deg(self.heading_deg + d_heading);
-        self.orbit_vel_deg_s = (d_heading * 18.0, d_tilt * 18.0);
+        self.record_drag_sample_at(now, d_heading, applied_tilt);
         self.sync_dirs_from_geo();
     }
 
-    fn pan_2d(&mut self, dx: f64, dy: f64) {
+    fn pan_2d(&mut self, dx: f64, dy: f64, now: Instant) {
         let visible_m = 2.0 * self.range_m * (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
         let m_per_px = visible_m / self.viewport_h.max(1.0);
         let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.15);
@@ -517,11 +699,11 @@ impl EarthOrbitController {
         let d_lat = (dy * m_per_px) / wgs84::A.to_radians();
         self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
         self.lat_deg = (self.lat_deg + d_lat).clamp(-85.05112878, 85.05112878);
-        self.pan_vel_lon_lat_s = (d_lon * 18.0, d_lat * 18.0);
+        self.record_drag_sample_at(now, d_lon * cos_lat, d_lat);
         self.sync_dirs_from_geo();
     }
 
-    fn drag_globe_arcball(&mut self, px: f64, py: f64, x: f64, y: f64) {
+    fn drag_globe_arcball(&mut self, px: f64, py: f64, x: f64, y: f64, now: Instant) {
         let dx = x - px;
         let dy = y - py;
         // Unified roll-free angular rotation calibrated at the sub-camera focus point so
@@ -535,15 +717,16 @@ impl EarthOrbitController {
         let step_north = dx * h_rad.sin() + dy * h_rad.cos();
         let d_lat = step_north * deg_per_px;
         let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.25);
-        let d_lon = step_east * deg_per_px / cos_lat;
+        let d_east_gc_deg = step_east * deg_per_px;
+        let d_lon = d_east_gc_deg / cos_lat;
         self.lat_deg = (self.lat_deg + d_lat).clamp(-89.95, 89.95);
         self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
-        self.pan_vel_lon_lat_s = (d_lon * 16.0, d_lat * 16.0);
+        self.record_drag_sample_at(now, d_east_gc_deg, d_lat);
         self.spin_vel_rad_s = 0.0;
         self.sync_dirs_from_geo();
     }
 
-    fn drag_local_tangent_plane(&mut self, px: f64, py: f64, x: f64, y: f64) {
+    fn drag_local_tangent_plane(&mut self, px: f64, py: f64, x: f64, y: f64, now: Instant) {
         let gw = self.ground_focus_weight(false);
         let plane_h = self.focus_ground_m * gw;
         let (cam, up_opt) = self.raw_camera_and_up(false, self.focus_ground_m);
@@ -581,7 +764,7 @@ impl EarthOrbitController {
 
         self.lat_deg = (self.lat_deg + d_lat).clamp(-89.95, 89.95);
         self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
-        self.pan_vel_lon_lat_s = (d_lon * 16.0, d_lat * 16.0);
+        self.record_drag_sample_at(now, d_lon * cos_lat, d_lat);
         self.sync_dirs_from_geo();
     }
 
@@ -609,7 +792,7 @@ impl EarthOrbitController {
         self.zoom_cursor_px = Some((x, y));
     }
 
-    /// Advances smooth zoom easing, inertia momentum, and ground-elevation collision clamping.
+    /// Advances smooth zoom easing, continuous held-key zoom, inertia momentum, and ground-elevation collision clamping.
     ///
     /// Returns `true` if any camera state changed during this step.
     pub fn step_damping(
@@ -624,6 +807,19 @@ impl EarthOrbitController {
         }
         self.is_2d_hint = is_2d;
         let mut changed = false;
+
+        // 0. Continuous held-key zoom (`zoom_in_held` -> closer, `zoom_out_held` -> farther)
+        let key_zoom_dir = (self.zoom_out_held as i32 - self.zoom_in_held as i32) as f64;
+        if key_zoom_dir != 0.0 {
+            let rate = if self.zoom_fast_modifier {
+                KEY_ZOOM_LN_PER_SEC * 1.6
+            } else {
+                KEY_ZOOM_LN_PER_SEC
+            };
+            let factor = (key_zoom_dir * rate * dt).exp();
+            self.target_range_m = (self.target_range_m * factor).clamp(MIN_RANGE_M, MAX_RANGE_M);
+            self.zoom_cursor_px = None;
+        }
 
         // 1. Update smoothed terrain height under focus point
         let sampled_focus_ground = if is_2d {
@@ -653,7 +849,7 @@ impl EarthOrbitController {
 
         // 2. Momentum damping when pointer is released
         if self.drag_action.is_none() {
-            let decay = (-8.5 * dt).exp();
+            let decay = (-2.6 * dt).exp();
             if self.spin_vel_rad_s.abs() > 1e-4 {
                 let d_angle = self.spin_vel_rad_s * dt;
                 let axis = DVec3::new(self.spin_axis[0], self.spin_axis[1], self.spin_axis[2]);
@@ -668,19 +864,30 @@ impl EarthOrbitController {
                 changed = true;
             }
 
-            if self.pan_vel_lon_lat_s.0.abs() > 1e-6 || self.pan_vel_lon_lat_s.1.abs() > 1e-6 {
+            if self.pan_vel_gc_deg_s.0.abs() > 1e-6 || self.pan_vel_gc_deg_s.1.abs() > 1e-6 {
                 let lat_lim = if is_2d { 85.05112878 } else { 89.95 };
-                self.lon_deg = ((self.lon_deg + self.pan_vel_lon_lat_s.0 * dt) + 180.0)
-                    .rem_euclid(360.0)
-                    - 180.0;
-                self.lat_deg = (self.lat_deg + self.pan_vel_lon_lat_s.1 * dt).clamp(-lat_lim, lat_lim);
-                self.pan_vel_lon_lat_s.0 *= decay;
-                self.pan_vel_lon_lat_s.1 *= decay;
-                if self.pan_vel_lon_lat_s.0.abs() <= 1e-6 {
-                    self.pan_vel_lon_lat_s.0 = 0.0;
+                let min_cos =
+                    if is_2d || self.range_m <= LOCAL_TRANSITION_RANGE_M || self.tilt_deg >= 4.0 {
+                        0.15
+                    } else {
+                        0.25
+                    };
+                let cos_lat = self.lat_deg.to_radians().cos().abs().max(min_cos);
+                let d_lon = (self.pan_vel_gc_deg_s.0 / cos_lat) * dt;
+                let d_lat = self.pan_vel_gc_deg_s.1 * dt;
+                self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
+                let unclamped_lat = self.lat_deg + d_lat;
+                self.lat_deg = unclamped_lat.clamp(-lat_lim, lat_lim);
+                if (unclamped_lat - self.lat_deg).abs() > 1e-9 {
+                    self.pan_vel_gc_deg_s.1 = 0.0;
                 }
-                if self.pan_vel_lon_lat_s.1.abs() <= 1e-6 {
-                    self.pan_vel_lon_lat_s.1 = 0.0;
+                self.pan_vel_gc_deg_s.0 *= decay;
+                self.pan_vel_gc_deg_s.1 *= decay;
+                if self.pan_vel_gc_deg_s.0.abs() <= 1e-6 {
+                    self.pan_vel_gc_deg_s.0 = 0.0;
+                }
+                if self.pan_vel_gc_deg_s.1.abs() <= 1e-6 {
+                    self.pan_vel_gc_deg_s.1 = 0.0;
                 }
                 self.sync_dirs_from_geo();
                 changed = true;
@@ -691,7 +898,11 @@ impl EarthOrbitController {
                 let max_t =
                     84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4);
                 self.heading_deg = normalize_deg(self.heading_deg + self.orbit_vel_deg_s.0 * dt);
-                self.tilt_deg = (self.tilt_deg + self.orbit_vel_deg_s.1 * dt).clamp(0.0, max_t);
+                let unclamped_t = self.tilt_deg + self.orbit_vel_deg_s.1 * dt;
+                self.tilt_deg = unclamped_t.clamp(0.0, max_t);
+                if (unclamped_t - self.tilt_deg).abs() > 1e-9 {
+                    self.orbit_vel_deg_s.1 = 0.0;
+                }
                 self.orbit_vel_deg_s.0 *= decay;
                 self.orbit_vel_deg_s.1 *= decay;
                 if self.orbit_vel_deg_s.0.abs() <= 1e-3 {
@@ -708,7 +919,7 @@ impl EarthOrbitController {
         // 3. Smooth log-range zoom easing + cursor anchor shift when zooming inward
         let log_diff = (self.target_range_m.ln() - self.range_m.ln()).abs();
         if log_diff > 5e-4 {
-            let zoom_alpha = 1.0 - (-14.0 * dt).exp();
+            let zoom_alpha = 1.0 - (-12.5 * dt).exp();
             let old_range = self.range_m;
             let new_log = old_range.ln() + (self.target_range_m.ln() - old_range.ln()) * zoom_alpha;
             let new_range = new_log.exp().clamp(MIN_RANGE_M, MAX_RANGE_M);
@@ -973,4 +1184,115 @@ mod tests {
             ctrl.tilt_deg
         );
     }
+
+    #[test]
+    fn held_k_and_l_keys_zoom_in_and_out_continuously_with_good_speed() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(38.0, 24.0, 10_000_000.0, 0.0, 0.0);
+
+        // Hold zoom-in ('k') for 1.0 second at 144 Hz -> should zoom in substantially (~10x closer).
+        ctrl.set_zoom_in_held(true);
+        assert!(ctrl.is_zoom_key_held());
+        for _ in 0..144 {
+            assert!(ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0));
+        }
+        ctrl.set_zoom_in_held(false);
+        assert!(!ctrl.is_zoom_key_held());
+        assert!(
+            ctrl.range_m < 1_500_000.0 && ctrl.range_m > 400_000.0,
+            "holding zoom-in for 1s should zoom smoothly from 10,000 km into ~750-1,200 km, got {}",
+            ctrl.range_m
+        );
+
+        // Let smooth release tail settle.
+        for _ in 0..30 {
+            ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0);
+        }
+        let zoomed_in_range = ctrl.range_m;
+
+        // Hold zoom-out ('l') for 1.0 second at 144 Hz -> should zoom back out smoothly.
+        ctrl.set_zoom_out_held(true);
+        for _ in 0..144 {
+            assert!(ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0));
+        }
+        ctrl.clear_held_keys();
+        assert!(!ctrl.is_zoom_key_held());
+        assert!(
+            ctrl.range_m > zoomed_in_range * 6.0,
+            "holding zoom-out for 1s should zoom back out substantially, got {} vs {}",
+            ctrl.range_m,
+            zoomed_in_range
+        );
+    }
+
+    #[test]
+    fn mouse_flick_coasts_with_momentum_and_repeated_flicks_gain_speed() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(20.0, 0.0, 13_500_000.0, 0.0, 0.0);
+
+        // Simulate a realistic 500 Hz mouse flick (30 packets over 60 ms, plus a tiny 0.5 px finger-lift packet).
+        let t0 = Instant::now();
+        ctrl.handle_mouse_down_at(0, 720.0, 450.0, t0);
+        let mut x = 720.0;
+        for i in 1..=30 {
+            x -= 8.0;
+            ctrl.handle_mouse_move_at(x, 450.0, t0 + Duration::from_millis(i * 2));
+        }
+        // Tiny slow packet right before button release must NOT wipe out flick velocity.
+        ctrl.handle_mouse_move_at(x - 0.5, 450.0, t0 + Duration::from_millis(66));
+        ctrl.handle_mouse_up_at(0, t0 + Duration::from_millis(68));
+
+        let vel_after_first_flick = ctrl.pan_vel_gc_deg_s.0;
+        assert!(
+            vel_after_first_flick > 40.0,
+            "expected brisk eastward angular momentum after 500Hz flick, got {vel_after_first_flick}"
+        );
+
+        // Coast briefly (80 ms), then flick AGAIN in the same direction -> momentum must build higher!
+        let lon_after_release = ctrl.lon_deg;
+        for _ in 0..12 {
+            assert!(ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0));
+        }
+        assert!(
+            ctrl.lon_deg > lon_after_release + 2.0,
+            "globe should coast smoothly after mouse release"
+        );
+
+        let t1 = t0 + Duration::from_millis(150);
+        ctrl.handle_mouse_down_at(0, 720.0, 450.0, t1);
+        let mut x2 = 720.0;
+        for i in 1..=30 {
+            x2 -= 8.0;
+            ctrl.handle_mouse_move_at(x2, 450.0, t1 + Duration::from_millis(i * 2));
+        }
+        ctrl.handle_mouse_up_at(0, t1 + Duration::from_millis(65));
+
+        let vel_after_second_flick = ctrl.pan_vel_gc_deg_s.0;
+        assert!(
+            vel_after_second_flick > vel_after_first_flick * 1.35,
+            "consecutive flicks in same direction must gain momentum: first={vel_after_first_flick}, second={vel_after_second_flick}"
+        );
+    }
+
+    #[test]
+    fn pausing_pointer_before_release_stops_without_unwanted_drift() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(20.0, 0.0, 13_500_000.0, 0.0, 0.0);
+
+        let t0 = Instant::now();
+        ctrl.handle_mouse_down_at(0, 720.0, 450.0, t0);
+        ctrl.handle_mouse_move_at(560.0, 450.0, t0 + Duration::from_millis(25));
+        // Hold mouse stationary for 140 ms (> 90 ms window) before releasing button.
+        ctrl.handle_mouse_up_at(0, t0 + Duration::from_millis(165));
+
+        assert_eq!(
+            ctrl.pan_vel_gc_deg_s,
+            (0.0, 0.0),
+            "holding pointer still before mouseup must release cleanly with zero drift"
+        );
+    }
 }
+

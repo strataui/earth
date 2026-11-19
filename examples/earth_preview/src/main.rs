@@ -380,6 +380,7 @@ fn main() -> Result<(), String> {
         ..Default::default()
     };
 
+    let earth_for_events = earth.clone();
     let earth_for_frame = earth;
     let mode_for_frame = sun_demo_mode;
     let sim_for_frame = sun_cycle_sim_s;
@@ -393,7 +394,10 @@ fn main() -> Result<(), String> {
     launch_with_frame(
         build_root,
         config,
-        |_, _| false,
+        move |event, _rt| {
+            handle_preview_key_event(&earth_for_events, event);
+            false
+        },
         None,
         move |info: AppFrameInfo, _rt: &mut AppRuntime| -> FrameOutcome {
             let t_s = std::time::Instant::now();
@@ -440,10 +444,103 @@ fn main() -> Result<(), String> {
     )
 }
 
+fn handle_preview_key_event(earth: &EarthView, event: &strata::platform::PlatformEvent) {
+    use strata::platform::{KeyCode, PlatformEvent};
+
+    match event {
+        PlatformEvent::KeyDown { key, modifiers }
+            if !modifiers.ctrl && !modifiers.alt && !modifiers.meta =>
+        {
+            match key {
+                KeyCode::KeyK => earth.with_state_mut(|st| {
+                    st.orbit.set_zoom_fast_modifier(modifiers.shift);
+                    st.orbit.set_zoom_in_held(true);
+                }),
+                KeyCode::KeyL => earth.with_state_mut(|st| {
+                    st.orbit.set_zoom_fast_modifier(modifiers.shift);
+                    st.orbit.set_zoom_out_held(true);
+                }),
+                _ => {}
+            }
+        }
+        PlatformEvent::KeyUp { key, modifiers } => match key {
+            KeyCode::KeyK => earth.with_state_mut(|st| {
+                st.orbit.set_zoom_fast_modifier(modifiers.shift);
+                st.orbit.set_zoom_in_held(false);
+            }),
+            KeyCode::KeyL => earth.with_state_mut(|st| {
+                st.orbit.set_zoom_fast_modifier(modifiers.shift);
+                st.orbit.set_zoom_out_held(false);
+            }),
+            _ => {}
+        },
+        PlatformEvent::WindowFocused(false) | PlatformEvent::WindowCloseRequested => {
+            earth.with_state_mut(|st| st.orbit.clear_held_keys());
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use strata_earth::{ecef_to_geodetic, EarthOrbitController, LocalFrame, MIN_RANGE_M};
+    use super::handle_preview_key_event;
+    use strata::platform::{KeyCode, Modifiers, PlatformEvent};
+    use strata_earth::{
+        ecef_to_geodetic, EarthDefaultTileSource, EarthInput, EarthOrbitController, EarthView,
+        LocalFrame, MIN_RANGE_M,
+    };
     use strata_render::camera64::DVec3;
+
+    #[test]
+    fn preview_k_and_l_hold_events_zoom_in_and_out_smoothly() {
+        let input = EarthInput::globe();
+        let earth = EarthView::new(&input, Box::new(EarthDefaultTileSource::offline_basemap()));
+        let start_range = earth.with_state(|st| st.orbit.range_m);
+
+        handle_preview_key_event(
+            &earth,
+            &PlatformEvent::KeyDown {
+                key: KeyCode::KeyK,
+                modifiers: Modifiers::default(),
+            },
+        );
+        for _ in 0..60 {
+            let _ = earth.step_frame(1.0 / 120.0);
+        }
+        handle_preview_key_event(
+            &earth,
+            &PlatformEvent::KeyUp {
+                key: KeyCode::KeyK,
+                modifiers: Modifiers::default(),
+            },
+        );
+        let zoomed_in = earth.with_state(|st| st.orbit.range_m);
+        assert!(
+            zoomed_in < start_range * 0.45,
+            "holding K for 0.5s should zoom closer quickly: start={start_range}, after={zoomed_in}"
+        );
+
+        handle_preview_key_event(
+            &earth,
+            &PlatformEvent::KeyDown {
+                key: KeyCode::KeyL,
+                modifiers: Modifiers::default(),
+            },
+        );
+        for _ in 0..75 {
+            let _ = earth.step_frame(1.0 / 120.0);
+        }
+        handle_preview_key_event(&earth, &PlatformEvent::WindowFocused(false));
+        assert!(
+            earth.with_state(|st| !st.orbit.is_zoom_key_held()),
+            "losing window focus must release held K/L keys"
+        );
+        let zoomed_out = earth.with_state(|st| st.orbit.range_m);
+        assert!(
+            zoomed_out > zoomed_in * 2.2,
+            "holding L should zoom back out smoothly: in={zoomed_in}, out={zoomed_out}"
+        );
+    }
 
     #[test]
     fn orbit_zoom_and_tilt_never_roll_camera() {
