@@ -1,15 +1,16 @@
 //! Host-facing scene API: no mock buildings by default, textures carried with
-//! the scene, mutable scene access, and ENU transform helpers.
+//! the scene, native geodetic `EarthWorld` object management, and ENU / Heading-Pitch-Roll transforms.
 
 use strata_earth::{
-    BuildingFootprint, EarthCamera, EarthInput, EarthScene, Geodetic, MemoryBuildingSource,
-    MemoryTileSource, TileImage,
+    BuildingFootprint, EarthCamera, EarthGeometry, EarthInput, EarthMaterial, EarthObject,
+    EarthScene, GeoOrientation, GeoPosition, Geodetic, MemoryBuildingSource, MemoryTileSource,
+    TileImage,
 };
-use strata_render::compositor::DisplayList;
-use strata_render::math3d::{Mat4, Vec3};
-use strata_render::overlay3d::OverlayPrimitive;
+use strata_render::camera64::DVec3;
+use strata_render::compositor::{DisplayList, DrawCommand};
 use strata_render::rasterizer::FrameBuffer;
-use strata_render::scene3d::{Geometry3D, Material3D, Mesh3D};
+use strata_render::scene3d::Material3D;
+use strata_style::types::Color;
 
 const W: usize = 400;
 const H: usize = 300;
@@ -24,6 +25,16 @@ fn input(altitude_m: f64) -> EarthInput {
         viewport: strata_layout::Rect::new(0.0, 0.0, W as f32, H as f32),
         tile_grid: 5,
         ..Default::default()
+    }
+}
+
+fn built_scene3d(
+    scene: &EarthScene,
+    viewport: strata_layout::Rect,
+) -> std::sync::Arc<strata_render::scene3d::Scene3D> {
+    match scene.to_draw_command(viewport) {
+        DrawCommand::DrawViewport3D { scene: s, .. } => s,
+        _ => panic!("expected DrawViewport3D"),
     }
 }
 
@@ -87,7 +98,8 @@ fn scene_carries_textures_and_draw_command_renders_them() {
     let mut source = red_source(&input);
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
-    assert!(scene.scene().textures().is_some());
+    let s3d = built_scene3d(&scene, input.viewport);
+    assert!(s3d.textures().is_some());
 
     let mut list = DisplayList::new();
     scene.append_to_display_list(&mut list, input.viewport);
@@ -107,107 +119,128 @@ fn unchanged_frames_share_the_texture_store() {
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
     scene.build(&input, &mut source);
-    let a = scene.scene().textures().cloned().expect("textures");
+    let a = built_scene3d(&scene, input.viewport)
+        .textures()
+        .cloned()
+        .expect("textures");
     scene.build(&input, &mut source);
-    let b = scene.scene().textures().cloned().expect("textures");
+    let b = built_scene3d(&scene, input.viewport)
+        .textures()
+        .cloned()
+        .expect("textures");
     assert!(std::sync::Arc::ptr_eq(&a, &b));
 }
 
 #[test]
-fn scene_mut_and_overlay_mut_append_without_rebuilding_terrain() {
+fn earth_world_spawns_and_removes_geodetic_objects_cleanly() {
     let input = input(2_500.0);
     let mut scene = EarthScene::new();
     scene.build(&input, &mut MemoryTileSource::new());
-    let meshes = scene.scene().meshes.len();
+    let base_draws = scene.stats().draw_calls;
 
-    scene.scene_mut().meshes.push(Mesh3D::new(
-        Geometry3D::Box {
-            width: 1.0,
-            height: 1.0,
-            depth: 1.0,
-        },
-        Material3D::default(),
-    ));
-    assert_eq!(scene.scene().meshes.len(), meshes + 1);
+    let box_id = scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::terrain(37.7749, -122.4194, 15.0),
+            EarthGeometry::box_m(20.0, 20.0, 30.0),
+        )
+        .with_label("Tower")
+        .with_material(EarthMaterial::standard(Color::rgb(56, 189, 248))),
+    );
+    let line_id = scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::sea_level(37.7749, -122.4194, 40.0),
+            EarthGeometry::Polyline {
+                points: vec![
+                    GeoPosition::sea_level(37.7749, -122.4194, 40.0),
+                    GeoPosition::sea_level(37.7780, -122.4150, 80.0),
+                ],
+                radius_m: 2.5,
+            },
+        )
+        .with_material(EarthMaterial::unlit(Color::rgb(255, 80, 80))),
+    );
+    assert_eq!(scene.world(|w| w.len()), 2);
 
-    let before = scene.overlay_mut().primitives.len();
-    scene
-        .overlay_mut()
-        .primitives
-        .push(OverlayPrimitive::Polyline {
-            points: vec![
-                strata_render::camera64::DVec3 {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 0.0,
-                },
-                strata_render::camera64::DVec3 {
-                    x: 1.0,
-                    y: 1.0,
-                    z: 1.0,
-                },
-            ],
-            color: strata_style::types::Color::rgb(255, 0, 0),
-            width: 2.0,
-        });
-    assert_eq!(scene.overlay_mut().primitives.len(), before + 1);
+    scene.build(&input, &mut MemoryTileSource::new());
+    assert_eq!(scene.stats().draw_calls, base_draws + 2);
 
-    let taken = scene.take_scene_arc();
-    assert_eq!(taken.meshes.len(), meshes + 1);
+    assert!(scene.remove_object(box_id));
+    assert!(scene.remove_object(line_id));
+    assert_eq!(scene.world(|w| w.len()), 0);
 }
 
-fn model_matrix(scene: &EarthScene, pos: Geodetic, ypr: [f64; 3]) -> Mat4 {
-    let t = scene.rtc_transform(pos, ypr, [1.0, 1.0, 1.0]);
-    Mat4::from_trs(
-        Vec3::new(t.position[0], t.position[1], t.position[2]),
-        Vec3::new(t.rotation[0], t.rotation[1], t.rotation[2]),
-        Vec3::new(t.scale[0], t.scale[1], t.scale[2]),
-    )
-}
-
-fn dot(v: Vec3, d: strata_render::camera64::DVec3) -> f32 {
-    v.x * d.x as f32 + v.y * d.y as f32 + v.z * d.z as f32
+fn dot_col(col: [f64; 3], d: DVec3) -> f64 {
+    col[0] * d.x + col[1] * d.y + col[2] * d.z
 }
 
 #[test]
-fn rtc_transform_aligns_model_axes_with_enu() {
+fn geodetic_object_transform_aligns_local_axes_with_enu() {
+    let inp = input(12_000_000.0); // Pure 3D globe regime (zero flat morph)
     let mut scene = EarthScene::new();
-    scene.build(&input(2_500.0), &mut MemoryTileSource::new());
+    scene.build(&inp, &mut MemoryTileSource::new());
+
     for (lat, lon) in [(37.77, -122.42), (-33.9, 151.2), (64.1, -21.9), (0.0, 0.0)] {
-        let pos = Geodetic::new(lat, lon, 100.0);
+        let id = scene.spawn_object(EarthObject::new(
+            GeoPosition::sea_level(lat, lon, 100.0),
+            EarthGeometry::box_m(1.0, 1.0, 1.0),
+        ));
+        let tf = scene
+            .resolve_object_transform(id, &inp)
+            .expect("resolved transform");
         let frame = strata_earth::geodesy::LocalFrame::at(lat, lon);
-        let m = model_matrix(&scene, pos, [0.0, 0.0, 0.0]);
-        let east = m.transform_vector(Vec3::new(1.0, 0.0, 0.0));
-        let up = m.transform_vector(Vec3::new(0.0, 1.0, 0.0));
-        let nose = m.transform_vector(Vec3::new(0.0, 0.0, -1.0));
-        assert!(dot(east, frame.east) > 0.999, "east at {lat},{lon}");
-        assert!(dot(up, frame.up) > 0.999, "up at {lat},{lon}");
-        assert!(dot(nose, frame.north) > 0.999, "north at {lat},{lon}");
+        assert!(
+            dot_col(tf.model_cols[0], frame.east) > 0.9999,
+            "+X must align with East at {lat},{lon}"
+        );
+        assert!(
+            dot_col(tf.model_cols[1], frame.north) > 0.9999,
+            "+Y must align with North at {lat},{lon}"
+        );
+        assert!(
+            dot_col(tf.model_cols[2], frame.up) > 0.9999,
+            "+Z must align with Up at {lat},{lon}"
+        );
     }
 }
 
 #[test]
-fn rtc_transform_applies_yaw_pitch_roll() {
+fn geodetic_object_transform_applies_heading_pitch_roll() {
+    let inp = input(12_000_000.0);
     let mut scene = EarthScene::new();
-    scene.build(&input(2_500.0), &mut MemoryTileSource::new());
-    let pos = Geodetic::new(37.77, -122.42, 100.0);
-    let frame = strata_earth::geodesy::LocalFrame::at(pos.lat_deg, pos.lon_deg);
-    let nose = Vec3::new(0.0, 0.0, -1.0);
-    let wing = Vec3::new(1.0, 0.0, 0.0);
+    scene.build(&inp, &mut MemoryTileSource::new());
 
-    let yaw = model_matrix(&scene, pos, [90.0, 0.0, 0.0]);
-    assert!(dot(yaw.transform_vector(nose), frame.east) > 0.999);
+    let (lat, lon) = (37.77, -122.42);
+    let frame = strata_earth::geodesy::LocalFrame::at(lat, lon);
 
-    let pitch = model_matrix(&scene, pos, [0.0, 30.0, 0.0]);
-    assert!(dot(pitch.transform_vector(nose), frame.up) > 0.45);
+    let eval = |scene: &mut EarthScene, h: f64, p: f64, r: f64| {
+        let id = scene.spawn_object(
+            EarthObject::new(
+                GeoPosition::sea_level(lat, lon, 100.0),
+                EarthGeometry::box_m(1.0, 1.0, 1.0),
+            )
+            .with_orientation(GeoOrientation::new(h, p, r)),
+        );
+        scene
+            .resolve_object_transform(id, &inp)
+            .expect("resolved transform")
+    };
 
-    let roll = model_matrix(&scene, pos, [0.0, 0.0, 30.0]);
-    assert!(dot(roll.transform_vector(wing), frame.up) < -0.45);
+    // Heading 90° clockwise from North rotates +Y (forward) onto +East.
+    let h90 = eval(&mut scene, 90.0, 0.0, 0.0);
+    assert!(dot_col(h90.model_cols[1], frame.east) > 0.999);
 
-    // Gimbal lock: heading 0, 90 degrees roll still yields a valid frame.
-    let lock = model_matrix(&scene, pos, [0.0, 0.0, 90.0]);
-    assert!(dot(lock.transform_vector(wing), frame.up) < -0.99);
-    assert!(dot(lock.transform_vector(nose), frame.north) > 0.99);
+    // Pitch +30° tilts +Y (forward) upward toward +Up.
+    let p30 = eval(&mut scene, 0.0, 30.0, 0.0);
+    assert!(dot_col(p30.model_cols[1], frame.up) > 0.45);
+
+    // Roll +30° banks +X (right wing) downward toward -Up.
+    let r30 = eval(&mut scene, 0.0, 0.0, 30.0);
+    assert!(dot_col(r30.model_cols[0], frame.up) < -0.45);
+
+    // 90° roll preserves orthonormal forward (+North) and downward right wing (-Up).
+    let r90 = eval(&mut scene, 0.0, 0.0, 90.0);
+    assert!(dot_col(r90.model_cols[0], frame.up) < -0.99);
+    assert!(dot_col(r90.model_cols[1], frame.north) > 0.99);
 }
 
 #[test]
@@ -217,20 +250,17 @@ fn fallback_tint_is_configurable_and_neutral_by_default() {
     assert_eq!(default.fallback_tint.g(), default.fallback_tint.b());
 
     let mut input = input(2_500.0);
-    input.fallback_tint = strata_style::types::Color::rgba(10, 20, 200, 255);
+    input.fallback_tint = Color::rgba(10, 20, 200, 255);
     let mut scene = EarthScene::new();
     scene.build(&input, &mut MemoryTileSource::new());
-    let tinted = scene
-        .scene()
-        .meshes
-        .iter()
-        .any(|mesh| match &mesh.material {
-            Material3D::TexturedBatch(batch) => batch
-                .draws
-                .iter()
-                .all(|d| d.material.tint == input.fallback_tint),
-            _ => false,
-        });
+    let s3d = built_scene3d(&scene, input.viewport);
+    let tinted = s3d.meshes.iter().any(|mesh| match &mesh.material {
+        Material3D::TexturedBatch(batch) => batch
+            .draws
+            .iter()
+            .all(|d| d.material.tint == input.fallback_tint),
+        _ => false,
+    });
     assert!(
         tinted,
         "patches without imagery must use the configured tint"

@@ -3,9 +3,10 @@
 use crate::astro::{build_environment_assets_with_skybox, GlobalCloudMapStore};
 use crate::geodesy::{
     build_tile_local_rtc_mesh_morphed, level_for_altitude, retained_camera_uniforms_with_up,
-    tile_bounding_sphere, tile_bounds, tile_bounds_mercator, traverse_quadtree_lod_2d_flat,
-    traverse_quadtree_lod_frustum6_projected_with_up, wgs84, EarthCamera, Frustum6, Geodetic,
-    LocalFrame, PatchBounds, SurfaceMorphParams, TileKey, TileProjection, MAX_QUADTREE_LEAVES,
+    stabilized_surface_morph, tile_bounding_sphere, tile_bounds, tile_bounds_mercator,
+    traverse_quadtree_lod_2d_flat, traverse_quadtree_lod_frustum6_projected_with_up, wgs84,
+    EarthCamera, Frustum6, Geodetic, LocalFrame, PatchBounds, SurfaceMorphParams, TileKey,
+    TileProjection, MAX_QUADTREE_LEAVES,
 };
 use crate::gltf::{CustomWeatherMeshes, WeatherConfig};
 use crate::plugins::{
@@ -13,6 +14,7 @@ use crate::plugins::{
     EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext,
     EarthWorldBuildContext, LoadedTileImagerySnapshot, OceanWavesPlugin, WeatherPlugin,
 };
+use crate::raycast::{raycast_surface_ray, raycast_viewport, EarthRayHit};
 use crate::satellites::{SatelliteCatalogStore, SatelliteElement};
 use crate::scene::{
     compute_adaptive_skirt_depth, requested_tile, sky_gradient, surrounding_patches,
@@ -23,6 +25,7 @@ use crate::skybox::SpaceSkyboxStore;
 use crate::tiles::{
     TileElevation, TileImage, TileProviderConfig, TileProviderPreset, TileSource,
 };
+use crate::world::{EarthObject, EarthObjectId, EarthWorld, ResolvedObjectTransform};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -122,30 +125,7 @@ fn stabilized_morph_params(
     map_2d_morph: f64,
     projection: TileProjection,
 ) -> SurfaceMorphParams {
-    // In 2.5D pan mode (flat_blend near 1.0, map_2d == 0), quantize the shared tangent plane
-    // anchor on a 0.02 deg (~2.2 km) grid so panning hits ~100% of cached tile meshes while
-    // keeping adjacent tiles on the exact same plane (zero cracks, <0.3m curvature tolerance).
-    let anchor = if flat_blend >= 0.99 && map_2d_morph <= 1e-4 {
-        Geodetic::new(
-            (focus.lat_deg * 50.0).round() / 50.0,
-            (focus.lon_deg * 50.0).round() / 50.0,
-            0.0,
-        )
-    } else if flat_blend > 1e-6 {
-        Geodetic::new(
-            (focus.lat_deg * 200.0).round() / 200.0,
-            (focus.lon_deg * 200.0).round() / 200.0,
-            0.0,
-        )
-    } else {
-        focus
-    };
-    SurfaceMorphParams {
-        focus: anchor,
-        flat_blend,
-        map_2d_morph,
-        projection,
-    }
+    stabilized_surface_morph(focus, flat_blend, map_2d_morph, projection)
 }
 
 #[inline]
@@ -282,6 +262,7 @@ pub struct RetainedTerrainBuilder {
     plugin_textures: HashMap<u64, CachedPluginTexEntry>,
     cached_elev_arcs: HashMap<TileKey, (u64, Arc<TileElevation>)>,
     ground_snapshot: Option<Arc<RwLock<GroundElevSnapshot>>>,
+    world: Arc<RwLock<EarthWorld>>,
     next_tex_id: u64,
     next_revision: u64,
     frame_counter: u64,
@@ -359,6 +340,7 @@ impl RetainedTerrainBuilder {
             plugin_textures: HashMap::new(),
             cached_elev_arcs: HashMap::new(),
             ground_snapshot: Some(Arc::new(RwLock::new(GroundElevSnapshot::default()))),
+            world: Arc::new(RwLock::new(EarthWorld::new())),
             next_tex_id: 1,
             next_revision: 1,
             frame_counter: 0,
@@ -406,6 +388,18 @@ impl RetainedTerrainBuilder {
         self.ground_snapshot = Some(snap);
     }
 
+    pub(crate) fn set_world(&mut self, world: Arc<RwLock<EarthWorld>>) {
+        self.world = world;
+    }
+
+    pub fn sample_ground_elevation_m(&self, lat_deg: f64, lon_deg: f64) -> f64 {
+        self.ground_snapshot
+            .as_ref()
+            .and_then(|s| s.read().ok())
+            .map(|g| g.sample_elevation_m(lat_deg, lon_deg))
+            .unwrap_or(0.0)
+    }
+
     pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
         self.custom_weather = custom;
         self.last_built_weather = None;
@@ -419,6 +413,11 @@ impl RetainedTerrainBuilder {
         if clear_elevation {
             self.meshes.clear();
             self.cached_elev_arcs.clear();
+            if let Some(ref snap_lock) = self.ground_snapshot {
+                if let Ok(mut guard) = snap_lock.write() {
+                    *guard = GroundElevSnapshot::default();
+                }
+            }
         }
     }
 
@@ -1470,9 +1469,11 @@ impl RetainedTerrainBuilder {
             projection: input.tile_projection,
             patches,
         };
-        if let Some(ref snap_lock) = self.ground_snapshot {
-            if let Ok(mut guard) = snap_lock.write() {
-                *guard = ground_snap_val.clone();
+        if input.elevation_enabled {
+            if let Some(ref snap_lock) = self.ground_snapshot {
+                if let Ok(mut guard) = snap_lock.write() {
+                    *guard = ground_snap_val.clone();
+                }
             }
         }
 
@@ -1531,6 +1532,36 @@ impl RetainedTerrainBuilder {
                 .run_dynamic_overlays(&mut dyn_ctx, &mut dynamic_meshes);
         }
 
+        let morph = stabilized_morph_params(
+            input.camera.focus,
+            flat_t as f64,
+            ll.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let eye_dvec = DVec3::new(camera.eye_ecef[0], camera.eye_ecef[1], camera.eye_ecef[2]);
+        let (geo_mesh_assets, geo_instances) = if let Ok(mut w) = self.world.write() {
+            if w.is_empty() {
+                (Arc::default(), Arc::default())
+            } else {
+                w.compile_retained(
+                    eye_dvec,
+                    input.viewport.height.max(1.0) as f64,
+                    input.camera.fov_y_deg,
+                    input.elevation_enabled,
+                    morph,
+                    &|lat, lon| {
+                        if input.elevation_enabled {
+                            ground_snap_val.sample_elevation_m(lat, lon)
+                        } else {
+                            0.0
+                        }
+                    },
+                )
+            }
+        } else {
+            (Arc::default(), Arc::default())
+        };
+
         stats.visible_tiles = instances_out.len();
         (
             Arc::new(RetainedTerrainFrame {
@@ -1540,6 +1571,8 @@ impl RetainedTerrainBuilder {
                 instances: instances_out,
                 textures: textures_out,
                 dynamic_meshes,
+                geo_mesh_assets,
+                geo_instances,
                 environment,
             }),
             stats,
@@ -1701,9 +1734,25 @@ impl EarthTileWorker {
 
     pub fn spawn_with_plugins(
         retained: RetainedScene3D,
+        source: Box<dyn TileSource + Send>,
+        wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+        plugins: EarthPluginRegistry,
+    ) -> Self {
+        Self::spawn_with_plugins_and_world(
+            retained,
+            source,
+            wakeup,
+            plugins,
+            Arc::new(RwLock::new(EarthWorld::new())),
+        )
+    }
+
+    pub fn spawn_with_plugins_and_world(
+        retained: RetainedScene3D,
         mut source: Box<dyn TileSource + Send>,
         wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
         plugins: EarthPluginRegistry,
+        world: Arc<RwLock<EarthWorld>>,
     ) -> Self {
         let shared = Arc::new((
             Mutex::new(WorkerShared {
@@ -1725,6 +1774,7 @@ impl EarthTileWorker {
         let shared_env = Arc::clone(&shared);
         let completed_bg = Arc::clone(&completed_seq);
         let ground_snapshot_bg = Arc::clone(&ground_snapshot);
+        let world_bg = Arc::clone(&world);
         let env_wakeup_outer = wakeup.clone();
         let env_wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             {
@@ -1759,6 +1809,7 @@ impl EarthTileWorker {
                 );
                 builder.set_plugins(plugins);
                 builder.set_ground_snapshot(ground_snapshot_bg);
+                builder.set_world(world_bg);
                 let mut geom_rev = 0u64;
                 let mut seen_custom_gen = 0u64;
                 let mut seen_provider_gen = 0u64;
@@ -1936,6 +1987,7 @@ impl Drop for EarthTileWorker {
 pub struct EarthViewport {
     retained: RetainedScene3D,
     worker: EarthTileWorker,
+    world: Arc<RwLock<EarthWorld>>,
     input: EarthInput,
     plugins: EarthPluginRegistry,
     active_provider: TileProviderConfig,
@@ -1946,6 +1998,8 @@ pub struct EarthViewport {
     weather_ids: HashMap<u64, u64>,
     overlay_rev: u64,
     last_overlay_flat_t: f32,
+    last_geo_morph_sig: u64,
+    last_geo_eye_dist_m: f64,
     stopped: Arc<AtomicBool>,
 }
 
@@ -1981,12 +2035,19 @@ impl EarthViewport {
             false,
         );
         let retained = RetainedScene3D::new(cam_uniforms);
-        let mut worker =
-            EarthTileWorker::spawn_with_plugins(retained.clone(), source, wakeup, plugins.clone());
+        let world = Arc::new(RwLock::new(EarthWorld::new()));
+        let mut worker = EarthTileWorker::spawn_with_plugins_and_world(
+            retained.clone(),
+            source,
+            wakeup,
+            plugins.clone(),
+            Arc::clone(&world),
+        );
         worker.request_update(input.clone());
         Self {
             retained,
             worker,
+            world,
             input: input.clone(),
             plugins,
             active_provider: TileProviderConfig::default(),
@@ -1997,6 +2058,8 @@ impl EarthViewport {
             weather_ids: HashMap::new(),
             overlay_rev: 1,
             last_overlay_flat_t: initial_flat_t,
+            last_geo_morph_sig: 0,
+            last_geo_eye_dist_m: input.camera.eye_distance_m(),
             stopped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2063,6 +2126,63 @@ impl EarthViewport {
         }
     }
 
+    /// Returns the active [`SurfaceMorphParams`] matching the current terrain tile projection & morph.
+    #[inline]
+    pub fn current_surface_morph(&self) -> SurfaceMorphParams {
+        let ll = self.input.low_level_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
+        stabilized_morph_params(
+            self.input.camera.focus,
+            flat_t as f64,
+            ll.map_2d_morph as f64,
+            self.input.tile_projection,
+        )
+    }
+
+    #[inline]
+    fn camera_up_dvec(&self) -> Option<DVec3> {
+        self.input
+            .camera_up_ecef
+            .map(|[x, y, z]| DVec3::new(x, y, z))
+    }
+
+    fn compile_world_retained(
+        &mut self,
+    ) -> (
+        Arc<Vec<Arc<strata_render::scene3d::RetainedMeshAsset>>>,
+        Arc<Vec<strata_render::scene3d::RetainedGeoInstance>>,
+    ) {
+        let morph = self.current_surface_morph();
+        self.last_geo_morph_sig = mesh_morph_signature(morph);
+        self.last_geo_eye_dist_m = self.input.camera.eye_distance_m();
+        let placement = self.input.camera.placement_with_up(self.camera_up_dvec());
+        let vp_h = self.input.viewport.height.max(1.0) as f64;
+        let fov_y = self.input.camera.fov_y_deg;
+        let elev_on = self.input.elevation_enabled;
+        let worker_ref = &self.worker;
+        if let Ok(mut w) = self.world.write() {
+            if w.is_empty() {
+                return (Arc::default(), Arc::default());
+            }
+            w.compile_retained(placement.eye, vp_h, fov_y, elev_on, morph, &|lat, lon| {
+                if elev_on {
+                    worker_ref.sample_ground_elevation_m(lat, lon)
+                } else {
+                    0.0
+                }
+            })
+        } else {
+            (Arc::default(), Arc::default())
+        }
+    }
+
+    /// Immediately recompiles and publishes [`EarthWorld`] instances to the GPU retained scene
+    /// in microseconds without rebuilding terrain tiles.
+    pub fn refresh_world_objects(&mut self) {
+        let (assets, instances) = self.compile_world_retained();
+        self.retained.update_geo_objects(assets, instances);
+    }
+
     fn build_dynamic_overlays(&mut self) -> Vec<RetainedDynamicMesh> {
         self.overlay_rev = self.overlay_rev.wrapping_add(1).max(1);
         let ll = self.input.low_level_state();
@@ -2100,8 +2220,15 @@ impl EarthViewport {
             false,
         );
         let dyn_meshes = self.build_dynamic_overlays();
-        self.retained
-            .update_camera_and_dynamic_meshes(cam_u, dyn_meshes);
+        let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
+        if has_world {
+            let (assets, instances) = self.compile_world_retained();
+            self.retained
+                .update_camera_and_world_overlays(cam_u, dyn_meshes, assets, instances);
+        } else {
+            self.retained
+                .update_camera_and_dynamic_meshes(cam_u, dyn_meshes);
+        }
     }
 
     #[inline]
@@ -2130,11 +2257,15 @@ impl EarthViewport {
     }
 
     /// Toggles live heightmap (DEM) fetching and terrain relief displacement cleanly.
+    ///
+    /// Immediately re-evaluates all [`crate::geodesy::AltitudeMode::Terrain`] objects in
+    /// [`EarthWorld`] (`DEM + altitude_m` when `true`; `0.0 + altitude_m` above sea level when `false`).
     pub fn set_elevation_enabled(&mut self, enabled: bool) {
         if self.input.elevation_enabled == enabled {
             return;
         }
         self.input.elevation_enabled = enabled;
+        self.refresh_world_objects();
         if !self.stopped.load(Ordering::Relaxed) {
             self.worker.request_update(self.input.clone());
         }
@@ -2376,7 +2507,19 @@ impl EarthViewport {
         let ocean_active = self.input.ocean_waves.enabled
             && self.plugins.is_active(OceanWavesPlugin::ID)
             && camera.altitude_m() < 520_000.0;
-        if (flat_t - self.last_overlay_flat_t).abs() > 0.015 || ocean_active {
+
+        let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
+        let need_geo_refresh = if has_world {
+            let cur_sig = mesh_morph_signature(self.current_surface_morph());
+            let cur_dist = camera.eye_distance_m();
+            cur_sig != self.last_geo_morph_sig
+                || (cur_dist - self.last_geo_eye_dist_m).abs()
+                    > self.last_geo_eye_dist_m.max(1.0) * 0.006
+        } else {
+            false
+        };
+
+        if (flat_t - self.last_overlay_flat_t).abs() > 0.015 || ocean_active || need_geo_refresh {
             self.publish_camera_and_overlays();
         } else {
             let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
@@ -2454,5 +2597,113 @@ impl EarthViewport {
             return 0.0;
         }
         self.worker.sample_ground_elevation_m(lat_deg, lon_deg)
+    }
+
+    /// Borrows the geodetic [`EarthWorld`] for read inspection.
+    pub fn world<R>(&self, f: impl FnOnce(&EarthWorld) -> R) -> R {
+        let guard = self.world.read().expect("EarthWorld lock poisoned");
+        f(&guard)
+    }
+
+    /// Mutates the geodetic [`EarthWorld`] and immediately publishes updated GPU object instances.
+    pub fn world_mut<R>(&mut self, f: impl FnOnce(&mut EarthWorld) -> R) -> R {
+        let out = {
+            let mut guard = self.world.write().expect("EarthWorld lock poisoned");
+            f(&mut guard)
+        };
+        self.refresh_world_objects();
+        out
+    }
+
+    /// Spawns a geodetic [`EarthObject`] into the world and immediately publishes its GPU instance.
+    pub fn spawn_object(&mut self, object: EarthObject) -> EarthObjectId {
+        self.world_mut(|w| w.spawn(object))
+    }
+
+    /// Removes a geodetic [`EarthObject`] by ID, returning `true` if it existed.
+    pub fn remove_object(&mut self, id: EarthObjectId) -> bool {
+        self.world_mut(|w| w.remove(id))
+    }
+
+    /// Removes all geodetic [`EarthObject`]s from the world.
+    pub fn clear_objects(&mut self) {
+        self.world_mut(|w| w.clear());
+    }
+
+    /// Evaluates the live world transform (including resolved `Terrain` vs `SeaLevel` altitude)
+    /// for `id` under the current heightmap and view-morph state.
+    pub fn resolve_object_transform(&self, id: EarthObjectId) -> Option<ResolvedObjectTransform> {
+        let morph = self.current_surface_morph();
+        let placement = self.input.camera.placement_with_up(self.camera_up_dvec());
+        let vp_h = self.input.viewport.height.max(1.0) as f64;
+        let fov_y = self.input.camera.fov_y_deg;
+        let elev_on = self.input.elevation_enabled;
+        let worker_ref = &self.worker;
+        let guard = self.world.read().ok()?;
+        guard.resolve_object_transform(
+            id,
+            placement.eye,
+            vp_h,
+            fov_y,
+            elev_on,
+            morph,
+            &|lat, lon| {
+                if elev_on {
+                    worker_ref.sample_ground_elevation_m(lat, lon)
+                } else {
+                    0.0
+                }
+            },
+        )
+    }
+
+    /// Raycasts viewport pixel `(screen_x, screen_y)` against pickable [`EarthWorld`] objects
+    /// and the active planetary surface (terrain heightmap when `elevation_enabled`, sea level when off).
+    pub fn raycast(&self, screen_x: f64, screen_y: f64) -> Option<EarthRayHit> {
+        let morph = self.current_surface_morph();
+        let elev_on = self.input.elevation_enabled;
+        let worker_ref = &self.worker;
+        let guard = self.world.read().ok()?;
+        raycast_viewport(
+            screen_x,
+            screen_y,
+            self.input.viewport.width as f64,
+            self.input.viewport.height as f64,
+            &self.input.camera,
+            self.camera_up_dvec(),
+            elev_on,
+            morph,
+            Some(&guard),
+            &|lat, lon| {
+                if elev_on {
+                    worker_ref.sample_ground_elevation_m(lat, lon)
+                } else {
+                    0.0
+                }
+            },
+        )
+    }
+
+    /// Raycasts viewport pixel `(screen_x, screen_y)` strictly against the planetary surface
+    /// (ignoring pickable [`EarthObject`]s).
+    pub fn raycast_terrain(&self, screen_x: f64, screen_y: f64) -> Option<EarthRayHit> {
+        let morph = self.current_surface_morph();
+        let elev_on = self.input.elevation_enabled;
+        let worker_ref = &self.worker;
+        let (ray_origin, ray_dir) = crate::geodesy::screen_to_ray_with_up(
+            screen_x,
+            screen_y,
+            self.input.viewport.width as f64,
+            self.input.viewport.height as f64,
+            &self.input.camera,
+            self.camera_up_dvec(),
+        );
+        raycast_surface_ray(ray_origin, ray_dir, elev_on, morph, &|lat, lon| {
+            if elev_on {
+                worker_ref.sample_ground_elevation_m(lat, lon)
+            } else {
+                0.0
+            }
+        })
     }
 }

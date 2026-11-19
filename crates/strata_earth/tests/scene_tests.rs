@@ -7,17 +7,26 @@
 
 use std::time::Instant;
 use strata_earth::{
-    surrounding_tiles, tile_sampler, EarthInput, EarthScene, EntityMarker, FrameDescriptor,
-    Geodetic, MemoryTileSource, TileImage, TileKey, TileSource,
+    surrounding_tiles, tile_sampler, EarthGeometry, EarthInput, EarthMaterial, EarthObject,
+    EarthScene, FrameDescriptor, GeoPosition, Geodetic, MemoryTileSource, TileImage, TileKey,
+    TileSource,
 };
+use strata_render::compositor::DrawCommand;
 use strata_render::overlay3d::OverlayPrimitive;
 use strata_render::rasterizer::FrameBuffer;
 use strata_render::rasterizer3d::render_scene_3d_with_textures;
-use strata_render::scene3d::{Background3D, Geometry3D, Material3D};
+use strata_render::scene3d::{Background3D, Geometry3D, Material3D, Scene3D};
 use strata_style::types::Color;
 
 const W: usize = 1440;
 const H: usize = 900;
+
+fn built_scene3d(scene: &EarthScene, viewport: strata_layout::Rect) -> std::sync::Arc<Scene3D> {
+    match scene.to_draw_command(viewport) {
+        DrawCommand::DrawViewport3D { scene: s, .. } => s,
+        _ => panic!("expected DrawViewport3D"),
+    }
+}
 
 fn solid_tile(r: u8, g: u8, b: u8) -> TileImage {
     TileImage {
@@ -71,10 +80,11 @@ fn viewpoint(altitude_m: f64) -> EarthInput {
 
 fn render_scene(input: &EarthInput, scene: &EarthScene) -> FrameBuffer {
     let mut fb = FrameBuffer::new(W, H);
+    let s3d = built_scene3d(scene, input.viewport);
     render_scene_3d_with_textures(
         &mut fb,
         input.viewport,
-        scene.scene(),
+        &s3d,
         None,
         Some(scene.tile_registry().store()),
     );
@@ -220,7 +230,7 @@ fn scene_build_is_deterministic() {
         let mut source = source_for(&keys, &solid_tile(10, 20, 30));
         let mut scene = EarthScene::new();
         scene.build(&input, &mut source);
-        (scene.scene().clone(), scene.stats())
+        ((*built_scene3d(&scene, input.viewport)).clone(), scene.stats())
     };
     let (a, a_stats) = make();
     let (b, b_stats) = make();
@@ -229,24 +239,28 @@ fn scene_build_is_deterministic() {
 }
 
 #[test]
-fn graticule_and_markers_reach_the_overlay() {
-    let mut input = viewpoint(9_000_000.0);
-    input.markers.push(EntityMarker {
-        position: Geodetic::new(37.7749, -122.4194, 0.0),
-        label: "SF".to_string(),
-        color: Color::rgba(56, 189, 248, 255),
-    });
+fn graticule_and_world_labels_reach_the_overlay() {
+    let input = viewpoint(9_000_000.0);
     let mut source = MemoryTileSource::new();
     let mut scene = EarthScene::new();
+    scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::terrain(37.7749, -122.4194, 0.0),
+            EarthGeometry::beacon_pin(20.0, 5.0),
+        )
+        .with_label("SF")
+        .with_material(EarthMaterial::standard(Color::rgba(56, 189, 248, 255))),
+    );
     scene.build(&input, &mut source);
 
-    let overlay = scene.scene().overlay().expect("overlay attached");
+    let s3d = built_scene3d(&scene, input.viewport);
+    let overlay = s3d.overlay().expect("overlay attached");
     assert!(
         overlay
             .primitives
             .iter()
-            .any(|p| matches!(p, OverlayPrimitive::Marker { .. })),
-        "the marker must be present"
+            .any(|p| matches!(p, OverlayPrimitive::Label { .. })),
+        "the object label must be present"
     );
     assert!(
         overlay
@@ -261,13 +275,13 @@ fn graticule_and_markers_reach_the_overlay() {
     // overlay and the geometry share a camera.
     let frame = scene.renderer_overlay_frame();
     let projected = overlay.project(&frame);
-    let markers = projected
+    let labels = projected
         .iter()
-        .filter(|c| matches!(c, strata_render::overlay3d::OverlayCommand::Marker { .. }))
+        .filter(|c| matches!(c, strata_render::overlay3d::OverlayCommand::Label { .. }))
         .count();
     assert_eq!(
-        markers, 1,
-        "exactly one marker should project onto the visible globe"
+        labels, 1,
+        "exactly one object label should project onto the visible globe"
     );
 }
 
@@ -279,8 +293,9 @@ fn layer_toggles_remove_their_content() {
     let mut source = MemoryTileSource::new();
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
+    let s3d = built_scene3d(&scene, input.viewport);
     assert!(
-        scene.scene().overlay().is_none(),
+        s3d.overlay().is_none(),
         "no overlay when both toggles are off"
     );
 
@@ -317,13 +332,6 @@ fn tile_registry_reuses_handles_and_evicts() {
 fn populated_input() -> EarthInput {
     let mut input = viewpoint(3_000.0);
     input.tile_grid = 9;
-    input.markers = (0..8)
-        .map(|i| EntityMarker {
-            position: Geodetic::new(37.0 + i as f64 * 0.2, -122.0 + i as f64 * 0.2, 0.0),
-            label: format!("node-{i}"),
-            color: Color::rgba(56, 189, 248, 255),
-        })
-        .collect();
     input
 }
 
@@ -334,6 +342,16 @@ fn measure_frame_budget(input: &EarthInput) -> (f64, strata_earth::FrameStats) {
     let keys = surrounding_tiles(input.camera.focus, 18);
     let mut source = source_for(&keys, &solid_tile(40, 90, 60));
     let mut scene = EarthScene::new();
+    for i in 0..8 {
+        scene.spawn_object(
+            EarthObject::new(
+                GeoPosition::terrain(37.0 + i as f64 * 0.2, -122.0 + i as f64 * 0.2, 5.0),
+                EarthGeometry::beacon_pin(20.0, 5.0),
+            )
+            .with_label(format!("node-{i}"))
+            .with_material(EarthMaterial::standard(Color::rgba(56, 189, 248, 255))),
+        );
+    }
     let span = strata_earth::tile_patch_span_deg(&input.camera, input.patch_scale);
     let patches = strata_earth::surrounding_patches(input.camera.focus, span);
     scene.set_building_source(Some(Box::new(grid_buildings(&patches))));
@@ -341,22 +359,26 @@ fn measure_frame_budget(input: &EarthInput) -> (f64, strata_earth::FrameStats) {
     // Warm-up: buffers, textures, and the rasterizer caches.
     scene.build(input, &mut source);
     let mut fb = FrameBuffer::new(W, H);
-    render_scene_3d_with_textures(
-        &mut fb,
-        input.viewport,
-        scene.scene(),
-        None,
-        Some(scene.tile_registry().store()),
-    );
+    {
+        let s3d = built_scene3d(&scene, input.viewport);
+        render_scene_3d_with_textures(
+            &mut fb,
+            input.viewport,
+            &s3d,
+            None,
+            Some(scene.tile_registry().store()),
+        );
+    }
 
     let mut samples = Vec::with_capacity(30);
     for _ in 0..30 {
         let start = Instant::now();
         scene.build(input, &mut source);
+        let s3d = built_scene3d(&scene, input.viewport);
         render_scene_3d_with_textures(
             &mut fb,
             input.viewport,
-            scene.scene(),
+            &s3d,
             None,
             Some(scene.tile_registry().store()),
         );
@@ -442,7 +464,8 @@ fn textured_meshes_are_the_only_geometry_the_plugin_emits() {
     let mut source = source_for(&keys, &solid_tile(0, 0, 0));
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
-    for mesh in &scene.scene().meshes {
+    let s3d = built_scene3d(&scene, input.viewport);
+    for mesh in &s3d.meshes {
         assert!(
             matches!(mesh.geometry, Geometry3D::CustomTextured { .. }),
             "tile geometry must carry UVs"
@@ -458,9 +481,7 @@ fn textured_meshes_are_the_only_geometry_the_plugin_emits() {
         );
     }
     assert!(
-        scene
-            .scene()
-            .meshes
+        s3d.meshes
             .iter()
             .any(|m| matches!(m.material, Material3D::TexturedBatch(_))),
         "terrain must be one batched mesh"
@@ -496,8 +517,8 @@ fn relief_sampling_raises_the_terrain_surface() {
     scene.build(&input, &mut source);
 
     let origin = strata_earth::geodetic_to_ecef(input.camera.focus);
-    let mesh = scene
-        .scene()
+    let s3d = built_scene3d(&scene, input.viewport);
+    let mesh = s3d
         .meshes
         .iter()
         .find(|mesh| matches!(mesh.material, Material3D::TexturedBatch(_)))
@@ -568,8 +589,8 @@ fn terrain_is_one_batched_mesh_and_buildings_are_one_mesh() {
     scene.set_building_source(Some(Box::new(grid_buildings(&patches))));
     scene.build(&input, &mut source);
 
-    let batches: Vec<&strata_render::scene3d::TexturedBatchMaterial3D> = scene
-        .scene()
+    let s3d = built_scene3d(&scene, input.viewport);
+    let batches: Vec<&strata_render::scene3d::TexturedBatchMaterial3D> = s3d
         .meshes
         .iter()
         .filter_map(|mesh| match &mesh.material {
@@ -691,7 +712,8 @@ fn celestial_bodies_are_declared_depth_test_free() {
     let mut scene = EarthScene::new();
     scene.build(&input, &mut source);
 
-    let bodies = scene.scene().celestial();
+    let s3d = built_scene3d(&scene, input.viewport);
+    let bodies = s3d.celestial();
     assert!(!bodies.is_empty(), "the globe regime must declare the sun");
     for body in bodies {
         assert!(
@@ -717,7 +739,8 @@ fn cloud_shell_is_a_declaration_not_drawn_geometry() {
     // The software rasterizer does not draw cloud shells; they are declared for
     // a host pass. At terrain altitude the shell radius is far beyond the local
     // far plane, so drawing it here would either clip or cover the frame.
-    let shells = scene.scene().cloud_shells();
+    let s3d = built_scene3d(&scene, input.viewport);
+    let shells = s3d.cloud_shells();
     assert_eq!(shells.len(), 1, "the cloud layer must still be declared");
     assert!(
         shells[0].radius > 6_000_000.0,
@@ -744,7 +767,8 @@ fn graticule_only_emits_the_eye_facing_hemisphere() {
 
     let origin = strata_earth::geodetic_to_ecef(input.camera.focus);
     let eye = input.camera.placement().eye.sub(origin);
-    let overlay = scene.scene().overlay().expect("graticule overlay");
+    let s3d = built_scene3d(&scene, input.viewport);
+    let overlay = s3d.overlay().expect("graticule overlay");
     let mut lines = 0;
     let mut points = 0;
     for primitive in &overlay.primitives {

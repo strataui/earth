@@ -1,8 +1,9 @@
 //! Acceptance evaluation for the ground parity pair.
 
 use strata_earth::{
-    evaluate_acceptance, AcceptanceCriteria, EarthCamera, EarthInput, EarthScene, EntityMarker,
-    Geodetic, MemoryTileSource, PixelDelta, TileElevation, TileImage, TileKey,
+    evaluate_acceptance, AcceptanceCriteria, EarthCamera, EarthGeometry, EarthInput, EarthMaterial,
+    EarthObject, EarthScene, GeoPosition, Geodetic, MemoryTileSource, PixelDelta, TileElevation,
+    TileImage, TileKey,
 };
 use strata_layout::Rect;
 use strata_style::types::Color;
@@ -48,11 +49,6 @@ fn input() -> EarthInput {
         cloud_cover: 0.0,
         daylight: 0.6,
         tile_grid: 5,
-        markers: vec![EntityMarker {
-            position: Geodetic::new(37.7749, -122.4194, 0.0),
-            label: "SF".to_string(),
-            color: Color::rgba(56, 189, 248, 255),
-        }],
         ..Default::default()
     }
 }
@@ -61,6 +57,14 @@ fn same_frame_delta() -> strata_earth::DescriptorDelta {
     let input = input();
     let (mut source, _) = source_for(&input);
     let mut scene = EarthScene::new();
+    scene.spawn_object(
+        EarthObject::new(
+            GeoPosition::terrain(37.7749, -122.4194, 0.0),
+            EarthGeometry::beacon_pin(20.0, 5.0),
+        )
+        .with_label("SF")
+        .with_material(EarthMaterial::standard(Color::rgba(56, 189, 248, 255))),
+    );
     scene.build(&input, &mut source);
     let descriptor = strata_earth::FrameDescriptor::capture(&scene, &input);
     strata_earth::compare(&descriptor, &scene)

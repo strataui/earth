@@ -1,16 +1,48 @@
 // Interactive Earth preview embedding `strata_earth::EarthView` alongside floating
-// top-right Strata HUD controls, with zero global window event hooks.
+// top-right Strata HUD controls, external keybind handling, and live raycast 3D object placement.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use strata::platform::KeyCode;
 use strata::prelude::*;
 use strata::WindowConfig;
 use strata::{launch_with_frame, AppFrameInfo, FrameOutcome};
 use strata_earth::{
-    EarthDefaultTileSource, EarthInput, EarthOrbitController, EarthView, EarthViewMode,
-    SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig,
+    Color, EarthDefaultTileSource, EarthGeometry, EarthInput, EarthMaterial, EarthObject,
+    EarthOrbitController, EarthView, EarthViewMode, GeoPosition, SpaceEnvironmentConfig,
+    SunDirectionMode, TileProviderPreset, WeatherConfig,
 };
+
+/// Example-local continuous exponential zoom rate (natural-log range units per second) for `K` / `L`.
+const PREVIEW_KEY_ZOOM_LN_PER_SEC: f64 = 1.95;
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewHeldZoom {
+    zoom_in: bool,
+    zoom_out: bool,
+    fast: bool,
+}
+
+impl PreviewHeldZoom {
+    #[inline]
+    fn is_active(self) -> bool {
+        self.zoom_in != self.zoom_out
+    }
+
+    #[inline]
+    fn step_earth(self, earth: &EarthView, dt_s: f64) {
+        let dir = (self.zoom_out as i32 - self.zoom_in as i32) as f64;
+        if dir != 0.0 && dt_s > 0.0 {
+            let rate = if self.fast {
+                PREVIEW_KEY_ZOOM_LN_PER_SEC * 1.6
+            } else {
+                PREVIEW_KEY_ZOOM_LN_PER_SEC
+            };
+            earth.zoom_by_ln(dir * rate * dt_s.clamp(0.0, 0.1));
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SunDemoMode {
@@ -36,6 +68,33 @@ where
             <span>{label}</span>
         </button>
     }
+}
+
+fn wire_preview_zoom_keys(earth: &EarthView, held: &Rc<RefCell<PreviewHeldZoom>>) {
+    let held_down = Rc::clone(held);
+    earth.on_key_down(move |ev| {
+        if ev.modifiers.ctrl || ev.modifiers.alt || ev.modifiers.meta {
+            return;
+        }
+        let mut h = held_down.borrow_mut();
+        h.fast = ev.modifiers.shift;
+        match ev.key {
+            KeyCode::KeyK => h.zoom_in = true,
+            KeyCode::KeyL => h.zoom_out = true,
+            _ => {}
+        }
+    });
+
+    let held_up = Rc::clone(held);
+    earth.on_key_up(move |ev| {
+        let mut h = held_up.borrow_mut();
+        h.fast = ev.modifiers.shift && !ev.key_str.starts_with("Shift");
+        match ev.key {
+            KeyCode::KeyK => h.zoom_in = false,
+            KeyCode::KeyL => h.zoom_out = false,
+            _ => {}
+        }
+    });
 }
 
 fn main() -> Result<(), String> {
@@ -66,6 +125,41 @@ fn main() -> Result<(), String> {
     input.weather = WeatherConfig::default();
 
     let earth = EarthView::with_orbit(&input, Box::new(source), orbit);
+    let held_zoom = Rc::new(RefCell::new(PreviewHeldZoom::default()));
+    wire_preview_zoom_keys(&earth, &held_zoom);
+
+    let click_place_on = Signal::new(false);
+    let placed_count = Signal::new(0usize);
+    let last_ray_status: Signal<Option<String>> = Signal::new(None);
+
+    // External click -> world raycast -> geodetic 3D object placement (+5.0m above active terrain/sea level).
+    {
+        let earth_click = earth.clone();
+        let place_sig = click_place_on.clone();
+        let count_sig = placed_count.clone();
+        let status_sig = last_ray_status.clone();
+        earth.on_click(move |ev| {
+            if place_sig.untracked_get() || ev.modifiers.shift {
+                if let Some(hit) = earth_click.raycast(ev.x, ev.y) {
+                    earth_click.spawn_object(
+                        EarthObject::new(
+                            GeoPosition::terrain(hit.lat_deg, hit.lon_deg, 5.0),
+                            EarthGeometry::beacon_pin(28.0, 7.5),
+                        )
+                        .with_material(EarthMaterial::standard(Color::rgb(56, 189, 248)))
+                        .with_min_pixel_size(22.0),
+                    );
+                    let count = earth_click.object_count();
+                    count_sig.set(count);
+                    status_sig.set(Some(format!(
+                        "Object #{count} · {:.4}°, {:.4}° · Surf {:.1}m (+5.0m Terrain)",
+                        hit.lat_deg, hit.lon_deg, hit.altitude_m
+                    )));
+                }
+            }
+        });
+    }
+
     let sun_demo_mode = Rc::new(RefCell::new(SunDemoMode::SystemClock));
     let sun_cycle_sim_s = Rc::new(RefCell::new(1_735_689_600.0f64));
     let active_preset = Rc::new(RefCell::new(TileProviderPreset::ArcGisWorldImagery));
@@ -103,6 +197,9 @@ fn main() -> Result<(), String> {
                     inp.ocean_waves.enabled,
                 )
             });
+        let cur_place_on = click_place_on.get();
+        let cur_placed_count = placed_count.get();
+        let cur_ray_status = last_ray_status.get();
         let cur_sun_mode = *mode_for_view.borrow();
         let cur_preset = *preset_for_view.borrow();
         let (cur_fps, cur_ms) = *fps_for_view.borrow();
@@ -159,6 +256,33 @@ fn main() -> Result<(), String> {
                 e_fly.fly_to(lat, lon, None);
             },
         );
+
+        let place_toggle_sig = click_place_on.clone();
+        let btn_place = control_btn(
+            if cur_place_on {
+                "Click Place: On (+5m)"
+            } else {
+                "Click Place: Off"
+            }
+            .to_string(),
+            cur_place_on,
+            move |_| {
+                place_toggle_sig.set(!place_toggle_sig.untracked_get());
+            },
+        );
+
+        let e_clear = earth_for_view.clone();
+        let clear_count_sig = placed_count.clone();
+        let clear_status_sig = last_ray_status.clone();
+        let btn_clear = if cur_placed_count > 0 {
+            control_btn(format!("Clear ({cur_placed_count})"), false, move |_| {
+                e_clear.clear_objects();
+                clear_count_sig.set(0);
+                clear_status_sig.set(None);
+            })
+        } else {
+            rsx! { <span class="hidden" /> }
+        };
 
         let e3 = earth_for_view.clone();
         let btn_sun_lit = control_btn(
@@ -280,12 +404,9 @@ fn main() -> Result<(), String> {
 
         let e10 = earth_for_view.clone();
         let btn_elev = control_btn("Heightmap".to_string(), elev_on, move |_| {
-            e10.with_state_mut(|st| {
-                let next = !st.viewport.elevation_enabled();
-                st.viewport.set_elevation_enabled(next);
-                st.sync_camera();
-                st.notify_ui_changed();
-            });
+            let next = !e10.elevation_enabled();
+            e10.set_elevation_enabled(next);
+            e10.with_state(|st| st.notify_ui_changed());
         });
 
         let e11 = earth_for_view.clone();
@@ -362,6 +483,17 @@ fn main() -> Result<(), String> {
         });
 
         let fps_text = format!("{cur_fps} FPS · {cur_ms:.1} ms");
+        let status_badge = match cur_ray_status {
+            Some(msg) => rsx! {
+                <div
+                    data-earth-ray-status="true"
+                    class="absolute bottom-3 left-3 z-20 px-3 py-1.5 rounded-xl bg-neutral-950/85 border border-sky-500/40 text-sky-300 text-[11px] font-mono select-none pointer-events-none"
+                >
+                    <span>{msg}</span>
+                </div>
+            },
+            None => rsx! { <span class="hidden" /> },
+        };
 
         rsx! {
             <div class="relative w-full h-full bg-black overflow-hidden">
@@ -372,14 +504,17 @@ fn main() -> Result<(), String> {
                 >
                     <span>{fps_text}</span>
                 </div>
+                {status_badge}
                 <div
                     data-earth-controls="true"
-                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[440px] p-2 rounded-xl bg-neutral-950/85 border border-neutral-800/85"
+                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[460px] p-2 rounded-xl bg-neutral-950/85 border border-neutral-800/85"
                 >
                     {btn_mode}
                     {btn_provider}
                     {btn_view}
                     {btn_fly}
+                    {btn_place}
+                    {btn_clear}
                     {btn_sun_lit}
                     {btn_city}
                     {btn_ocean}
@@ -409,6 +544,7 @@ fn main() -> Result<(), String> {
 
     let earth_for_events = earth.clone();
     let earth_for_frame = earth;
+    let held_for_frame = Rc::clone(&held_zoom);
     let mode_for_frame = sun_demo_mode;
     let sim_for_frame = sun_cycle_sim_s;
     let fps_for_frame = fps_readout;
@@ -422,8 +558,10 @@ fn main() -> Result<(), String> {
     launch_with_frame(
         build_root,
         config,
-        move |event, _rt| {
-            handle_preview_key_event(&earth_for_events, event);
+        move |event, rt| {
+            if rt.active_focus.is_none() {
+                earth_for_events.dispatch_platform_event(event);
+            }
             false
         },
         None,
@@ -454,6 +592,11 @@ fn main() -> Result<(), String> {
                 fps_window_start = std::time::Instant::now();
             }
 
+            let held_now = *held_for_frame.borrow();
+            if held_now.is_active() {
+                held_now.step_earth(&earth_for_frame, dt);
+            }
+
             if *mode_for_frame.borrow() == SunDemoMode::OrbitalCycle {
                 *sim_for_frame.borrow_mut() += dt * 3_600.0;
                 let sim_s = *sim_for_frame.borrow();
@@ -475,46 +618,11 @@ fn main() -> Result<(), String> {
     )
 }
 
-fn handle_preview_key_event(earth: &EarthView, event: &strata::platform::PlatformEvent) {
-    use strata::platform::{KeyCode, PlatformEvent};
-
-    match event {
-        PlatformEvent::KeyDown { key, modifiers }
-            if !modifiers.ctrl && !modifiers.alt && !modifiers.meta =>
-        {
-            match key {
-                KeyCode::KeyK => earth.with_state_mut(|st| {
-                    st.orbit.set_zoom_fast_modifier(modifiers.shift);
-                    st.orbit.set_zoom_in_held(true);
-                }),
-                KeyCode::KeyL => earth.with_state_mut(|st| {
-                    st.orbit.set_zoom_fast_modifier(modifiers.shift);
-                    st.orbit.set_zoom_out_held(true);
-                }),
-                _ => {}
-            }
-        }
-        PlatformEvent::KeyUp { key, modifiers } => match key {
-            KeyCode::KeyK => earth.with_state_mut(|st| {
-                st.orbit.set_zoom_fast_modifier(modifiers.shift);
-                st.orbit.set_zoom_in_held(false);
-            }),
-            KeyCode::KeyL => earth.with_state_mut(|st| {
-                st.orbit.set_zoom_fast_modifier(modifiers.shift);
-                st.orbit.set_zoom_out_held(false);
-            }),
-            _ => {}
-        },
-        PlatformEvent::WindowFocused(false) | PlatformEvent::WindowCloseRequested => {
-            earth.with_state_mut(|st| st.orbit.clear_held_keys());
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::handle_preview_key_event;
+    use super::{wire_preview_zoom_keys, PreviewHeldZoom};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use strata::platform::{KeyCode, Modifiers, PlatformEvent};
     use strata_earth::{
         ecef_to_geodetic, EarthDefaultTileSource, EarthInput, EarthOrbitController, EarthView,
@@ -523,48 +631,49 @@ mod tests {
     use strata_render::camera64::DVec3;
 
     #[test]
-    fn preview_k_and_l_hold_events_zoom_in_and_out_smoothly() {
+    fn preview_k_and_l_hold_events_zoom_in_and_out_smoothly_via_external_callbacks() {
         let input = EarthInput::globe();
         let earth = EarthView::new(&input, Box::new(EarthDefaultTileSource::offline_basemap()));
+        let held = Rc::new(RefCell::new(PreviewHeldZoom::default()));
+        wire_preview_zoom_keys(&earth, &held);
+
         let start_range = earth.with_state(|st| st.orbit.range_m);
 
-        handle_preview_key_event(
-            &earth,
-            &PlatformEvent::KeyDown {
-                key: KeyCode::KeyK,
-                modifiers: Modifiers::default(),
-            },
-        );
+        earth.dispatch_platform_event(&PlatformEvent::KeyDown {
+            key: KeyCode::KeyK,
+            modifiers: Modifiers::default(),
+        });
+        assert!(held.borrow().is_active());
         for _ in 0..60 {
-            let _ = earth.step_frame(1.0 / 120.0);
+            let dt = 1.0 / 120.0;
+            held.borrow().step_earth(&earth, dt);
+            let _ = earth.step_frame(dt);
         }
-        handle_preview_key_event(
-            &earth,
-            &PlatformEvent::KeyUp {
-                key: KeyCode::KeyK,
-                modifiers: Modifiers::default(),
-            },
-        );
+        earth.dispatch_platform_event(&PlatformEvent::KeyUp {
+            key: KeyCode::KeyK,
+            modifiers: Modifiers::default(),
+        });
+        assert!(!held.borrow().is_active());
         let zoomed_in = earth.with_state(|st| st.orbit.range_m);
         assert!(
             zoomed_in < start_range * 0.50,
             "holding K for 0.5s should zoom closer quickly: start={start_range}, after={zoomed_in}"
         );
 
-        handle_preview_key_event(
-            &earth,
-            &PlatformEvent::KeyDown {
-                key: KeyCode::KeyL,
-                modifiers: Modifiers::default(),
-            },
-        );
+        earth.dispatch_platform_event(&PlatformEvent::KeyDown {
+            key: KeyCode::KeyL,
+            modifiers: Modifiers::default(),
+        });
+        assert!(held.borrow().is_active());
         for _ in 0..75 {
-            let _ = earth.step_frame(1.0 / 120.0);
+            let dt = 1.0 / 120.0;
+            held.borrow().step_earth(&earth, dt);
+            let _ = earth.step_frame(dt);
         }
-        handle_preview_key_event(&earth, &PlatformEvent::WindowFocused(false));
+        earth.dispatch_platform_event(&PlatformEvent::WindowFocused(false));
         assert!(
-            earth.with_state(|st| !st.orbit.is_zoom_key_held()),
-            "losing window focus must release held K/L keys"
+            !held.borrow().is_active(),
+            "losing window focus must synthesize on_key_up and release held K/L keys"
         );
         let zoomed_out = earth.with_state(|st| st.orbit.range_m);
         assert!(

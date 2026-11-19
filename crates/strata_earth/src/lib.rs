@@ -1,18 +1,5 @@
-//! Earth scene plugin.
-//!
-//! Assembles the renderer state for one Earth frame: camera, background,
-//! terrain tiles, relief walls, building prisms, and the 2D overlay pass. The
-//! crate is additive: it builds a [`strata_render::scene3d::Scene3D`] using only
-//! the public engine surface, so existing 3D users are unaffected.
-//!
-//! Design rules enforced by tests:
-//!
-//! - No `egui`, widget, or shell-command dependency; the plugin is pure Rust
-//!   over the engine.
-//! - Tile decisions are separate from texture upload ([`tiles::TileSource`] vs
-//!   [`tiles::TileRegistry`]).
-//! - World coordinates stay f64 until the render hand-off.
-//! - Mesh rebuilds reuse buffers; steady-state frames do not allocate.
+//! Strata Earth planetary 3D engine: native `f64` geodetic scene graph ([`EarthWorld`]),
+//! hardware-instanced double-single RTE rendering, terrain/mode-aware raycasting, and `<EarthView>`.
 
 pub mod acceptance;
 pub mod assets_cdn;
@@ -20,11 +7,14 @@ pub mod astro;
 pub mod basemap;
 pub mod controller;
 pub mod descriptor;
+#[cfg(feature = "widget")]
+pub mod events;
 pub mod geodesy;
 pub mod gltf;
 pub mod json;
 pub mod labels;
 pub mod plugins;
+pub mod raycast;
 pub mod satellites;
 pub mod scene;
 pub mod skybox;
@@ -32,6 +22,7 @@ pub mod tiles;
 #[cfg(feature = "widget")]
 pub mod widget;
 pub mod worker;
+pub mod world;
 
 pub use assets_cdn::{
     sha256_hex, versioned_legacy_filename, AssetManager, AssetManifest, AssetManifestEntry,
@@ -68,24 +59,30 @@ pub use basemap::{
 };
 pub use descriptor::{
     compare, replay, CameraDelta, DeltaSummary, DescriptorCamera, DescriptorCelestial,
-    DescriptorClouds, DescriptorDelta, DescriptorMarker, DescriptorPatch, DescriptorRing,
+    DescriptorClouds, DescriptorDelta, DescriptorObject, DescriptorPatch, DescriptorRing,
     DescriptorSphere, DescriptorTile, FrameDescriptor, PatchDelta, PatchMatch, TileDelta,
     TileSupply, DESCRIPTOR_FORMAT, DESCRIPTOR_VERSION, DESCRIPTOR_VERSION_V1,
+};
+#[cfg(feature = "widget")]
+pub use events::{
+    EarthCameraState, EarthControlsConfig, EarthKeyEvent, EarthModifiers, EarthMouseButton,
+    EarthPointerEvent, EarthWheelEvent,
 };
 pub use geodesy::{
     build_tile_local_rtc_mesh, build_tile_local_rtc_mesh_morphed, clamp_latitude,
     compute_seamless_25d_blend, compute_tile_sse, depth_range, ecef_to_geodetic, geodetic_to_ecef,
     horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum, level_for_altitude,
-    mercator_gy_to_lat_deg, pick_geodetic, pick_geodetic_with_up, raycast_ellipsoid,
-    resolve_tile_imagery, retained_camera_uniforms, retained_camera_uniforms_with_up,
-    rte_gpu_relative_position, rte_relative_position_f32, screen_to_ray, screen_to_ray_with_up,
-    split_dvec3_to_high_low, split_f64_to_high_low, tile_bounding_sphere,
-    tile_bounding_sphere_projected, tile_bounds, tile_bounds_mercator, traverse_quadtree_lod,
-    traverse_quadtree_lod_2d_flat, traverse_quadtree_lod_frustum6,
-    traverse_quadtree_lod_frustum6_projected, traverse_quadtree_lod_frustum6_projected_with_up,
-    wrap_longitude, CameraPlacement, EarthCamera, Frustum6, Geodetic, LocalFrame, RteEyeUniforms,
-    SurfaceMorphParams, TileKey, TileProjection, TileTextureResolution, GLOBE_ALTITUDE_M,
-    MAX_QUADTREE_LEAVES,
+    mercator_gy_to_lat_deg, pick_geodetic, pick_geodetic_with_up, project_morphed_point_and_frame,
+    raycast_ellipsoid, resolve_tile_imagery, retained_camera_uniforms,
+    retained_camera_uniforms_with_up, rte_gpu_relative_position, rte_relative_position_f32,
+    screen_to_ray, screen_to_ray_with_up, split_dvec3_to_high_low, split_f64_to_high_low,
+    stabilized_surface_morph, tile_bounding_sphere, tile_bounding_sphere_projected, tile_bounds,
+    tile_bounds_mercator, traverse_quadtree_lod, traverse_quadtree_lod_2d_flat,
+    traverse_quadtree_lod_frustum6, traverse_quadtree_lod_frustum6_projected,
+    traverse_quadtree_lod_frustum6_projected_with_up, unproject_morphed_surface_lat_lon,
+    wrap_longitude, AltitudeMode, CameraPlacement, EarthCamera, Frustum6, GeoPosition, Geodetic,
+    LocalFrame, RteEyeUniforms, SurfaceMorphParams, TileKey, TileProjection,
+    TileTextureResolution, GLOBE_ALTITUDE_M, MAX_QUADTREE_LEAVES,
 };
 pub use gltf::{
     build_25d_weather_meshes, cc0_cloud_mesh, cc0_rain_mesh, cc0_snow_mesh, parse_glb_mesh,
@@ -97,6 +94,7 @@ pub use plugins::{
     EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext, EarthWorldBuildContext,
     LoadedTileImagerySnapshot, OceanWavesPlugin, SatellitesPlugin, WeatherPlugin,
 };
+pub use raycast::{raycast_ray, raycast_surface_ray, raycast_viewport, EarthRayHit};
 pub use satellites::{
     build_3d_satellites_meshes, embedded_satellite_elements, parse_celestrak_gp_json,
     propagate_satellite_ecef, PropagatedSatellite, SatelliteCatalogStore, SatelliteElement,
@@ -107,7 +105,7 @@ pub use scene::{
     parse_overpass_buildings, requested_tile, sky_gradient, surrounding_patches, surrounding_tiles,
     terrain_skirt_triangle_count, terrain_triangle_count, terrain_triangle_count_with_skirts,
     tile_patch_span_deg, BuildingFootprint, BuildingSource, EarthInput, EarthLowLevelState,
-    EarthScene, EarthViewMode, EntityMarker, FrameStats, LayerToggles, MemoryBuildingSource,
+    EarthScene, EarthViewMode, FrameStats, LayerToggles, MemoryBuildingSource,
     NetworkBuildingSource, OceanWavesConfig, PatchBounds, PatchFrame, SpaceEnvironmentConfig,
     SunDirectionMode, SurfaceMode,
 };
@@ -121,12 +119,19 @@ pub use tiles::{
     TileProviderPreset, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
 };
 pub use controller::{
-    altitude_for_zoom_2d, fly_to, zoom_2d_for_altitude, EarthOrbitController, DEFAULT_FLY_TO_ALTITUDE_M,
-    DEFAULT_FOV_Y_DEG, GLOBAL_OVERVIEW_RANGE_M, GROUND_CLEARANCE_M, KEY_ZOOM_LN_PER_SEC,
+    altitude_for_zoom_2d, fly_to, zoom_2d_for_altitude, EarthOrbitController,
+    DEFAULT_FLY_TO_ALTITUDE_M, DEFAULT_FOV_Y_DEG, GLOBAL_OVERVIEW_RANGE_M, GROUND_CLEARANCE_M,
     LOCAL_TRANSITION_RANGE_M, MAX_RANGE_M, MIN_RANGE_M,
 };
 #[cfg(feature = "widget")]
-pub use widget::{EarthOverlayContext, EarthOverlayPlugin, EarthView, EarthViewState};
+pub use widget::{
+    EarthOverlayContext, EarthOverlayPlugin, EarthView, EarthViewState, CLICK_MAX_TRAVEL_PX,
+};
 pub use worker::{
     EarthTileWorker, EarthViewport, EarthViewportStats, RetainedBuildStats, RetainedTerrainBuilder,
+};
+pub use strata_style::types::Color;
+pub use world::{
+    EarthGeometry, EarthMaterial, EarthMeshId, EarthObject, EarthObjectId, EarthVertex,
+    EarthWorld, GeoOrientation, ObjectAnchor, ResolvedObjectTransform,
 };

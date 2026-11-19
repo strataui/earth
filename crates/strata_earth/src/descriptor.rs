@@ -211,11 +211,12 @@ pub struct DescriptorRing {
     pub tiles: Vec<DescriptorTile>,
 }
 
-/// One overlay marker.
+/// One geodetic 3D object serialized from [`crate::world::EarthWorld`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct DescriptorMarker {
+pub struct DescriptorObject {
     pub position: [f64; 3],
-    pub label: String,
+    pub altitude_mode: crate::geodesy::AltitudeMode,
+    pub label: Option<String>,
     pub color: [f64; 4],
 }
 
@@ -259,7 +260,7 @@ pub struct FrameDescriptor {
     pub surface: Option<DescriptorSphere>,
     /// Per-level tile supply for a spherical surface.
     pub rings: Vec<DescriptorRing>,
-    pub markers: Vec<DescriptorMarker>,
+    pub objects: Vec<DescriptorObject>,
     pub sky_top: [f64; 4],
     pub sky_bottom: [f64; 4],
     pub celestial: Vec<DescriptorCelestial>,
@@ -447,19 +448,20 @@ impl FrameDescriptor {
                 patches
             },
             tiles,
-            markers: input
-                .markers
-                .iter()
-                .map(|marker| DescriptorMarker {
-                    position: [
-                        marker.position.lat_deg,
-                        marker.position.lon_deg,
-                        marker.position.height_m,
-                    ],
-                    label: marker.label.clone(),
-                    color: color_channels(marker.color),
-                })
-                .collect(),
+            objects: scene.world(|w| {
+                w.iter()
+                    .map(|(_, obj)| DescriptorObject {
+                        position: [
+                            obj.position.lat_deg,
+                            obj.position.lon_deg,
+                            obj.position.altitude_m,
+                        ],
+                        altitude_mode: obj.position.altitude_mode,
+                        label: obj.label.clone(),
+                        color: color_channels(obj.material.color),
+                    })
+                    .collect()
+            }),
             sky_top,
             sky_bottom,
             celestial,
@@ -502,20 +504,6 @@ impl FrameDescriptor {
             max_tile_level: self.max_tile_level,
             tile_grid: self.tile_grid,
             patch_scale: self.patch_scale,
-            markers: self
-                .markers
-                .iter()
-                .map(|marker| crate::scene::EntityMarker {
-                    position: Geodetic::new(
-                        marker.position[0],
-                        marker.position[1],
-                        marker.position[2],
-                    ),
-                    label: marker.label.clone(),
-                    color: color_from_channels(marker.color.map(Json::Number).as_ref())
-                        .unwrap_or(Color::WHITE),
-                })
-                .collect(),
             surface_mode: if self.surface.is_some() {
                 crate::scene::SurfaceMode::SphericalGlobe
             } else {
@@ -526,6 +514,31 @@ impl FrameDescriptor {
             fallback_tint: Color::rgba(128, 128, 128, 255),
             ..EarthInput::default()
         }
+    }
+
+    /// Populates `scene`'s [`crate::world::EarthWorld`] with the geodetic objects captured in this descriptor.
+    pub fn populate_world(&self, scene: &mut EarthScene) {
+        scene.world_mut(|w| {
+            w.clear();
+            for item in &self.objects {
+                let color = color_from_channels(item.color.map(Json::Number).as_ref())
+                    .unwrap_or(Color::WHITE);
+                let mut obj = crate::world::EarthObject::new(
+                    crate::geodesy::GeoPosition::new(
+                        item.position[0],
+                        item.position[1],
+                        item.position[2],
+                        item.altitude_mode,
+                    ),
+                    crate::world::EarthGeometry::beacon_pin(28.0, 7.0),
+                )
+                .with_color(color);
+                if let Some(ref lbl) = item.label {
+                    obj = obj.with_label(lbl.clone());
+                }
+                w.spawn(obj);
+            }
+        });
     }
 
     /// Serializes to canonical JSON.
@@ -584,15 +597,26 @@ impl FrameDescriptor {
         }
         entries.extend([
             (
-                "markers",
+                "objects",
                 Json::array(
-                    self.markers
+                    self.objects
                         .iter()
-                        .map(|marker| {
+                        .map(|obj| {
+                            let mode_str = match obj.altitude_mode {
+                                crate::geodesy::AltitudeMode::SeaLevel => "sea_level",
+                                crate::geodesy::AltitudeMode::Terrain => "terrain",
+                            };
                             Json::object(vec![
-                                ("position", Json::numbers(&marker.position)),
-                                ("label", Json::string(marker.label.clone())),
-                                ("color", Json::numbers(&marker.color)),
+                                ("position", Json::numbers(&obj.position)),
+                                ("altitude_mode", Json::string(mode_str)),
+                                (
+                                    "label",
+                                    match &obj.label {
+                                        Some(s) => Json::string(s.clone()),
+                                        None => Json::Null,
+                                    },
+                                ),
+                                ("color", Json::numbers(&obj.color)),
                             ])
                         })
                         .collect(),
@@ -777,33 +801,32 @@ impl FrameDescriptor {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let markers = value
-            .get("markers")
+        let objects = value
+            .get("objects")
             .and_then(Json::as_array)
             .unwrap_or(&[])
             .iter()
-            .map(|marker| {
+            .map(|obj| {
                 let position = numbers_from(
-                    marker
-                        .get("position")
+                    obj.get("position")
                         .and_then(Json::as_array)
-                        .ok_or_else(|| "missing marker.position".to_string())?,
+                        .ok_or_else(|| "missing object.position".to_string())?,
                     3,
-                    "marker.position",
+                    "object.position",
                 )?;
+                let altitude_mode = match obj.get("altitude_mode").and_then(Json::as_str) {
+                    Some("sea_level") => crate::geodesy::AltitudeMode::SeaLevel,
+                    _ => crate::geodesy::AltitudeMode::Terrain,
+                };
                 let color = color_from_channels(
-                    marker
-                        .get("color")
+                    obj.get("color")
                         .and_then(Json::as_array)
-                        .ok_or_else(|| "missing marker.color".to_string())?,
+                        .ok_or_else(|| "missing object.color".to_string())?,
                 )?;
-                Ok(DescriptorMarker {
+                Ok(DescriptorObject {
                     position: [position[0], position[1], position[2]],
-                    label: marker
-                        .get("label")
-                        .and_then(Json::as_str)
-                        .unwrap_or("")
-                        .to_string(),
+                    altitude_mode,
+                    label: obj.get("label").and_then(Json::as_str).map(str::to_string),
                     color: color_channels(color),
                 })
             })
@@ -924,7 +947,7 @@ impl FrameDescriptor {
             tiles,
             surface,
             rings,
-            markers,
+            objects,
             sky_top: [sky_top[0], sky_top[1], sky_top[2], sky_top[3]],
             sky_bottom: [sky_bottom[0], sky_bottom[1], sky_bottom[2], sky_bottom[3]],
             celestial,
@@ -996,6 +1019,7 @@ pub fn replay(
     source: &mut dyn TileSource,
 ) -> bool {
     let input = descriptor.earth_input();
+    descriptor.populate_world(scene);
     scene.build(&input, source);
     descriptor.matches(scene)
 }
@@ -1327,7 +1351,7 @@ pub fn compare(descriptor: &FrameDescriptor, scene: &EarthScene) -> DescriptorDe
         far,
         position,
         ..
-    } = scene.scene().camera
+    } = scene.internal_scene().camera
     {
         let aspect = descriptor.viewport[0] / descriptor.viewport[1].max(1.0);
         camera.scene_camera_present = true;

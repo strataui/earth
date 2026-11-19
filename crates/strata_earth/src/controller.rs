@@ -85,8 +85,6 @@ fn up_dir_from_heading(lat_deg: f64, lon_deg: f64, heading_deg: f64) -> [f64; 3]
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Continuous exponential zoom rate (natural-log range units per second) when holding zoom keys.
-pub const KEY_ZOOM_LN_PER_SEC: f64 = 1.95;
 /// Default destination altitude above surface (`75 m`, within `50..=100 m`) when `altitude_m` is `None`.
 pub const DEFAULT_FLY_TO_ALTITUDE_M: f64 = 75.0;
 /// Full-world overview range (`18,500 km`) reached during the 3D pull-back phase of [`EarthOrbitController::fly_to`].
@@ -203,9 +201,6 @@ pub struct EarthOrbitController {
     carry_pan_vel: (f64, f64),
     carry_orbit_vel: (f64, f64),
     active_transit: Option<OrbitalTransit>,
-    zoom_in_held: bool,
-    zoom_out_held: bool,
-    zoom_fast_modifier: bool,
     is_2d_hint: bool,
     ground_needs_snap: bool,
     last_middle_click: Option<(Instant, f64, f64)>,
@@ -238,9 +233,6 @@ impl Default for EarthOrbitController {
             carry_pan_vel: (0.0, 0.0),
             carry_orbit_vel: (0.0, 0.0),
             active_transit: None,
-            zoom_in_held: false,
-            zoom_out_held: false,
-            zoom_fast_modifier: false,
             is_2d_hint: false,
             ground_needs_snap: true,
             last_middle_click: None,
@@ -255,6 +247,11 @@ impl EarthOrbitController {
     /// Creates a new controller initialized to a global hero framing.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline]
+    fn max_tilt_for_range(range_m: f64) -> f64 {
+        84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, range_m) * 0.4)
     }
 
     #[inline]
@@ -288,44 +285,60 @@ impl EarthOrbitController {
         self.active_transit = None;
     }
 
-    /// Sets whether the continuous zoom-in key (e.g. `K`) is currently held down.
+    /// Applies an exponential natural-log range step (`delta_ln < 0.0` zooms in closer;
+    /// `delta_ln > 0.0` zooms out farther) centered on the current focus point.
     #[inline]
-    pub fn set_zoom_in_held(&mut self, held: bool) {
-        self.zoom_in_held = held;
-        if held {
-            self.active_transit = None;
-            self.zoom_cursor_px = None;
+    pub fn zoom_by_ln(&mut self, delta_ln: f64) {
+        if !delta_ln.is_finite() || delta_ln.abs() < 1e-9 {
+            return;
+        }
+        self.active_transit = None;
+        self.zoom_cursor_px = None;
+        self.target_range_m =
+            (self.target_range_m * delta_ln.exp()).clamp(MIN_RANGE_M, MAX_RANGE_M);
+    }
+
+    /// Multiplies target camera range by `factor` (`< 1.0` zooms in; `> 1.0` zooms out).
+    #[inline]
+    pub fn zoom_by_factor(&mut self, factor: f64) {
+        if factor.is_finite() && factor > 0.0 {
+            self.zoom_by_ln(factor.ln());
         }
     }
 
-    /// Sets whether the continuous zoom-out key (e.g. `L`) is currently held down.
+    /// Applies an exponential natural-log range step anchored toward viewport pixel `(x, y)`.
     #[inline]
-    pub fn set_zoom_out_held(&mut self, held: bool) {
-        self.zoom_out_held = held;
-        if held {
-            self.active_transit = None;
-            self.zoom_cursor_px = None;
+    pub fn zoom_at_screen_px(&mut self, delta_ln: f64, x: f64, y: f64) {
+        if !delta_ln.is_finite() || delta_ln.abs() < 1e-9 {
+            return;
         }
+        self.active_transit = None;
+        self.target_range_m =
+            (self.target_range_m * delta_ln.exp()).clamp(MIN_RANGE_M, MAX_RANGE_M);
+        self.zoom_cursor_px = Some((x, y));
     }
 
-    /// Sets whether a fast-zoom modifier (e.g. `Shift`) is active during held keyboard zoom.
-    #[inline]
-    pub fn set_zoom_fast_modifier(&mut self, fast: bool) {
-        self.zoom_fast_modifier = fast;
+    /// Shifts camera focus by `(d_lat_deg, d_lon_deg)` degrees.
+    pub fn pan_by_deg(&mut self, d_lat_deg: f64, d_lon_deg: f64) {
+        self.active_transit = None;
+        let lat_lim = if self.is_2d_hint { 85.05112878 } else { 89.95 };
+        self.lat_deg = (self.lat_deg + d_lat_deg).clamp(-lat_lim, lat_lim);
+        self.lon_deg = ((self.lon_deg + d_lon_deg) + 180.0).rem_euclid(360.0) - 180.0;
+        self.sync_dirs_from_geo();
     }
 
-    /// Releases all held continuous keyboard inputs (e.g. when the window loses focus).
-    #[inline]
-    pub fn clear_held_keys(&mut self) {
-        self.zoom_in_held = false;
-        self.zoom_out_held = false;
-        self.zoom_fast_modifier = false;
-    }
-
-    /// Returns `true` if either continuous zoom key is currently held down.
-    #[inline]
-    pub fn is_zoom_key_held(&self) -> bool {
-        self.zoom_in_held || self.zoom_out_held
+    /// Rotates camera heading and pitch (`tilt_deg`) in degrees around the focus point.
+    pub fn orbit_by_deg(&mut self, d_heading_deg: f64, d_tilt_deg: f64) {
+        self.active_transit = None;
+        if self.is_2d_hint {
+            self.heading_deg = 0.0;
+            self.tilt_deg = 0.0;
+        } else {
+            let max_tilt = Self::max_tilt_for_range(self.range_m);
+            self.heading_deg = normalize_deg(self.heading_deg + d_heading_deg);
+            self.tilt_deg = (self.tilt_deg + d_tilt_deg).clamp(0.0, max_tilt);
+        }
+        self.sync_dirs_from_geo();
     }
 
     #[inline]
@@ -1075,8 +1088,8 @@ impl EarthOrbitController {
         true
     }
 
-    /// Advances smooth zoom easing, continuous held-key zoom, global [`Self::fly_to`] transits,
-    /// inertia momentum, and ground-elevation collision clamping.
+    /// Advances smooth zoom easing, global [`Self::fly_to`] transits, inertia momentum,
+    /// and ground-elevation collision clamping.
     ///
     /// Returns `true` if any camera state changed during this step.
     pub fn step_damping(
@@ -1091,20 +1104,6 @@ impl EarthOrbitController {
         }
         self.is_2d_hint = is_2d;
         let mut changed = false;
-
-        // 0. Continuous held-key zoom (`zoom_in_held` -> closer, `zoom_out_held` -> farther)
-        let key_zoom_dir = (self.zoom_out_held as i32 - self.zoom_in_held as i32) as f64;
-        if key_zoom_dir != 0.0 {
-            self.active_transit = None;
-            let rate = if self.zoom_fast_modifier {
-                KEY_ZOOM_LN_PER_SEC * 1.6
-            } else {
-                KEY_ZOOM_LN_PER_SEC
-            };
-            let factor = (key_zoom_dir * rate * dt).exp();
-            self.target_range_m = (self.target_range_m * factor).clamp(MIN_RANGE_M, MAX_RANGE_M);
-            self.zoom_cursor_px = None;
-        }
 
         let transit_active = self.step_orbital_transit(dt, is_2d);
         if transit_active {
@@ -1476,44 +1475,48 @@ mod tests {
     }
 
     #[test]
-    fn held_k_and_l_keys_zoom_in_and_out_continuously_with_good_speed() {
+    fn external_zoom_by_ln_pan_and_orbit_primitives_drive_camera_smoothly() {
         let mut ctrl = EarthOrbitController::new();
         ctrl.set_viewport_size(1440.0, 900.0);
         ctrl.jump_to(38.0, 24.0, 10_000_000.0, 0.0, 0.0);
 
-        // Hold zoom-in ('k') for 1.0 second at 144 Hz -> should zoom in substantially (~10x closer).
-        ctrl.set_zoom_in_held(true);
-        assert!(ctrl.is_zoom_key_held());
+        // External caller driving zoom_by_ln(-1.95 * dt) for 1.0 second at 144 Hz -> zooms in ~7x closer.
+        let dt = 1.0 / 144.0;
         for _ in 0..144 {
-            assert!(ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0));
+            ctrl.zoom_by_ln(-1.95 * dt);
+            assert!(ctrl.step_damping(dt, false, |_, _| 0.0));
         }
-        ctrl.set_zoom_in_held(false);
-        assert!(!ctrl.is_zoom_key_held());
         assert!(
             ctrl.range_m < 2_200_000.0 && ctrl.range_m > 500_000.0,
-            "holding zoom-in for 1s should zoom smoothly from 10,000 km into ~1,400-1,800 km, got {}",
+            "driving zoom_by_ln(-1.95 * dt) for 1s should zoom smoothly from 10,000 km into ~1,400-1,800 km, got {}",
             ctrl.range_m
         );
 
-        // Let smooth release tail settle.
         for _ in 0..30 {
-            ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0);
+            ctrl.step_damping(dt, false, |_, _| 0.0);
         }
         let zoomed_in_range = ctrl.range_m;
 
-        // Hold zoom-out ('l') for 1.0 second at 144 Hz -> should zoom back out smoothly.
-        ctrl.set_zoom_out_held(true);
+        // External caller driving zoom_by_ln(+1.95 * dt) for 1.0 second at 144 Hz -> zooms back out.
         for _ in 0..144 {
-            assert!(ctrl.step_damping(1.0 / 144.0, false, |_, _| 0.0));
+            ctrl.zoom_by_ln(1.95 * dt);
+            assert!(ctrl.step_damping(dt, false, |_, _| 0.0));
         }
-        ctrl.clear_held_keys();
-        assert!(!ctrl.is_zoom_key_held());
         assert!(
             ctrl.range_m > zoomed_in_range * 4.5,
-            "holding zoom-out for 1s should zoom back out substantially, got {} vs {}",
+            "driving zoom_by_ln(+1.95 * dt) for 1s should zoom back out substantially, got {} vs {}",
             ctrl.range_m,
             zoomed_in_range
         );
+
+        ctrl.pan_by_deg(2.5, -4.0);
+        assert!((ctrl.lat_deg - 40.5).abs() < 1e-6);
+        assert!((ctrl.lon_deg - 20.0).abs() < 1e-6);
+
+        ctrl.jump_to(40.5, 20.0, 4_000.0, 0.0, 10.0);
+        ctrl.orbit_by_deg(35.0, 15.0);
+        assert!((ctrl.heading_deg - 35.0).abs() < 1e-6);
+        assert!((ctrl.tilt_deg - 25.0).abs() < 1e-6);
     }
 
     #[test]

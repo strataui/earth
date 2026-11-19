@@ -46,7 +46,14 @@ fn test_earth_scene_to_draw_command_and_display_list() {
     match cmd {
         DrawCommand::DrawViewport3D { bounds, scene: s } => {
             assert_eq!(bounds, viewport_rect);
-            assert_eq!(s.camera, scene.scene().camera);
+            let placement = input.camera.placement();
+            match s.camera {
+                strata_render::scene3d::Camera3D::Perspective { near, far, .. } => {
+                    assert!((near - placement.near_m as f32).abs() < 1e-3);
+                    assert!((far - placement.far_m as f32).abs() < 1.0);
+                }
+                _ => panic!("expected Perspective camera"),
+            }
         }
         _ => panic!("expected DrawViewport3D command"),
     }
