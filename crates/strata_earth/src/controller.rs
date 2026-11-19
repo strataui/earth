@@ -86,7 +86,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Continuous exponential zoom rate (natural-log range units per second) when holding zoom keys.
-pub const KEY_ZOOM_LN_PER_SEC: f64 = 2.6;
+pub const KEY_ZOOM_LN_PER_SEC: f64 = 1.95;
 
 const DRAG_VELOCITY_WINDOW: Duration = Duration::from_millis(90);
 
@@ -1200,8 +1200,8 @@ mod tests {
         ctrl.set_zoom_in_held(false);
         assert!(!ctrl.is_zoom_key_held());
         assert!(
-            ctrl.range_m < 1_500_000.0 && ctrl.range_m > 400_000.0,
-            "holding zoom-in for 1s should zoom smoothly from 10,000 km into ~750-1,200 km, got {}",
+            ctrl.range_m < 2_200_000.0 && ctrl.range_m > 500_000.0,
+            "holding zoom-in for 1s should zoom smoothly from 10,000 km into ~1,400-1,800 km, got {}",
             ctrl.range_m
         );
 
@@ -1219,7 +1219,7 @@ mod tests {
         ctrl.clear_held_keys();
         assert!(!ctrl.is_zoom_key_held());
         assert!(
-            ctrl.range_m > zoomed_in_range * 6.0,
+            ctrl.range_m > zoomed_in_range * 4.5,
             "holding zoom-out for 1s should zoom back out substantially, got {} vs {}",
             ctrl.range_m,
             zoomed_in_range

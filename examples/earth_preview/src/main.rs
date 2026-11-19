@@ -516,7 +516,7 @@ mod tests {
         );
         let zoomed_in = earth.with_state(|st| st.orbit.range_m);
         assert!(
-            zoomed_in < start_range * 0.45,
+            zoomed_in < start_range * 0.50,
             "holding K for 0.5s should zoom closer quickly: start={start_range}, after={zoomed_in}"
         );
 
@@ -537,7 +537,7 @@ mod tests {
         );
         let zoomed_out = earth.with_state(|st| st.orbit.range_m);
         assert!(
-            zoomed_out > zoomed_in * 2.2,
+            zoomed_out > zoomed_in * 1.9,
             "holding L should zoom back out smoothly: in={zoomed_in}, out={zoomed_out}"
         );
     }
