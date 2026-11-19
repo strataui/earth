@@ -1284,7 +1284,7 @@ pub fn traverse_quadtree_lod_2d_flat(
 ) -> Vec<(TileKey, i32)> {
     let cap = max_leaves.max(16);
     let lod_grid = tile_grid.max(65);
-    let alt_m = camera.altitude_m().max(100.0);
+    let alt_m = camera.altitude_m().max(45.0);
     let focus_lat = camera.focus.lat_deg.clamp(-85.051129, 85.051129);
     let focus_lon = wrap_longitude(camera.focus.lon_deg);
     let aspect = (viewport_width_px.max(1.0) / viewport_height_px.max(1.0)).max(0.01);

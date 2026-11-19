@@ -121,8 +121,9 @@ pub use tiles::{
     TileProviderPreset, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
 };
 pub use controller::{
-    EarthOrbitController, DEFAULT_FOV_Y_DEG, GROUND_CLEARANCE_M, LOCAL_TRANSITION_RANGE_M,
-    MAX_RANGE_M, MIN_RANGE_M,
+    altitude_for_zoom_2d, fly_to, zoom_2d_for_altitude, EarthOrbitController, DEFAULT_FLY_TO_ALTITUDE_M,
+    DEFAULT_FOV_Y_DEG, GLOBAL_OVERVIEW_RANGE_M, GROUND_CLEARANCE_M, KEY_ZOOM_LN_PER_SEC,
+    LOCAL_TRANSITION_RANGE_M, MAX_RANGE_M, MIN_RANGE_M,
 };
 #[cfg(feature = "widget")]
 pub use widget::{EarthOverlayContext, EarthOverlayPlugin, EarthView, EarthViewState};

@@ -70,20 +70,32 @@ fn main() -> Result<(), String> {
     let sun_cycle_sim_s = Rc::new(RefCell::new(1_735_689_600.0f64));
     let active_preset = Rc::new(RefCell::new(TileProviderPreset::ArcGisWorldImagery));
     let fps_readout = Rc::new(RefCell::new((60u32, 16.7f64)));
+    let fly_target_idx = Rc::new(RefCell::new(0usize));
+
+    const FLY_LANDMARKS: &[(&str, f64, f64)] = &[
+        ("Tokyo", 35.6762, 139.6503),
+        ("Paris", 48.8584, 2.2945),
+        ("Giza", 29.9792, 31.1342),
+        ("New York", 40.7580, -73.9855),
+        ("Rio", -22.9519, -43.2105),
+        ("Istanbul", 41.0082, 28.9784),
+    ];
 
     let earth_for_view = earth.clone();
     let mode_for_view = Rc::clone(&sun_demo_mode);
     let sim_for_view = Rc::clone(&sun_cycle_sim_s);
     let preset_for_view = Rc::clone(&active_preset);
     let fps_for_view = Rc::clone(&fps_readout);
+    let fly_idx_for_view = Rc::clone(&fly_target_idx);
 
     let build_root = move || -> View {
-        let (is_2d, at_local_25d, sp, elev_on, labels_on, w, ocean_on) =
+        let (is_2d, at_local_25d, is_flying, sp, elev_on, labels_on, w, ocean_on) =
             earth_for_view.with_state(|st| {
                 let inp = st.viewport.input();
                 (
                     st.viewport.view_mode() == EarthViewMode::Mode2D,
                     st.orbit.range_m < 20_000.0,
+                    st.orbit.is_flying(),
                     inp.space.clone(),
                     inp.elevation_enabled,
                     inp.layers.labels,
@@ -94,6 +106,7 @@ fn main() -> Result<(), String> {
         let cur_sun_mode = *mode_for_view.borrow();
         let cur_preset = *preset_for_view.borrow();
         let (cur_fps, cur_ms) = *fps_for_view.borrow();
+        let next_landmark = FLY_LANDMARKS[*fly_idx_for_view.borrow() % FLY_LANDMARKS.len()];
 
         let e1 = earth_for_view.clone();
         let btn_mode = control_btn(
@@ -131,6 +144,19 @@ fn main() -> Result<(), String> {
                         st.jump_to(37.7749, -122.4194, 3_200.0, 22.0, 58.0);
                     }
                 });
+            },
+        );
+
+        let e_fly = earth_for_view.clone();
+        let idx_fly = Rc::clone(&fly_idx_for_view);
+        let btn_fly = control_btn(
+            format!("Fly To: {}", next_landmark.0),
+            is_flying,
+            move |_| {
+                let idx = *idx_fly.borrow() % FLY_LANDMARKS.len();
+                let (_, lat, lon) = FLY_LANDMARKS[idx];
+                *idx_fly.borrow_mut() = (idx + 1) % FLY_LANDMARKS.len();
+                e_fly.fly_to(lat, lon, None);
             },
         );
 
@@ -353,6 +379,7 @@ fn main() -> Result<(), String> {
                     {btn_mode}
                     {btn_provider}
                     {btn_view}
+                    {btn_fly}
                     {btn_sun_lit}
                     {btn_city}
                     {btn_ocean}
@@ -389,6 +416,7 @@ fn main() -> Result<(), String> {
     let mut fps_window_start = std::time::Instant::now();
     let mut max_dt_ms = 0.0f64;
     let mut max_step_ms = 0.0f64;
+    let mut was_flying = false;
     let perf_fps = std::env::var_os("STRATA_PERF_LOG").is_some();
 
     launch_with_frame(
@@ -434,8 +462,11 @@ fn main() -> Result<(), String> {
                 });
             }
             let outcome = earth_for_frame.step_frame(dt);
+            let now_flying = earth_for_frame.with_state(|st| st.orbit.is_flying());
+            let fly_edge = now_flying != was_flying;
+            was_flying = now_flying;
             max_step_ms = max_step_ms.max(t_s.elapsed().as_secs_f64() * 1000.0);
-            if fps_dirty {
+            if fps_dirty || fly_edge {
                 FrameOutcome::Dirty
             } else {
                 outcome
