@@ -9,9 +9,10 @@ use strata::prelude::*;
 use strata::WindowConfig;
 use strata::{launch_with_frame, AppFrameInfo, FrameOutcome};
 use strata_earth::{
-    Color, EarthDefaultTileSource, EarthGeometry, EarthInput, EarthMaterial, EarthObject,
-    EarthOrbitController, EarthView, EarthViewMode, GeoPosition, SpaceEnvironmentConfig,
-    SunDirectionMode, TileProviderPreset, WeatherConfig,
+    AtmosphereSample, Color, EarthDefaultTileSource, EarthGeometry, EarthInput, EarthMaterial,
+    EarthObject, EarthOrbitController, EarthView, EarthViewMode, GeoPosition, PrecipitationConfig,
+    PrecipitationMode, SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig,
+    LOCAL_TRANSITION_RANGE_M,
 };
 
 /// Example-local continuous exponential zoom rate (natural-log range units per second) for `K` / `L`.
@@ -49,6 +50,92 @@ enum SunDemoMode {
     SystemClock,
     OrbitalCycle,
     FixedSunset,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TempPreset {
+    Warm12C,
+    Cool2C,
+    FreezeNeg6C,
+    LiveOpenMeteo,
+}
+
+impl TempPreset {
+    fn next(self) -> Self {
+        match self {
+            Self::Warm12C => Self::Cool2C,
+            Self::Cool2C => Self::FreezeNeg6C,
+            Self::FreezeNeg6C => Self::LiveOpenMeteo,
+            Self::LiveOpenMeteo => Self::Warm12C,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Warm12C => "Temp: +12°C",
+            Self::Cool2C => "Temp: +2°C",
+            Self::FreezeNeg6C => "Temp: -6°C",
+            Self::LiveOpenMeteo => "Temp: Live",
+        }
+    }
+
+    fn apply_to(self, cfg: &mut PrecipitationConfig) {
+        match self {
+            Self::Warm12C => {
+                cfg.use_live_temperature = false;
+                cfg.atmosphere.base_temp_c = 12.0;
+            }
+            Self::Cool2C => {
+                cfg.use_live_temperature = false;
+                cfg.atmosphere.base_temp_c = 2.0;
+            }
+            Self::FreezeNeg6C => {
+                cfg.use_live_temperature = false;
+                cfg.atmosphere.base_temp_c = -6.0;
+            }
+            Self::LiveOpenMeteo => {
+                cfg.use_live_temperature = true;
+            }
+        }
+    }
+}
+
+fn format_atmo_status(
+    cfg: &PrecipitationConfig,
+    eye_alt_m: f64,
+    sample: Option<AtmosphereSample>,
+) -> Option<String> {
+    if !cfg.enabled {
+        return None;
+    }
+    let Some(s) = sample else {
+        return Some(format!(
+            "Precip Active · Alt {:.0}m",
+            eye_alt_m.max(0.0)
+        ));
+    };
+    let src = if s.source_live { "Live" } else { "ISA" };
+    if cfg.respect_cloud_ceiling && eye_alt_m > s.cloud_ceiling_msl_m {
+        Some(format!(
+            "Above Clouds · Alt {:.0}m > {:.0}m · T {:+.1}°C ({src})",
+            eye_alt_m, s.cloud_ceiling_msl_m, s.temperature_c
+        ))
+    } else {
+        let phase_txt = match &cfg.mode {
+            PrecipitationMode::Physical => s.phase.label(),
+            PrecipitationMode::Rain => "Rain (Forced)",
+            PrecipitationMode::Snow => "Snow (Forced)",
+            PrecipitationMode::CustomLayers(_) => "Custom 2D",
+        };
+        Some(format!(
+            "{phase_txt} · Alt {:.0}m · T {:+.1}°C (Tw {:+.1}°C) · Freeze {:.0}m · Ceil {:.0}m ({src})",
+            eye_alt_m.max(0.0),
+            s.temperature_c,
+            s.wet_bulb_c,
+            s.freezing_level_msl_m.max(0.0),
+            s.cloud_ceiling_msl_m,
+        ))
+    }
 }
 
 fn control_btn<F>(label: String, active: bool, on_click: F) -> View
@@ -164,7 +251,9 @@ fn main() -> Result<(), String> {
     let sun_demo_mode = Rc::new(RefCell::new(SunDemoMode::SystemClock));
     let sun_cycle_sim_s = Rc::new(RefCell::new(1_735_689_600.0f64));
     let active_preset = Rc::new(RefCell::new(TileProviderPreset::ArcGisWorldImagery));
+    let temp_preset = Rc::new(RefCell::new(TempPreset::Warm12C));
     let fps_readout = Rc::new(RefCell::new((60u32, 16.7f64)));
+    let atmo_readout: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let fly_target_idx = Rc::new(RefCell::new(0usize));
 
     const FLY_LANDMARKS: &[(&str, f64, f64)] = &[
@@ -180,21 +269,24 @@ fn main() -> Result<(), String> {
     let mode_for_view = Rc::clone(&sun_demo_mode);
     let sim_for_view = Rc::clone(&sun_cycle_sim_s);
     let preset_for_view = Rc::clone(&active_preset);
+    let temp_for_view = Rc::clone(&temp_preset);
     let fps_for_view = Rc::clone(&fps_readout);
+    let atmo_for_view = Rc::clone(&atmo_readout);
     let fly_idx_for_view = Rc::clone(&fly_target_idx);
 
     let build_root = move || -> View {
-        let (is_2d, at_local_25d, is_flying, sp, elev_on, labels_on, w, ocean_on) =
+        let (is_2d, at_local_25d, is_flying, sp, elev_on, labels_on, w, precip, ocean_on) =
             earth_for_view.with_state(|st| {
                 let inp = st.viewport.input();
                 (
                     st.viewport.view_mode() == EarthViewMode::Mode2D,
-                    st.orbit.range_m < 20_000.0,
+                    st.orbit.range_m < LOCAL_TRANSITION_RANGE_M,
                     st.orbit.is_flying(),
                     inp.space.clone(),
                     inp.elevation_enabled,
                     inp.layers.labels,
                     inp.weather.clone(),
+                    inp.precipitation.clone(),
                     inp.ocean_waves.enabled,
                 )
             });
@@ -203,7 +295,9 @@ fn main() -> Result<(), String> {
         let cur_ray_status = last_ray_status.get();
         let cur_sun_mode = *mode_for_view.borrow();
         let cur_preset = *preset_for_view.borrow();
+        let cur_temp_preset = *temp_for_view.borrow();
         let (cur_fps, cur_ms) = *fps_for_view.borrow();
+        let cur_atmo_status = atmo_for_view.borrow().clone();
         let next_landmark = FLY_LANDMARKS[*fly_idx_for_view.borrow() % FLY_LANDMARKS.len()];
 
         let e1 = earth_for_view.clone();
@@ -224,7 +318,7 @@ fn main() -> Result<(), String> {
         let e2 = earth_for_view.clone();
         let btn_view = control_btn(
             if at_local_25d {
-                "View: 2.5D SF"
+                "View: 2.5D"
             } else {
                 "View: Space"
             }
@@ -232,7 +326,7 @@ fn main() -> Result<(), String> {
             at_local_25d,
             move |_| {
                 e2.with_state_mut(|st| {
-                    if st.orbit.range_m < 20_000.0 {
+                    if st.orbit.range_m < LOCAL_TRANSITION_RANGE_M {
                         st.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
                     } else {
                         if st.viewport.view_mode() == EarthViewMode::Mode2D {
@@ -444,24 +538,49 @@ fn main() -> Result<(), String> {
         );
 
         let e14 = earth_for_view.clone();
-        let btn_rain = control_btn("Rain".to_string(), w.rain, move |_| {
-            e14.with_state_mut(|st| {
-                let mut w = st.viewport.weather_config().clone();
-                w.rain = !w.rain;
-                st.viewport.set_weather_config(w);
-                st.notify_ui_changed();
-            });
+        let tp14 = Rc::clone(&temp_for_view);
+        let precip_label = if !precip.enabled {
+            "Precip: Off"
+        } else {
+            match &precip.mode {
+                PrecipitationMode::Physical => "Precip: Auto",
+                PrecipitationMode::Rain => "Precip: Rain",
+                PrecipitationMode::Snow => "Precip: Snow",
+                PrecipitationMode::CustomLayers(_) => "Precip: Custom",
+            }
+        };
+        let btn_precip = control_btn(precip_label.to_string(), precip.enabled, move |_| {
+            let mut cfg = e14.precipitation_config();
+            if !cfg.enabled {
+                cfg.enabled = true;
+                cfg.mode = PrecipitationMode::Physical;
+                tp14.borrow().apply_to(&mut cfg);
+            } else {
+                match cfg.mode {
+                    PrecipitationMode::Physical => cfg.mode = PrecipitationMode::Rain,
+                    PrecipitationMode::Rain => cfg.mode = PrecipitationMode::Snow,
+                    PrecipitationMode::Snow | PrecipitationMode::CustomLayers(_) => {
+                        cfg.enabled = false;
+                        cfg.mode = PrecipitationMode::Physical;
+                    }
+                }
+            }
+            e14.set_precipitation_config(cfg);
         });
 
         let e15 = earth_for_view.clone();
-        let btn_snow = control_btn("Snow".to_string(), w.snow, move |_| {
-            e15.with_state_mut(|st| {
-                let mut w = st.viewport.weather_config().clone();
-                w.snow = !w.snow;
-                st.viewport.set_weather_config(w);
-                st.notify_ui_changed();
-            });
-        });
+        let tp15 = Rc::clone(&temp_for_view);
+        let btn_temp = control_btn(
+            cur_temp_preset.label().to_string(),
+            precip.enabled && matches!(precip.mode, PrecipitationMode::Physical),
+            move |_| {
+                let next = tp15.borrow().next();
+                *tp15.borrow_mut() = next;
+                let mut cfg = e15.precipitation_config();
+                next.apply_to(&mut cfg);
+                e15.set_precipitation_config(cfg);
+            },
+        );
 
         let e16 = earth_for_view.clone();
         let p16 = Rc::clone(&preset_for_view);
@@ -484,6 +603,17 @@ fn main() -> Result<(), String> {
         });
 
         let fps_text = format!("{cur_fps} FPS · {cur_ms:.1} ms");
+        let atmo_badge = match cur_atmo_status {
+            Some(msg) => rsx! {
+                <div
+                    data-earth-atmo-status="true"
+                    class="absolute top-12 left-3 z-20 px-3 py-1.5 rounded-xl bg-neutral-950/85 border border-cyan-500/35 text-cyan-200 text-[11px] font-mono select-none pointer-events-none"
+                >
+                    <span>{msg}</span>
+                </div>
+            },
+            None => View::new(strata_dom::NodeBlueprint::fragment(Vec::new())),
+        };
         let status_badge = match cur_ray_status {
             Some(msg) => rsx! {
                 <div
@@ -505,6 +635,7 @@ fn main() -> Result<(), String> {
                 >
                     <span>{fps_text}</span>
                 </div>
+                {atmo_badge}
                 {status_badge}
                 <div
                     data-earth-controls="true"
@@ -528,8 +659,8 @@ fn main() -> Result<(), String> {
                     {btn_labels}
                     {btn_gcloud}
                     {btn_cloud_res}
-                    {btn_rain}
-                    {btn_snow}
+                    {btn_precip}
+                    {btn_temp}
                 </div>
             </div>
         }
@@ -549,11 +680,14 @@ fn main() -> Result<(), String> {
     let mode_for_frame = sun_demo_mode;
     let sim_for_frame = sun_cycle_sim_s;
     let fps_for_frame = fps_readout;
+    let atmo_for_frame = atmo_readout;
     let mut fps_frames = 0u32;
     let mut fps_window_start = std::time::Instant::now();
+    let mut atmo_refresh_start = std::time::Instant::now();
     let mut max_dt_ms = 0.0f64;
     let mut max_step_ms = 0.0f64;
     let mut was_flying = false;
+    let mut was_local_25d = false;
     let perf_fps = std::env::var_os("STRATA_PERF_LOG").is_some();
 
     launch_with_frame(
@@ -571,7 +705,7 @@ fn main() -> Result<(), String> {
             let dt = info.dt.as_secs_f64();
             max_dt_ms = max_dt_ms.max(dt * 1000.0);
             fps_frames += 1;
-            let mut fps_dirty = false;
+            let mut hud_dirty = false;
             let elapsed_s = fps_window_start.elapsed().as_secs_f64();
             if elapsed_s >= 0.45 {
                 let fps = ((fps_frames as f64) / elapsed_s).round().clamp(1.0, 999.0) as u32;
@@ -587,7 +721,7 @@ fn main() -> Result<(), String> {
                 let prev = *fps_for_frame.borrow();
                 if prev.0 != fps || (prev.1 - ms).abs() >= 0.3 {
                     *fps_for_frame.borrow_mut() = (fps, ms);
-                    fps_dirty = true;
+                    hud_dirty = true;
                 }
                 fps_frames = 0;
                 fps_window_start = std::time::Instant::now();
@@ -606,11 +740,41 @@ fn main() -> Result<(), String> {
                 });
             }
             let outcome = earth_for_frame.step_frame(dt);
-            let now_flying = earth_for_frame.with_state(|st| st.orbit.is_flying());
+            let (now_flying, now_local_25d, precip_cfg, eye_alt_m) =
+                earth_for_frame.with_state(|st| {
+                    let inp = st.viewport.input();
+                    (
+                        st.orbit.is_flying(),
+                        st.orbit.range_m < LOCAL_TRANSITION_RANGE_M,
+                        inp.precipitation.clone(),
+                        inp.camera.altitude_m(),
+                    )
+                });
             let fly_edge = now_flying != was_flying;
             was_flying = now_flying;
+            let view_edge = now_local_25d != was_local_25d;
+            was_local_25d = now_local_25d;
+
+            if !precip_cfg.enabled {
+                if atmo_for_frame.borrow().is_some() {
+                    *atmo_for_frame.borrow_mut() = None;
+                    hud_dirty = true;
+                }
+            } else if atmo_refresh_start.elapsed().as_secs_f64() >= 0.25 || view_edge {
+                atmo_refresh_start = std::time::Instant::now();
+                let next_msg = format_atmo_status(
+                    &precip_cfg,
+                    eye_alt_m,
+                    earth_for_frame.last_atmosphere_sample(),
+                );
+                if *atmo_for_frame.borrow() != next_msg {
+                    *atmo_for_frame.borrow_mut() = next_msg;
+                    hud_dirty = true;
+                }
+            }
+
             max_step_ms = max_step_ms.max(t_s.elapsed().as_secs_f64() * 1000.0);
-            if fps_dirty || fly_edge {
+            if hud_dirty || fly_edge || view_edge {
                 FrameOutcome::Dirty
             } else {
                 outcome
@@ -687,6 +851,7 @@ mod tests {
     fn orbit_zoom_and_tilt_never_roll_camera() {
         let mut orbit = EarthOrbitController::new();
         orbit.set_viewport_size(1440.0, 900.0);
+        orbit.jump_to(37.7749, -122.4194, 4_000.0, 0.0, 20.0);
         orbit.handle_mouse_down(2, 720.0, 450.0);
         orbit.handle_mouse_move(780.0, 410.0);
         orbit.handle_mouse_up(2);

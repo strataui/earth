@@ -23,6 +23,9 @@ use crate::labels::{
     EarthScreenProjector, LiveMapLabelStore, ProjectedEarthLabel,
 };
 use crate::plugins::{EarthPlugin, EarthPluginRegistry};
+use crate::precipitation::{
+    AtmosphereSample, PrecipitationConfig, PrecipitationEvaluator, TemperatureProvider,
+};
 use crate::raycast::EarthRayHit;
 use crate::scene::{EarthInput, EarthViewMode, OceanWavesConfig};
 use crate::tiles::TileSource;
@@ -567,6 +570,15 @@ impl EarthView {
         self
     }
 
+    /// Configures GPU-instanced 2D camera-local precipitation and atmospheric physics via builder style.
+    pub fn with_precipitation(self, config: PrecipitationConfig) -> Self {
+        self.state
+            .borrow_mut()
+            .viewport
+            .set_precipitation_config(config);
+        self
+    }
+
     /// Configures whether the underlying `<Canvas3D>` runs uncapped animation ticks.
     pub fn with_uncapped(self, uncapped: bool) -> Self {
         self.state.borrow_mut().uncapped = uncapped;
@@ -883,6 +895,46 @@ impl EarthView {
         let mut st = self.state.borrow_mut();
         st.viewport.set_ocean_waves_enabled(enabled);
         st.notify_ui_changed();
+    }
+
+    /// Returns a snapshot of the active [`PrecipitationConfig`].
+    pub fn precipitation_config(&self) -> PrecipitationConfig {
+        self.state.borrow().viewport.precipitation_config().clone()
+    }
+
+    /// Updates GPU-instanced 2D camera-local precipitation and atmospheric settings in O(1).
+    pub fn set_precipitation_config(&self, config: PrecipitationConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_precipitation_config(config);
+        st.notify_ui_changed();
+    }
+
+    /// Convenience toggle enabling or disabling [`crate::precipitation::PrecipitationPlugin`].
+    pub fn set_precipitation_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_precipitation_enabled(enabled);
+        st.notify_ui_changed();
+    }
+
+    /// Installs a custom functional [`PrecipitationEvaluator`] controlling which 2D layers render.
+    pub fn set_precipitation_evaluator(&self, evaluator: PrecipitationEvaluator) {
+        self.state
+            .borrow_mut()
+            .viewport
+            .set_precipitation_evaluator(evaluator);
+    }
+
+    /// Installs or clears a custom [`TemperatureProvider`] (e.g., live sounding fetcher or closure).
+    pub fn set_temperature_provider(&self, provider: Option<Arc<dyn TemperatureProvider>>) {
+        self.state
+            .borrow_mut()
+            .viewport
+            .set_temperature_provider(provider);
+    }
+
+    /// Returns the most recently evaluated [`AtmosphereSample`] at the camera's exact altitude.
+    pub fn last_atmosphere_sample(&self) -> Option<AtmosphereSample> {
+        self.state.borrow().viewport.last_atmosphere_sample()
     }
 
     /// Registers or replaces a UI overlay plugin on this [`EarthView`] component.

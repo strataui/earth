@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use strata_render::camera64::DVec3;
 use strata_render::scene3d::{
-    RetainedCameraUniforms, RetainedDynamicMesh, RetainedEnvironmentAssets, RetainedTileInstance,
-    RetainedTileMesh, RetainedTileTexture, RteTileVertex, TileKeyId,
+    RetainedCameraUniforms, RetainedDynamicMesh, RetainedEnvironmentAssets, RetainedParticleLayer,
+    RetainedTileInstance, RetainedTileMesh, RetainedTileTexture, RteTileVertex, TileKeyId,
 };
 
 use crate::astro::embedded_land_mask;
@@ -27,7 +27,7 @@ use crate::geodesy::{
     geodetic_to_ecef, wgs84, wrap_longitude, Geodetic, LocalFrame, PatchBounds, TileKey,
     TileProjection,
 };
-use crate::gltf::{build_25d_weather_meshes, CustomWeatherMeshes};
+use crate::precipitation::PrecipitationPlugin;
 use crate::satellites::{build_3d_satellites_meshes, SatelliteElement};
 use crate::scene::{EarthInput, EarthLowLevelState, OceanWavesConfig};
 use crate::worker::{sample_tile_uv, GroundElevSnapshot};
@@ -44,7 +44,8 @@ impl EarthPluginHooks {
     pub const WORLD_BUILD: Self = Self(1 << 3);
     pub const DYNAMIC_OVERLAYS: Self = Self(1 << 4);
     pub const TICK: Self = Self(1 << 5);
-    pub const ALL: Self = Self((1 << 6) - 1);
+    pub const PARTICLES: Self = Self(1 << 6);
+    pub const ALL: Self = Self((1 << 7) - 1);
 
     #[inline]
     pub const fn empty() -> Self {
@@ -362,7 +363,6 @@ pub struct EarthDynamicOverlayContext<'a> {
     pub flat_t: f32,
     pub time_s: f64,
     pub overlay_rev: u64,
-    pub custom_weather: Option<&'a CustomWeatherMeshes>,
     pub satellite_elements: &'a [SatelliteElement],
     pub weather_ids: &'a mut HashMap<u64, u64>,
     pub(crate) ground_snapshot: Option<&'a RwLock<GroundElevSnapshot>>,
@@ -382,9 +382,31 @@ impl<'a> EarthDynamicOverlayContext<'a> {
     }
 }
 
+/// Fast O(1) GPU-instanced 2D camera-local particle volume emission context.
+pub struct EarthParticleContext<'a> {
+    pub input: &'a EarthInput,
+    pub low_level: EarthLowLevelState,
+    pub time_s: f64,
+    pub(crate) ground_snapshot: Option<&'a RwLock<GroundElevSnapshot>>,
+}
+
+impl<'a> EarthParticleContext<'a> {
+    #[inline]
+    pub fn sample_ground_elevation_m(&self, lat_deg: f64, lon_deg: f64) -> f64 {
+        self.ground_snapshot
+            .and_then(|lock| lock.read().ok().map(|s| s.sample_elevation_m(lat_deg, lon_deg)))
+            .unwrap_or(0.0)
+    }
+
+    #[inline]
+    pub fn sample_land_mask(&self, lat_deg: f64, lon_deg: f64) -> f32 {
+        sample_land_mask_at(lat_deg, lon_deg)
+    }
+}
+
 /// Extensible plugin trait for `strata_earth` world rendering and mid-work injection.
 pub trait EarthPlugin: Send + 'static {
-    /// Stable unique identifier (e.g. `"city_lights"`, `"ocean_waves"`, `"my_custom_layer"`).
+    /// Stable unique identifier (e.g. `"city_lights"`, `"precipitation"`, `"ocean_waves"`).
     fn id(&self) -> &'static str;
 
     /// Declares which pipeline stages this plugin participates in (unused stages incur zero cost).
@@ -405,7 +427,7 @@ pub trait EarthPlugin: Send + 'static {
         false
     }
 
-    /// Advances animated state by `dt_s` seconds; returning `true` schedules dynamic overlay redraws.
+    /// Advances animated state by `dt_s` seconds; returning `true` schedules redraws.
     fn on_tick(&mut self, _dt_s: f64, _ctx: &EarthPluginFrameContext<'_>) -> bool {
         false
     }
@@ -441,11 +463,20 @@ pub trait EarthPlugin: Send + 'static {
     /// Mid-work world-assembly hook after terrain leaves are built and before freezing the frame.
     fn on_world_build(&mut self, _ctx: &mut EarthWorldBuildContext<'_>) {}
 
-    /// Fast O(1) dynamic mesh emission hook invoked both during world builds and 60 FPS animations.
+    /// Fast O(1) dynamic mesh emission hook invoked during world builds and animations.
     fn on_dynamic_overlays(
         &mut self,
         _ctx: &mut EarthDynamicOverlayContext<'_>,
         _dynamic_meshes: &mut Vec<RetainedDynamicMesh>,
+    ) {
+    }
+
+    /// Fast O(1) GPU-instanced 2D camera-local particle volume emission hook (zero CPU meshing).
+    fn on_particle_layers(
+        &mut self,
+        _ctx: &mut EarthParticleContext<'_>,
+        _layers: &mut Vec<RetainedParticleLayer>,
+        _textures: &mut Vec<Arc<RetainedTileTexture>>,
     ) {
     }
 
@@ -526,13 +557,14 @@ impl EarthPluginRegistry {
     }
 
     /// Creates the default plugin stack matching built-in Earth rendering features
-    /// (`CelestialPlugin`, `CityLightsPlugin`, `WeatherPlugin`, `SatellitesPlugin`, `OceanWavesPlugin`)
-    /// with zero visual or performance degradation.
+    /// (`CelestialPlugin`, `CityLightsPlugin`, `WeatherPlugin`, `PrecipitationPlugin`,
+    /// `SatellitesPlugin`, `OceanWavesPlugin`) with zero visual or performance degradation.
     pub fn standard() -> Self {
         let reg = Self::empty();
         reg.register(CelestialPlugin::default());
         reg.register(CityLightsPlugin::default());
         reg.register(WeatherPlugin::default());
+        reg.register(PrecipitationPlugin::default());
         reg.register(SatellitesPlugin::default());
         reg.register(OceanWavesPlugin::default());
         reg
@@ -715,17 +747,31 @@ impl EarthPluginRegistry {
         false
     }
 
-    pub(crate) fn run_tick(&self, dt_s: f64, ctx: &EarthPluginFrameContext<'_>) -> bool {
+    /// Runs `on_tick` across all tick-enabled plugins, distinguishing dynamic/camera-mesh plugins
+    /// from zero-mesh GPU particle plugins so particle animation never triggers satellite/ocean rebuilds.
+    pub(crate) fn run_tick_detailed(
+        &self,
+        dt_s: f64,
+        ctx: &EarthPluginFrameContext<'_>,
+    ) -> (bool, bool) {
         let slots = self.collect_matching_slots(EarthPluginHooks::TICK);
-        let mut any_dirty = false;
+        let mut other_dirty = false;
+        let mut particle_dirty = false;
         for slot in slots {
+            let hooks = EarthPluginHooks::from_bits_truncate(slot.hooks.load(Ordering::Relaxed));
             if let Ok(mut plugin) = slot.inner.lock() {
                 if plugin.on_tick(dt_s, ctx) {
-                    any_dirty = true;
+                    if hooks.intersects(EarthPluginHooks::PARTICLES)
+                        && !hooks.intersects(EarthPluginHooks::DYNAMIC_OVERLAYS | EarthPluginHooks::CAMERA)
+                    {
+                        particle_dirty = true;
+                    } else {
+                        other_dirty = true;
+                    }
                 }
             }
         }
-        any_dirty
+        (other_dirty, particle_dirty)
     }
 
     pub(crate) fn run_prepare_camera(
@@ -803,6 +849,20 @@ impl EarthPluginRegistry {
         for slot in slots {
             if let Ok(mut plugin) = slot.inner.lock() {
                 plugin.on_dynamic_overlays(ctx, dynamic_meshes);
+            }
+        }
+    }
+
+    pub(crate) fn run_particle_layers(
+        &self,
+        ctx: &mut EarthParticleContext<'_>,
+        layers: &mut Vec<RetainedParticleLayer>,
+        textures: &mut Vec<Arc<RetainedTileTexture>>,
+    ) {
+        let slots = self.collect_matching_slots(EarthPluginHooks::PARTICLES);
+        for slot in slots {
+            if let Ok(mut plugin) = slot.inner.lock() {
+                plugin.on_particle_layers(ctx, layers, textures);
             }
         }
     }
@@ -998,8 +1058,10 @@ impl EarthPlugin for CityLightsPlugin {
     }
 }
 
-/// Built-in plugin driving global cloud rotation/opacity uniforms and 2.5D weather overlays
-/// (CC0 clouds, rain streaks, snowflakes).
+/// Built-in plugin driving global and local 2.5D cloud-layer rotation and opacity uniforms.
+///
+/// Camera-local 2D precipitation (rain, sleet, mathematical 2D snowflakes, and custom textures)
+/// is handled separately by [`crate::precipitation::PrecipitationPlugin`].
 #[derive(Debug, Clone)]
 pub struct WeatherPlugin {
     pub enabled: bool,
@@ -1024,13 +1086,10 @@ impl WeatherPlugin {
         }
         let flat_t = ctx.low_level.local_25d_blend.max(ctx.low_level.map_2d_morph);
         let w = &ctx.input.weather;
-        let spin_3d = w.global_cloud_map
+        w.global_cloud_map
             && ctx.input.layers.clouds
             && flat_t < 0.85
-            && w.global_cloud_spin_rad_s.abs() > 1e-9;
-        let weather_25d = flat_t > 0.02
-            && ((w.rain && w.rain_density > 0) || (w.snow && w.snow_density > 0));
-        spin_3d || weather_25d
+            && w.global_cloud_spin_rad_s.abs() > 1e-9
     }
 }
 
@@ -1040,7 +1099,7 @@ impl EarthPlugin for WeatherPlugin {
     }
 
     fn hooks(&self) -> EarthPluginHooks {
-        EarthPluginHooks::TICK | EarthPluginHooks::CAMERA | EarthPluginHooks::DYNAMIC_OVERLAYS
+        EarthPluginHooks::TICK | EarthPluginHooks::CAMERA
     }
 
     fn is_enabled(&self) -> bool {
@@ -1072,8 +1131,10 @@ impl EarthPlugin for WeatherPlugin {
             || ctx.low_level.map_2d_morph > 0.05;
         let space_factor = (1.0 - ctx.low_level.local_25d_blend).clamp(0.0, 1.0);
         let cloud_alt_fade = smoothstep_f32(450_000.0, 2_000_000.0, ctx.altitude_m as f32);
-        let cloud_on =
-            self.enabled && ctx.input.weather.global_cloud_map && ctx.input.layers.clouds && !in_2d_hide;
+        let cloud_on = self.enabled
+            && ctx.input.weather.global_cloud_map
+            && ctx.input.layers.clouds
+            && !in_2d_hide;
         let base_cloud_op = if cloud_on {
             ctx.input.weather.global_cloud_opacity.clamp(0.0, 1.0)
         } else {
@@ -1087,41 +1148,12 @@ impl EarthPlugin for WeatherPlugin {
         camera.time_s = eff_t as f32;
     }
 
-    fn on_dynamic_overlays(
-        &mut self,
-        ctx: &mut EarthDynamicOverlayContext<'_>,
-        dynamic_meshes: &mut Vec<RetainedDynamicMesh>,
-    ) {
-        if !self.enabled {
-            return;
-        }
-        let mut cfg = ctx.input.weather.clone();
-        cfg.weather_time_s += self.clock_offset_s;
-        let meshes = build_25d_weather_meshes(
-            ctx.input.camera.focus,
-            ctx.altitude_m_or_cam(),
-            ctx.flat_t,
-            &cfg,
-            ctx.custom_weather,
-            ctx.overlay_rev,
-            ctx.weather_ids,
-        );
-        dynamic_meshes.extend(meshes);
-    }
-
     fn as_any(&self) -> Option<&dyn Any> {
         Some(self)
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
         Some(self)
-    }
-}
-
-impl<'a> EarthDynamicOverlayContext<'a> {
-    #[inline]
-    fn altitude_m_or_cam(&self) -> f64 {
-        self.input.camera.altitude_m()
     }
 }
 

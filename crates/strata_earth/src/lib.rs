@@ -14,6 +14,7 @@ pub mod gltf;
 pub mod json;
 pub mod labels;
 pub mod plugins;
+pub mod precipitation;
 pub mod raycast;
 pub mod satellites;
 pub mod scene;
@@ -84,15 +85,25 @@ pub use geodesy::{
     LocalFrame, RteEyeUniforms, SurfaceMorphParams, TileKey, TileProjection,
     TileTextureResolution, GLOBE_ALTITUDE_M, MAX_QUADTREE_LEAVES,
 };
-pub use gltf::{
-    build_25d_weather_meshes, cc0_cloud_mesh, cc0_rain_mesh, cc0_snow_mesh, parse_glb_mesh,
-    CustomWeatherMeshes, WeatherConfig, WeatherMesh,
-};
+pub use gltf::{parse_glb_mesh, WeatherConfig, WeatherMesh};
 pub use plugins::{
     classify_non_land_water, sample_land_mask_at, CelestialPlugin, CityLightsPlugin,
-    EarthDynamicOverlayContext, EarthPlugin, EarthPluginFrameContext, EarthPluginHooks,
-    EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext, EarthWorldBuildContext,
-    LoadedTileImagerySnapshot, OceanWavesPlugin, SatellitesPlugin, WeatherPlugin,
+    EarthDynamicOverlayContext, EarthParticleContext, EarthPlugin, EarthPluginFrameContext,
+    EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext,
+    EarthWorldBuildContext, LoadedTileImagerySnapshot, OceanWavesPlugin, SatellitesPlugin,
+    WeatherPlugin,
+};
+pub use precipitation::{
+    climatological_sea_level_temp_c, compute_precipitation_phase, isa_pressure_hpa,
+    moist_adiabatic_lapse_rate_k_per_km, parse_open_meteo_sounding_json,
+    physical_precipitation_evaluator, saturation_vapor_pressure_pa, wet_bulb_temp_c,
+    AtmosphereConfig, AtmosphereQuery, AtmosphereSample, CloudCeiling, FnTemperatureProvider,
+    LapseRateModel, OpenMeteoSounding, OpenMeteoTemperatureProvider, ParticleBillboard,
+    ParticleSprite, PrecipitationConfig, PrecipitationEvalContext, PrecipitationEvaluator,
+    PrecipitationLayer, PrecipitationMode, PrecipitationPhase, PrecipitationPlugin,
+    StaticAtmosphereProvider, TemperatureAnchor, TemperatureProvider, CLOUD_SHELL_ALTITUDE_M,
+    DEFAULT_CLOUD_CEILING_MSL_M, DEFAULT_CLOUD_FADE_BAND_M, ISA_LAPSE_RATE_K_PER_KM,
+    ISA_SEA_LEVEL_PRESSURE_HPA, ISA_TROPOPAUSE_ALT_M,
 };
 pub use raycast::{raycast_ray, raycast_surface_ray, raycast_viewport, EarthRayHit};
 pub use satellites::{
@@ -120,8 +131,9 @@ pub use tiles::{
 };
 pub use controller::{
     altitude_for_zoom_2d, fly_to, zoom_2d_for_altitude, EarthOrbitController,
-    DEFAULT_FLY_TO_ALTITUDE_M, DEFAULT_FOV_Y_DEG, GLOBAL_OVERVIEW_RANGE_M, GROUND_CLEARANCE_M,
-    LOCAL_TRANSITION_RANGE_M, MAX_RANGE_M, MIN_RANGE_M,
+    DEFAULT_FLY_TO_ALTITUDE_M, DEFAULT_FOV_Y_DEG, FULL_25D_PITCH_TAPER_START_M,
+    FULL_3D_PITCH_CUTOFF_M, GLOBAL_OVERVIEW_RANGE_M, GROUND_CLEARANCE_M, LOCAL_TRANSITION_RANGE_M,
+    MAX_RANGE_M, MIN_RANGE_M,
 };
 #[cfg(feature = "widget")]
 pub use widget::{

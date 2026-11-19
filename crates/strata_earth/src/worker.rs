@@ -8,11 +8,16 @@ use crate::geodesy::{
     EarthCamera, Frustum6, Geodetic, LocalFrame, PatchBounds, SurfaceMorphParams, TileKey,
     TileProjection, MAX_QUADTREE_LEAVES,
 };
-use crate::gltf::{CustomWeatherMeshes, WeatherConfig};
+use crate::gltf::WeatherConfig;
 use crate::plugins::{
-    CachedPluginTexEntry, EarthDynamicOverlayContext, EarthPlugin, EarthPluginFrameContext,
-    EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext,
-    EarthWorldBuildContext, LoadedTileImagerySnapshot, OceanWavesPlugin, WeatherPlugin,
+    CachedPluginTexEntry, EarthDynamicOverlayContext, EarthParticleContext, EarthPlugin,
+    EarthPluginFrameContext, EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector,
+    EarthTileBuildContext, EarthWorldBuildContext, LoadedTileImagerySnapshot, OceanWavesPlugin,
+    WeatherPlugin,
+};
+use crate::precipitation::{
+    AtmosphereSample, PrecipitationConfig, PrecipitationEvaluator, PrecipitationPlugin,
+    TemperatureProvider,
 };
 use crate::raycast::{raycast_surface_ray, raycast_viewport, EarthRayHit};
 use crate::satellites::{SatelliteCatalogStore, SatelliteElement};
@@ -30,13 +35,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
-use strata_style::types::Color;
 use strata_render::camera64::DVec3;
 use strata_render::scene3d::{
     Background3D, RetainedCameraUniforms, RetainedDynamicMesh, RetainedEnvironmentAssets,
-    RetainedScene3D, RetainedTerrainFrame, RetainedTileInstance, RetainedTileMesh,
-    RetainedTileTexture, TileKeyId,
+    RetainedParticleLayer, RetainedScene3D, RetainedTerrainFrame, RetainedTileInstance,
+    RetainedTileMesh, RetainedTileTexture, TileKeyId,
 };
+use strata_style::types::Color;
 
 #[inline]
 fn hash_bytes_64(bytes: &[u8]) -> u64 {
@@ -270,15 +275,14 @@ pub struct RetainedTerrainBuilder {
     satellite_store: Arc<SatelliteCatalogStore>,
     skybox_store: Arc<SpaceSkyboxStore>,
     plugins: EarthPluginRegistry,
+    include_particles: bool,
     last_plugin_rev: u64,
     last_ocean_waves: OceanWavesConfig,
-    custom_weather: Option<CustomWeatherMeshes>,
     weather_ids: HashMap<u64, u64>,
     weather_rev: u64,
     last_cloud_rev: u64,
     last_sat_rev: u64,
     last_skybox_rev: u64,
-    last_built_weather: Option<(i64, i64, WeatherConfig)>,
     cached_env: Option<((u64, u64), Arc<RetainedEnvironmentAssets>)>,
 }
 
@@ -348,15 +352,14 @@ impl RetainedTerrainBuilder {
             satellite_store,
             skybox_store,
             plugins,
+            include_particles: true,
             last_plugin_rev,
             last_ocean_waves: OceanWavesConfig::default(),
-            custom_weather: None,
             weather_ids: HashMap::new(),
             weather_rev: 0,
             last_cloud_rev: 0,
             last_sat_rev: 0,
             last_skybox_rev: 0,
-            last_built_weather: None,
             cached_env: None,
         }
     }
@@ -370,6 +373,10 @@ impl RetainedTerrainBuilder {
         self.plugins = plugins;
         self.last_plugin_rev = 0;
         self.cached_env = None;
+    }
+
+    pub(crate) fn set_include_particles(&mut self, include: bool) {
+        self.include_particles = include;
     }
 
     pub fn register_plugin<P: EarthPlugin>(&mut self, plugin: P) {
@@ -400,11 +407,6 @@ impl RetainedTerrainBuilder {
             .unwrap_or(0.0)
     }
 
-    pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
-        self.custom_weather = custom;
-        self.last_built_weather = None;
-    }
-
     /// Clears cached GPU tile textures (and optionally elevation meshes) when switching tile providers.
     pub fn clear_provider_caches(&mut self, clear_elevation: bool) {
         self.textures.clear();
@@ -431,7 +433,7 @@ impl RetainedTerrainBuilder {
         self.last_cloud_rev
     }
 
-    /// Returns `true` when neither background cloudmap/skybox/satellites/plugins nor 2.5D weather meshes require rebuilding.
+    /// Returns `true` when neither background cloudmap/skybox/satellites/plugins nor ocean waves require rebuilding.
     pub fn frame_cache_valid_for_fast_path(&self, input: &EarthInput) -> bool {
         if self.last_plugin_rev != self.plugins.revision() {
             return false;
@@ -449,17 +451,7 @@ impl RetainedTerrainBuilder {
         {
             return false;
         }
-        let ll = input.low_level_state();
-        let active_25d = ll.local_25d_blend.max(ll.map_2d_morph) > 0.02
-            && (input.weather.rain || input.weather.snow);
-        if !active_25d {
-            return self.last_built_weather.is_none();
-        }
-        let lat_q = (input.camera.focus.lat_deg * 1e5).round() as i64;
-        let lon_q = (input.camera.focus.lon_deg * 1e5).round() as i64;
-        self.last_built_weather
-            .as_ref()
-            .is_some_and(|(a, b, w)| *a == lat_q && *b == lon_q && w == &input.weather)
+        true
     }
 
     pub(crate) fn base_camera_from_input(input: &EarthInput) -> RetainedCameraUniforms {
@@ -1507,14 +1499,6 @@ impl RetainedTerrainBuilder {
         }
 
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
-        let active_25d = flat_t > 0.02 && (input.weather.rain || input.weather.snow);
-        self.last_built_weather = if active_25d {
-            let lat_q = (input.camera.focus.lat_deg * 1e5).round() as i64;
-            let lon_q = (input.camera.focus.lon_deg * 1e5).round() as i64;
-            Some((lat_q, lon_q, input.weather.clone()))
-        } else {
-            None
-        };
         self.weather_rev = self.weather_rev.wrapping_add(1);
         if hooks.intersects(EarthPluginHooks::DYNAMIC_OVERLAYS) {
             let mut dyn_ctx = EarthDynamicOverlayContext {
@@ -1523,13 +1507,25 @@ impl RetainedTerrainBuilder {
                 flat_t,
                 time_s: input.weather.weather_time_s,
                 overlay_rev: self.weather_rev,
-                custom_weather: self.custom_weather.as_ref(),
                 satellite_elements: &sat_elements,
                 weather_ids: &mut self.weather_ids,
                 ground_snapshot: self.ground_snapshot.as_deref(),
             };
             self.plugins
                 .run_dynamic_overlays(&mut dyn_ctx, &mut dynamic_meshes);
+        }
+
+        let mut particle_layers = Vec::new();
+        let mut particle_textures = Vec::new();
+        if self.include_particles && hooks.intersects(EarthPluginHooks::PARTICLES) {
+            let mut p_ctx = EarthParticleContext {
+                input,
+                low_level: ll,
+                time_s: input.weather.weather_time_s,
+                ground_snapshot: self.ground_snapshot.as_deref(),
+            };
+            self.plugins
+                .run_particle_layers(&mut p_ctx, &mut particle_layers, &mut particle_textures);
         }
 
         let morph = stabilized_morph_params(
@@ -1573,6 +1569,8 @@ impl RetainedTerrainBuilder {
                 dynamic_meshes,
                 geo_mesh_assets,
                 geo_instances,
+                particle_layers: Arc::new(particle_layers),
+                particle_textures: Arc::new(particle_textures),
                 environment,
             }),
             stats,
@@ -1693,8 +1691,6 @@ fn find_resident_ancestor(
 struct WorkerShared {
     latest_input: Option<(u64, EarthInput)>,
     last_dispatched: Option<(u64, EarthInput)>,
-    custom_weather: Option<CustomWeatherMeshes>,
-    custom_weather_gen: u64,
     pending_provider: Option<(TileProviderConfig, bool)>,
     pending_source: Option<Box<dyn TileSource + Send>>,
     provider_gen: u64,
@@ -1758,8 +1754,6 @@ impl EarthTileWorker {
             Mutex::new(WorkerShared {
                 latest_input: None,
                 last_dispatched: None,
-                custom_weather: None,
-                custom_weather_gen: 0,
                 pending_provider: None,
                 pending_source: None,
                 provider_gen: 0,
@@ -1808,13 +1802,14 @@ impl EarthTileWorker {
                     skybox_store,
                 );
                 builder.set_plugins(plugins);
+                // Main-thread EarthViewport emits camera-locked 144 Hz particle layers synchronously.
+                builder.set_include_particles(false);
                 builder.set_ground_snapshot(ground_snapshot_bg);
                 builder.set_world(world_bg);
                 let mut geom_rev = 0u64;
-                let mut seen_custom_gen = 0u64;
                 let mut seen_provider_gen = 0u64;
                 loop {
-                    let (seq, input, custom_update, provider_update, source_update) = {
+                    let (seq, input, provider_update, source_update) = {
                         let (lock, cv) = &*shared_bg;
                         let mut guard = lock.lock().unwrap();
                         while guard.latest_input.is_none() && !guard.shutdown {
@@ -1823,12 +1818,6 @@ impl EarthTileWorker {
                         if guard.shutdown {
                             return;
                         }
-                        let cw = if guard.custom_weather_gen != seen_custom_gen {
-                            seen_custom_gen = guard.custom_weather_gen;
-                            Some(guard.custom_weather.clone())
-                        } else {
-                            None
-                        };
                         let (prov_up, src_up) = if guard.provider_gen != seen_provider_gen {
                             seen_provider_gen = guard.provider_gen;
                             (guard.pending_provider.take(), guard.pending_source.take())
@@ -1836,12 +1825,9 @@ impl EarthTileWorker {
                             (None, None)
                         };
                         let pair = guard.latest_input.take().unwrap();
-                        (pair.0, pair.1, cw, prov_up, src_up)
+                        (pair.0, pair.1, prov_up, src_up)
                     };
 
-                    if let Some(cw) = custom_update {
-                        builder.set_custom_weather_meshes(cw);
-                    }
                     if let Some(mut new_src) = source_update {
                         new_src.set_tile_ready_callback(Some(Arc::clone(&tile_wakeup)));
                         source = new_src;
@@ -1890,21 +1876,6 @@ impl EarthTileWorker {
             .read()
             .map(|s| s.sample_elevation_m(lat_deg, lon_deg))
             .unwrap_or(0.0)
-    }
-
-    /// Updates custom GLTF weather meshes on the background builder and schedules a refresh.
-    pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
-        let (lock, cv) = &*self.shared;
-        if let Ok(mut guard) = lock.lock() {
-            guard.custom_weather = custom;
-            guard.custom_weather_gen = guard.custom_weather_gen.wrapping_add(1);
-            if guard.latest_input.is_none() {
-                if let Some((seq, ref inp)) = guard.last_dispatched {
-                    guard.latest_input = Some((seq, inp.clone()));
-                }
-            }
-            cv.notify_one();
-        }
     }
 
     /// Switches the active [`TileProviderConfig`] on the background tile source and clears stale GPU textures.
@@ -1994,7 +1965,7 @@ pub struct EarthViewport {
     target_morph: f32,
     linear_morph: f32,
     transition_duration_s: f64,
-    custom_weather: Option<CustomWeatherMeshes>,
+    had_active_particles: bool,
     weather_ids: HashMap<u64, u64>,
     overlay_rev: u64,
     last_overlay_flat_t: f32,
@@ -2044,7 +2015,7 @@ impl EarthViewport {
             Arc::clone(&world),
         );
         worker.request_update(input.clone());
-        Self {
+        let mut vp = Self {
             retained,
             worker,
             world,
@@ -2054,14 +2025,18 @@ impl EarthViewport {
             target_morph: initial_morph,
             linear_morph: initial_morph,
             transition_duration_s: 0.45,
-            custom_weather: None,
+            had_active_particles: false,
             weather_ids: HashMap::new(),
             overlay_rev: 1,
             last_overlay_flat_t: initial_flat_t,
             last_geo_morph_sig: 0,
             last_geo_eye_dist_m: input.camera.eye_distance_m(),
             stopped: Arc::new(AtomicBool::new(false)),
+        };
+        if input.precipitation.enabled {
+            vp.publish_camera_and_particles();
         }
+        vp
     }
 
     #[inline]
@@ -2087,6 +2062,8 @@ impl EarthViewport {
         if removed {
             if id == OceanWavesPlugin::ID {
                 self.input.ocean_waves.enabled = false;
+            } else if id == PrecipitationPlugin::ID {
+                self.input.precipitation.enabled = false;
             }
             self.refresh_after_plugin_change();
         }
@@ -2099,6 +2076,7 @@ impl EarthViewport {
             let _ = self.plugins.remove(id);
         }
         self.input.ocean_waves.enabled = false;
+        self.input.precipitation.enabled = false;
         self.refresh_after_plugin_change();
     }
 
@@ -2108,6 +2086,8 @@ impl EarthViewport {
         if updated {
             if id == OceanWavesPlugin::ID {
                 self.input.ocean_waves.enabled = enabled;
+            } else if id == PrecipitationPlugin::ID {
+                self.input.precipitation.enabled = enabled;
             }
             self.refresh_after_plugin_change();
         }
@@ -2201,7 +2181,6 @@ impl EarthViewport {
                 flat_t,
                 time_s: self.input.weather.weather_time_s,
                 overlay_rev: self.overlay_rev,
-                custom_weather: self.custom_weather.as_ref(),
                 satellite_elements: &elements,
                 weather_ids: &mut self.weather_ids,
                 ground_snapshot: Some(self.worker.ground_snapshot.as_ref()),
@@ -2209,6 +2188,46 @@ impl EarthViewport {
             self.plugins.run_dynamic_overlays(&mut ctx, &mut out);
         }
         out
+    }
+
+    fn build_particle_layers(
+        &mut self,
+    ) -> (
+        Arc<Vec<RetainedParticleLayer>>,
+        Arc<Vec<Arc<RetainedTileTexture>>>,
+    ) {
+        let mut layers = Vec::new();
+        let mut textures = Vec::new();
+        if self
+            .plugins
+            .active_hooks()
+            .intersects(EarthPluginHooks::PARTICLES)
+        {
+            let ll = self.input.low_level_state();
+            let mut ctx = EarthParticleContext {
+                input: &self.input,
+                low_level: ll,
+                time_s: self.input.weather.weather_time_s,
+                ground_snapshot: Some(self.worker.ground_snapshot.as_ref()),
+            };
+            self.plugins
+                .run_particle_layers(&mut ctx, &mut layers, &mut textures);
+        }
+        self.had_active_particles = !layers.is_empty();
+        (Arc::new(layers), Arc::new(textures))
+    }
+
+    fn publish_camera_and_particles(&mut self) {
+        let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
+            &self.input,
+            &self.plugins,
+            self.input.weather.weather_time_s,
+            self.overlay_rev,
+            false,
+        );
+        let (p_layers, p_textures) = self.build_particle_layers();
+        self.retained
+            .update_camera_and_particles(cam_u, p_layers, p_textures);
     }
 
     fn publish_camera_and_overlays(&mut self) {
@@ -2220,14 +2239,22 @@ impl EarthViewport {
             false,
         );
         let dyn_meshes = self.build_dynamic_overlays();
+        let (p_layers, p_textures) = self.build_particle_layers();
         let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
         if has_world {
             let (assets, instances) = self.compile_world_retained();
-            self.retained
-                .update_camera_and_world_overlays(cam_u, dyn_meshes, assets, instances);
+            self.retained.update_camera_and_world_and_particles(
+                cam_u, dyn_meshes, assets, instances, p_layers, p_textures,
+            );
         } else {
-            self.retained
-                .update_camera_and_dynamic_meshes(cam_u, dyn_meshes);
+            self.retained.update_camera_and_world_and_particles(
+                cam_u,
+                dyn_meshes,
+                Arc::default(),
+                Arc::default(),
+                p_layers,
+                p_textures,
+            );
         }
     }
 
@@ -2266,6 +2293,9 @@ impl EarthViewport {
         }
         self.input.elevation_enabled = enabled;
         self.refresh_world_objects();
+        if self.input.precipitation.enabled || self.had_active_particles {
+            self.publish_camera_and_particles();
+        }
         if !self.stopped.load(Ordering::Relaxed) {
             self.worker.request_update(self.input.clone());
         }
@@ -2295,7 +2325,7 @@ impl EarthViewport {
         &self.input.weather
     }
 
-    /// Updates global cloudmap & 2.5D clouds/rain/snow toggles in O(1) without terrain rebuilds.
+    /// Updates global & local cloud-shell configuration in O(1) without terrain rebuilds.
     pub fn set_weather_config(&mut self, weather: WeatherConfig) {
         let need_worker = self.input.weather.global_cloud_map != weather.global_cloud_map
             || self.input.weather.cloud_resolution != weather.cloud_resolution;
@@ -2304,6 +2334,67 @@ impl EarthViewport {
         if need_worker && !self.stopped.load(Ordering::Relaxed) {
             self.worker.request_update(self.input.clone());
         }
+    }
+
+    #[inline]
+    pub fn precipitation_config(&self) -> &PrecipitationConfig {
+        &self.input.precipitation
+    }
+
+    /// Updates GPU-instanced 2D camera-local precipitation & atmospheric configuration in O(1).
+    pub fn set_precipitation_config(&mut self, precipitation: PrecipitationConfig) {
+        let enabled = precipitation.enabled;
+        self.input.precipitation = precipitation;
+        if enabled {
+            if self.plugins.contains(PrecipitationPlugin::ID) {
+                let _ = self.plugins.set_enabled(PrecipitationPlugin::ID, true);
+            } else {
+                self.plugins.register(PrecipitationPlugin::new());
+            }
+        }
+        self.publish_camera_and_particles();
+    }
+
+    /// Convenience toggle enabling or disabling [`PrecipitationPlugin`] rendering in O(1).
+    pub fn set_precipitation_enabled(&mut self, enabled: bool) {
+        let mut cfg = self.input.precipitation.clone();
+        cfg.enabled = enabled;
+        self.set_precipitation_config(cfg);
+    }
+
+    /// Installs a custom functional [`PrecipitationEvaluator`] on the active [`PrecipitationPlugin`].
+    pub fn set_precipitation_evaluator(&mut self, evaluator: PrecipitationEvaluator) {
+        if !self.plugins.contains(PrecipitationPlugin::ID) {
+            self.plugins.register(PrecipitationPlugin::new());
+        }
+        let _ = self
+            .plugins
+            .with_plugin_mut::<PrecipitationPlugin, _>(PrecipitationPlugin::ID, |p| {
+                p.set_evaluator(evaluator);
+            });
+        self.publish_camera_and_particles();
+    }
+
+    /// Installs or clears a custom [`TemperatureProvider`] on the active [`PrecipitationPlugin`].
+    pub fn set_temperature_provider(&mut self, provider: Option<Arc<dyn TemperatureProvider>>) {
+        if !self.plugins.contains(PrecipitationPlugin::ID) {
+            self.plugins.register(PrecipitationPlugin::new());
+        }
+        let _ = self
+            .plugins
+            .with_plugin_mut::<PrecipitationPlugin, _>(PrecipitationPlugin::ID, |p| {
+                p.set_temperature_provider(provider);
+            });
+        self.publish_camera_and_particles();
+    }
+
+    /// Returns the most recently evaluated [`AtmosphereSample`] from [`PrecipitationPlugin`], if any.
+    pub fn last_atmosphere_sample(&self) -> Option<AtmosphereSample> {
+        self.plugins
+            .with_plugin::<PrecipitationPlugin, _>(PrecipitationPlugin::ID, |p| {
+                p.last_atmosphere_sample()
+            })
+            .flatten()
     }
 
     #[inline]
@@ -2336,37 +2427,29 @@ impl EarthViewport {
         self.set_ocean_waves_config(cfg);
     }
 
-    /// Replaces the default embedded CC0 weather meshes with custom parsed GLTF meshes.
-    pub fn set_custom_weather_meshes(&mut self, custom: Option<CustomWeatherMeshes>) {
-        self.custom_weather = custom.clone();
-        self.worker.set_custom_weather_meshes(custom);
-        self.publish_camera_and_overlays();
-    }
-
     /// Updates simulation UNIX UTC timestamp (O(1) solar/lunar/sidereal/satellite uniform update).
     pub fn set_sim_time_unix_s(&mut self, unix_utc_s: f64) {
         self.input.sim_time_unix_s = unix_utc_s;
         self.publish_camera_and_overlays();
     }
 
-    /// Returns `true` when animated 2.5D precipitation/clouds or global cloud spin need ticking.
+    /// Returns `true` when global cloud spin or active precipitation need continuous animation ticks.
     pub fn has_active_weather_animation(&self) -> bool {
-        if !self.plugins.is_active(WeatherPlugin::ID) {
-            return false;
-        }
         let ll = self.input.low_level_state();
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
         let w = &self.input.weather;
-        let spin_3d = w.global_cloud_map
+        let spin_3d = self.plugins.is_active(WeatherPlugin::ID)
+            && w.global_cloud_map
             && self.input.layers.clouds
             && flat_t < 0.85
             && w.global_cloud_spin_rad_s.abs() > 1e-9;
-        let weather_25d = flat_t > 0.02
-            && ((w.rain && w.rain_density > 0) || (w.snow && w.snow_density > 0));
-        spin_3d || weather_25d
+        let precip = self.plugins.is_active(PrecipitationPlugin::ID)
+            && self.input.precipitation.enabled
+            && self.input.precipitation.intensity > 0.002;
+        spin_3d || precip
     }
 
-    /// Advances active weather animations by `dt_s` seconds synchronously in O(1) without quadtree rebuilds.
+    /// Advances active weather & precipitation animations by `dt_s` seconds synchronously in O(1).
     pub fn step_weather(&mut self, dt_s: f64) -> bool {
         if !self.has_active_weather_animation() {
             return false;
@@ -2379,14 +2462,19 @@ impl EarthViewport {
             overlay_rev: self.overlay_rev,
             is_dragging: false,
         };
-        if self.plugins.run_tick(dt_s, &ctx) {
+        let (other_dirty, particle_dirty) = self.plugins.run_tick_detailed(dt_s, &ctx);
+        if other_dirty {
             self.publish_camera_and_overlays();
-            return true;
+            true
+        } else if particle_dirty {
+            self.publish_camera_and_particles();
+            true
+        } else {
+            false
         }
-        false
     }
 
-    /// Advances all animated plugins (ocean waves, 2.5D/global weather, orbital satellites, custom plugins) in O(1).
+    /// Advances all animated plugins (precipitation, ocean waves, cloud spin, satellites, custom plugins) in O(1).
     pub fn step_dynamic_overlays(&mut self, dt_s: f64, tick_satellites: bool) -> bool {
         let ll = self.input.low_level_state();
         let ctx = EarthPluginFrameContext {
@@ -2400,11 +2488,16 @@ impl EarthViewport {
         if !self.plugins.any_wants_animation_tick(&ctx) {
             return false;
         }
-        let dirty = self.plugins.run_tick(dt_s, &ctx);
-        if dirty {
+        let (other_dirty, particle_dirty) = self.plugins.run_tick_detailed(dt_s, &ctx);
+        if other_dirty {
             self.publish_camera_and_overlays();
+            true
+        } else if particle_dirty {
+            self.publish_camera_and_particles();
+            true
+        } else {
+            false
         }
-        dirty
     }
 
     /// Returns the high-level view mode (`Mode3D` or `Mode2D`).
@@ -2520,6 +2613,12 @@ impl EarthViewport {
         let ocean_active = self.input.ocean_waves.enabled
             && self.plugins.is_active(OceanWavesPlugin::ID)
             && camera.altitude_m() < 520_000.0;
+        let particles_hooked = self
+            .plugins
+            .active_hooks()
+            .intersects(EarthPluginHooks::PARTICLES);
+        let need_particles =
+            particles_hooked && (self.input.precipitation.enabled || self.had_active_particles);
 
         let (has_world, has_px_sized) = self
             .world
@@ -2539,8 +2638,23 @@ impl EarthViewport {
 
         if (flat_t - self.last_overlay_flat_t).abs() > 0.015 || ocean_active {
             self.publish_camera_and_overlays();
+        } else if need_geo_refresh && need_particles {
+            let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
+                &self.input,
+                &self.plugins,
+                self.input.weather.weather_time_s,
+                self.overlay_rev,
+                false,
+            );
+            let (assets, instances) = self.compile_world_retained();
+            let (p_layers, p_textures) = self.build_particle_layers();
+            self.retained.update_camera_and_geo_and_particles(
+                cam_u, assets, instances, p_layers, p_textures,
+            );
         } else if need_geo_refresh {
             self.publish_camera_and_world();
+        } else if need_particles {
+            self.publish_camera_and_particles();
         } else {
             let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
                 &self.input,
