@@ -1,15 +1,13 @@
 use std::f64::consts::PI;
 
-use std::collections::HashMap;
 use strata_earth::{
-    build_25d_weather_meshes, cc0_cloud_mesh, cc0_rain_mesh, cc0_snow_mesh, embedded_bsc5_stars,
-    embedded_clouds_fallback, embedded_land_mask, embedded_moon_texture,
+    embedded_bsc5_stars, embedded_clouds_fallback, embedded_land_mask, embedded_moon_texture,
     greenwich_mean_sidereal_time_rad, icrf_to_ecef_matrix, moon_direction_from_unix_utc,
     parse_glb_mesh, sun_direction_from_local_time, sun_direction_from_subsolar_lat_lon,
     sun_direction_from_system_clock, sun_direction_from_unix_utc, system_clock_time,
     unix_to_julian_date, EarthCamera, EarthDefaultTileSource, EarthInput, EarthViewport, Geodetic,
-    LayerToggles, MemoryTileSource, RetainedTerrainBuilder, SpaceEnvironmentConfig,
-    SunDirectionMode, SurfaceMode, TileProjection, WeatherConfig,
+    LayerToggles, MemoryTileSource, PrecipitationConfig, PrecipitationMode, RetainedTerrainBuilder,
+    SpaceEnvironmentConfig, SunDirectionMode, SurfaceMode, TileProjection, WeatherConfig,
 };
 use strata_layout::Rect;
 
@@ -170,15 +168,8 @@ fn solar_lunar_and_sidereal_ephemeris_are_accurate() {
 }
 
 #[test]
-fn cc0_glb_weather_models_parse_and_spawn_only_in_25d() {
-    let cloud = cc0_cloud_mesh();
-    let rain = cc0_rain_mesh();
-    let snow = cc0_snow_mesh();
-    assert!(cloud.positions.len() >= 12 && !cloud.indices.is_empty());
-    assert!(rain.positions.len() >= 12 && !rain.indices.is_empty());
-    assert!(snow.positions.len() >= 12 && !snow.indices.is_empty());
-
-    // Build a tiny valid synthetic GLB in memory to verify custom GLB loading too.
+fn glb_parser_and_precipitation_layers_spawn_only_below_cloud_ceiling() {
+    // Build a tiny valid synthetic GLB in memory to verify custom GLB loading for EarthGeometry::glb.
     let mut bin = Vec::new();
     let pos: [[f32; 3]; 3] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
     for p in pos {
@@ -223,39 +214,48 @@ fn cc0_glb_weather_models_parse_and_spawn_only_in_25d() {
     assert_eq!(custom_tri.positions.len(), 3);
     assert_eq!(custom_tri.indices, vec![0, 1, 2]);
 
-    let weather = WeatherConfig {
-        clouds_25d: true,
-        rain: true,
-        snow: true,
-        cloud_count: 6,
-        rain_density: 40,
-        snow_density: 30,
-        ..WeatherConfig::default()
+    let mut builder = RetainedTerrainBuilder::new();
+    let mut src = MemoryTileSource::new();
+    let mut input = EarthInput {
+        camera: EarthCamera {
+            focus: Geodetic::new(47.6, -122.3, 0.0),
+            aim_offset_m: [0.0, 0.0, 0.0],
+            eye_offset_m: [0.0, 0.0, 10_000_000.0],
+            fov_y_deg: 55.0,
+            near_m: 1_000.0,
+        },
+        precipitation: PrecipitationConfig {
+            enabled: true,
+            mode: PrecipitationMode::Rain,
+            ..PrecipitationConfig::default()
+        },
+        ..EarthInput::default()
     };
-    let focus = Geodetic::new(47.6, -122.3, 0.0);
-    let mut cache = HashMap::new();
 
-    // Must be empty in 3D mode (`local_25d_blend == 0.0`).
-    let m_3d = build_25d_weather_meshes(focus, 10_000_000.0, 0.0, &weather, None, 1, &mut cache);
+    // Must emit zero precipitation layers in full 3D orbital space above the cloud ceiling.
+    let (frame_space, _) = builder.build_frame(&input, &mut src, 1, true);
     assert!(
-        m_3d.is_empty(),
-        "2.5D weather must not appear in full 3D globe mode"
+        frame_space.particle_layers.is_empty(),
+        "precipitation must stop completely above the cloud ceiling"
     );
 
-    // Must emit only rain and snow CC0 layers when in 2.5D mode (clouds use the cloud texture shader, never 3D cloud models).
-    let m_25d = build_25d_weather_meshes(focus, 1_800.0, 1.0, &weather, None, 2, &mut cache);
-    assert_eq!(m_25d.len(), 2);
-    for layer in &m_25d {
-        assert!(!layer.vertices.is_empty() && !layer.indices.is_empty());
-        assert_ne!(layer.id, 0x9E47_0001, "3D cloud models must never spawn");
-    }
+    // Must emit GPU-instanced 2D particle layers below the cloud ceiling with zero CPU weather meshes.
+    input.camera.eye_offset_m = [0.0, -400.0, 1_800.0];
+    let (frame_low, _) = builder.build_frame(&input, &mut src, 2, true);
+    assert_eq!(frame_low.particle_layers.len(), 1);
+    assert!(frame_low.particle_layers[0].particle_count > 0);
+    assert!(
+        frame_low
+            .dynamic_meshes
+            .iter()
+            .all(|m| !(0x9E47_0001..=0x9E47_0003).contains(&m.id)),
+        "legacy 3D weather meshes must never spawn"
+    );
 
-    // Disabling rain should leave only snow.
-    let mut weather_no_rain = weather.clone();
-    weather_no_rain.rain = false;
-    let m_filtered =
-        build_25d_weather_meshes(focus, 1_800.0, 1.0, &weather_no_rain, None, 3, &mut cache);
-    assert_eq!(m_filtered.len(), 1);
+    // Disabling precipitation clears all particle layers immediately.
+    input.precipitation.enabled = false;
+    let (frame_off, _) = builder.build_frame(&input, &mut src, 3, true);
+    assert!(frame_off.particle_layers.is_empty());
 }
 
 #[test]
@@ -295,11 +295,14 @@ fn transitions_fade_terminator_city_lights_and_clouds_in_25d_and_toggles_work() 
     assert!(cam_mid.day_night_strength < cam_3d.day_night_strength);
     assert!(cam_mid.city_lights_intensity < cam_3d.city_lights_intensity);
 
-    // Full 2.5D close to ground (1.5 km) -> shadowless, no city lights, no 3D cloud shell, 2.5D weather present.
+    // Full 2.5D close to ground (1.5 km) -> shadowless, no city lights, no 3D cloud shell, GPU precipitation active.
     let mut input_25d = input_3d.clone();
     input_25d.camera.eye_offset_m = [0.0, -400.0, 1_500.0];
-    input_25d.weather.rain = true;
-    input_25d.weather.snow = true;
+    input_25d.precipitation = PrecipitationConfig {
+        enabled: true,
+        mode: PrecipitationMode::Physical,
+        ..PrecipitationConfig::default()
+    };
     let cam_25d = RetainedTerrainBuilder::camera_from_input(&input_25d);
     assert!(cam_25d.local_25d_blend > 0.98);
     assert!(
@@ -355,11 +358,8 @@ fn transitions_fade_terminator_city_lights_and_clouds_in_25d_and_toggles_work() 
     );
     assert!(frame_3d.environment.is_some());
     assert!(
-        frame_3d
-            .dynamic_meshes
-            .iter()
-            .all(|m| !(0x9E47_0001..=0x9E47_0003).contains(&m.id)),
-        "2.5D weather meshes must remain absent in 3D"
+        frame_3d.particle_layers.is_empty(),
+        "precipitation layers must remain absent in 3D orbital space"
     );
     assert!(
         frame_3d
@@ -370,13 +370,13 @@ fn transitions_fade_terminator_city_lights_and_clouds_in_25d_and_toggles_work() 
     );
 
     let (frame_25d, _) = builder.build_frame(&input_25d, &mut src, 2, true);
-    assert_eq!(frame_25d.dynamic_meshes.len(), 2);
     assert!(
-        frame_25d
-            .dynamic_meshes
-            .iter()
-            .all(|m| (0x9E47_0002..=0x9E47_0003).contains(&m.id)),
-        "only 2.5D rain/snow meshes should remain (no 3D cloud models)"
+        frame_25d.dynamic_meshes.is_empty(),
+        "2.5D precipitation uses GPU instanced particle layers, never CPU dynamic meshes"
+    );
+    assert!(
+        !frame_25d.particle_layers.is_empty(),
+        "2.5D physical precipitation should emit GPU particle layers below cloud ceiling"
     );
 
     // Verify all toggles can disable cleanly even in 3D space.

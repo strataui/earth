@@ -5,8 +5,9 @@ use strata_earth::{
     EarthDynamicOverlayContext, EarthInput, EarthPlugin, EarthPluginFrameContext,
     EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext,
     EarthViewport, EarthWorldBuildContext, Geodetic, LoadedTileImagerySnapshot, MemoryTileSource,
-    OceanWavesConfig, OceanWavesPlugin, RetainedTerrainBuilder, SatellitesPlugin, TileKey,
-    TileProjection, TileSource, WeatherConfig, WeatherPlugin,
+    OceanWavesConfig, OceanWavesPlugin, PrecipitationConfig, PrecipitationMode,
+    PrecipitationPlugin, RetainedTerrainBuilder, SatellitesPlugin, TileKey, TileProjection,
+    TileSource, WeatherPlugin,
 };
 use strata_render::scene3d::{
     RetainedCameraUniforms, RetainedDynamicMesh, RetainedEnvironmentAssets, RetainedTileInstance,
@@ -425,10 +426,10 @@ fn empty_plugin_registry_starts_clean_and_allows_selective_composition() {
         inp.seamless_25d = true;
         inp.space.stars_visible = true;
         inp.space.city_lights = true;
-        inp.weather = WeatherConfig {
-            rain: true,
-            rain_density: 32,
-            ..WeatherConfig::default()
+        inp.precipitation = PrecipitationConfig {
+            enabled: true,
+            mode: PrecipitationMode::Rain,
+            ..PrecipitationConfig::default()
         };
         inp.ocean_waves = OceanWavesConfig::enabled();
         inp
@@ -444,10 +445,12 @@ fn empty_plugin_registry_starts_clean_and_allows_selective_composition() {
     assert_eq!(bare_frame.camera.local_cloud_opacity, 0.0);
     assert!(!bare_frame.camera.stars_visible);
     assert!(bare_frame.dynamic_meshes.is_empty());
+    assert!(bare_frame.particle_layers.is_empty());
 
-    // Plug in ONLY WeatherPlugin + OceanWavesPlugin + SatellitesPlugin + CelestialPlugin selectively
+    // Plug in ONLY WeatherPlugin + PrecipitationPlugin + OceanWavesPlugin + SatellitesPlugin + CelestialPlugin selectively
     empty.register(CelestialPlugin::default());
     empty.register(WeatherPlugin::default());
+    empty.register(PrecipitationPlugin::default());
     empty.register(SatellitesPlugin::default());
     empty.register(OceanWavesPlugin::default());
     let (composed, _) = bare_builder.build_frame(&input, &mut source, 2, true);
@@ -458,8 +461,8 @@ fn empty_plugin_registry_starts_clean_and_allows_selective_composition() {
         "WeatherPlugin should activate 2.5D cloud texture layer when selectively plugged"
     );
     assert!(
-        !composed.dynamic_meshes.is_empty(),
-        "WeatherPlugin should emit 2.5D rain meshes when selectively plugged"
+        !composed.particle_layers.is_empty(),
+        "PrecipitationPlugin should emit GPU 2D rain particle layers when selectively plugged"
     );
 }
 

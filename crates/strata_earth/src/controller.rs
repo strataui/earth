@@ -18,6 +18,10 @@ pub const MAX_RANGE_M: f64 = 24_000_000.0;
 pub const GROUND_CLEARANCE_M: f64 = 25.0;
 /// Altitude band below which 3D globe arcball seamlessly transitions into 2.5D tangent-plane orbit.
 pub const LOCAL_TRANSITION_RANGE_M: f64 = 180_000.0;
+/// Range above which 2.5D pitch smoothly begins tapering back toward initial full-3D nadir pitch (`0°`).
+pub const FULL_25D_PITCH_TAPER_START_M: f64 = 40_000.0;
+/// Range at and above which the globe is in full 3D orbital mode (`0°` nadir pitch, no pitch dragging).
+pub const FULL_3D_PITCH_CUTOFF_M: f64 = 250_000.0;
 /// Default vertical field of view in degrees.
 pub const DEFAULT_FOV_Y_DEG: f64 = 52.0;
 
@@ -249,9 +253,14 @@ impl EarthOrbitController {
         Self::default()
     }
 
+    /// Maximum permitted camera pitch (`tilt_deg`) for a given range.
+    ///
+    /// - Full 2.5D (`<= 40 km`): up to `84.0°` oblique tilt.
+    /// - 2.5D -> 3D transition (`40 km .. 250 km`): smoothly tapers to `0.0°`.
+    /// - Full 3D orbital space (`>= 250 km`): strictly `0.0°` (initial full-3D pitch).
     #[inline]
-    fn max_tilt_for_range(range_m: f64) -> f64 {
-        84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, range_m) * 0.4)
+    pub fn max_tilt_for_range(range_m: f64) -> f64 {
+        84.0 * (1.0 - smoothstep(FULL_25D_PITCH_TAPER_START_M, FULL_3D_PITCH_CUTOFF_M, range_m))
     }
 
     #[inline]
@@ -387,7 +396,7 @@ impl EarthOrbitController {
         self.range_m = range_m.clamp(MIN_RANGE_M, MAX_RANGE_M);
         self.target_range_m = self.range_m;
         self.heading_deg = normalize_deg(heading_deg);
-        self.tilt_deg = tilt_deg.clamp(0.0, 84.0);
+        self.tilt_deg = tilt_deg.clamp(0.0, Self::max_tilt_for_range(self.range_m));
         self.focus_ground_m = 0.0;
         self.ground_needs_snap = true;
         self.spin_vel_rad_s = 0.0;
@@ -779,7 +788,8 @@ impl EarthOrbitController {
         self.orbit_vel_deg_s = (0.0, 0.0);
         self.zoom_cursor_px = None;
 
-        if button == 1 && !self.is_2d_hint {
+        let allow_orbit_tilt = !self.is_2d_hint && Self::max_tilt_for_range(self.range_m) > 1e-4;
+        if button == 1 && allow_orbit_tilt {
             if let Some((prev_time, px, py)) = self.last_middle_click {
                 if now.saturating_duration_since(prev_time) <= Duration::from_millis(450)
                     && (x - px).hypot(y - py) <= 24.0
@@ -798,7 +808,7 @@ impl EarthOrbitController {
 
         self.drag_action = match button {
             0 => Some(DragAction::PanOrArcball),
-            1 | 2 => Some(DragAction::OrbitTilt),
+            1 | 2 if allow_orbit_tilt => Some(DragAction::OrbitTilt),
             _ => None,
         };
         self.drag_action.is_some()
@@ -882,8 +892,13 @@ impl EarthOrbitController {
         let max_t = if self.is_2d_hint {
             0.0
         } else {
-            84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4)
+            Self::max_tilt_for_range(self.range_m)
         };
+        if max_t <= 1e-4 {
+            self.tilt_deg = 0.0;
+            self.orbit_vel_deg_s = (0.0, 0.0);
+            return;
+        }
         let d_tilt = -dy * 0.24;
         let prev_tilt = self.tilt_deg;
         self.tilt_deg = (self.tilt_deg + d_tilt).clamp(0.0, max_t);
@@ -891,7 +906,7 @@ impl EarthOrbitController {
         let local_w = if self.is_2d_hint {
             0.0
         } else {
-            (1.0 - smoothstep(40_000.0, LOCAL_TRANSITION_RANGE_M, self.range_m))
+            (1.0 - smoothstep(FULL_25D_PITCH_TAPER_START_M, LOCAL_TRANSITION_RANGE_M, self.range_m))
                 * smoothstep(8.0, 28.0, self.tilt_deg)
         };
         let d_heading = dx * 0.28 * local_w;
@@ -1204,8 +1219,7 @@ impl EarthOrbitController {
 
             if !is_2d && (self.orbit_vel_deg_s.0.abs() > 1e-2 || self.orbit_vel_deg_s.1.abs() > 1e-2)
             {
-                let max_t =
-                    84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4);
+                let max_t = Self::max_tilt_for_range(self.range_m);
                 self.heading_deg = normalize_deg(self.heading_deg + self.orbit_vel_deg_s.0 * dt);
                 let unclamped_t = self.tilt_deg + self.orbit_vel_deg_s.1 * dt;
                 self.tilt_deg = unclamped_t.clamp(0.0, max_t);
@@ -1250,11 +1264,24 @@ impl EarthOrbitController {
             self.zoom_cursor_px = None;
         }
 
-        // 4. Enforce tilt ceiling & strict ground collision safety in 3D/2.5D
+        // 4. Smoothly transition pitch back to initial full-3D pitch (0°) when ascending
+        // from 2.5D into full 3D, and enforce strict ground collision safety.
         if !is_2d {
-            let max_t = 84.0 * (1.0 - smoothstep(180_000.0, 1_500_000.0, self.range_m) * 0.4);
+            let max_t = Self::max_tilt_for_range(self.range_m);
             if self.tilt_deg > max_t {
-                self.tilt_deg = max_t;
+                if self.orbit_vel_deg_s.1 > 0.0 {
+                    self.orbit_vel_deg_s.1 = 0.0;
+                }
+                let excess = self.tilt_deg - max_t;
+                if excess > 0.25 {
+                    let pitch_alpha = 1.0 - (-11.0 * dt).exp();
+                    self.tilt_deg += (max_t - self.tilt_deg) * pitch_alpha;
+                    if (self.tilt_deg - max_t).abs() < 0.05 {
+                        self.tilt_deg = max_t;
+                    }
+                } else {
+                    self.tilt_deg = max_t;
+                }
                 self.sync_dirs_from_geo();
                 changed = true;
             }
@@ -1527,16 +1554,16 @@ mod tests {
     }
 
     #[test]
-    fn double_middle_click_resets_pitch_in_3d_mode() {
+    fn double_middle_click_resets_pitch_in_25d_mode() {
         let mut ctrl = EarthOrbitController::new();
         ctrl.set_viewport_size(1440.0, 900.0);
-        ctrl.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
+        ctrl.jump_to(37.7749, -122.4194, 4_000.0, 0.0, 0.0);
 
-        // Middle-click and drag upward to increase pitch (tilt_deg).
+        // Middle-click and drag upward in 2.5D to increase pitch (tilt_deg).
         assert!(ctrl.handle_mouse_down(1, 720.0, 450.0));
         assert!(ctrl.handle_mouse_move(720.0, 350.0));
         assert!(ctrl.handle_mouse_up(1));
-        assert!(ctrl.tilt_deg > 10.0, "expected positive pitch after middle drag");
+        assert!(ctrl.tilt_deg > 10.0, "expected positive pitch after 2.5D middle drag");
 
         // Double middle-click at the same position resets pitch to 0.0.
         assert!(ctrl.handle_mouse_down(1, 720.0, 350.0));
@@ -1547,7 +1574,60 @@ mod tests {
         let _ = ctrl.handle_mouse_up(1);
         assert!(
             ctrl.tilt_deg.abs() < 1e-9,
-            "double middle click in 3D mode must reset pitch to 0.0, got {}",
+            "double middle click in 2.5D mode must reset pitch to 0.0, got {}",
+            ctrl.tilt_deg
+        );
+    }
+
+    #[test]
+    fn full_3d_mode_disables_middle_click_pitch_and_25d_to_3d_smoothly_levels_pitch() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.jump_to(26.0, 16.0, 13_500_000.0, 0.0, 0.0);
+
+        // Full 3D orbital mode (>= 250 km): middle-click drag must NOT start pitch orbit or change tilt.
+        assert!(
+            !ctrl.handle_mouse_down(1, 720.0, 450.0),
+            "middle-click pitch drag must be disabled in full 3D orbital mode"
+        );
+        assert!(!ctrl.handle_mouse_move(720.0, 320.0));
+        let _ = ctrl.handle_mouse_up(1);
+        assert!(
+            ctrl.tilt_deg.abs() < 1e-9,
+            "full 3D pitch must remain at initial 0.0°, got {}",
+            ctrl.tilt_deg
+        );
+
+        // Start tilted in 2.5D (58° at 3.2 km) and zoom out continuously into full 3D (> 350 km).
+        ctrl.jump_to(37.7749, -122.4194, 3_200.0, 22.0, 58.0);
+        assert!((ctrl.tilt_deg - 58.0).abs() < 1e-6);
+
+        let mut prev_tilt = ctrl.tilt_deg;
+        let mut saw_intermediate_tilt = false;
+        let dt = 1.0 / 60.0;
+        for _ in 0..240 {
+            if ctrl.range_m < 600_000.0 {
+                ctrl.zoom_by_ln(2.2 * dt);
+            }
+            let _ = ctrl.step_damping(dt, false, |_, _| 0.0);
+            assert!(
+                ctrl.tilt_deg <= prev_tilt + 1e-6,
+                "pitch must monotonically decrease when transitioning from 2.5D to 3D: prev={prev_tilt}, cur={}",
+                ctrl.tilt_deg
+            );
+            if ctrl.tilt_deg > 5.0 && ctrl.tilt_deg < 50.0 {
+                saw_intermediate_tilt = true;
+            }
+            prev_tilt = ctrl.tilt_deg;
+        }
+        assert!(
+            saw_intermediate_tilt,
+            "2.5D -> 3D pitch return must transition smoothly through intermediate angles rather than snapping"
+        );
+        assert!(
+            ctrl.range_m >= FULL_3D_PITCH_CUTOFF_M && ctrl.tilt_deg.abs() < 0.05,
+            "full 3D mode must arrive cleanly at initial 0° pitch: range={}, tilt={}",
+            ctrl.range_m,
             ctrl.tilt_deg
         );
     }

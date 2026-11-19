@@ -1,24 +1,9 @@
-//! Minimal pure-Rust glTF 2.0 `.glb` loader and 2.5D weather particle batch builder.
+//! Minimal pure-Rust glTF 2.0 `.glb` binary mesh loader and global cloud-layer [`WeatherConfig`].
 //!
-//! Loads CC0 3D models (`weather_cloud.glb`, `weather_rain.glb`, `weather_snow.glb`)
-//! sourced cleanly from Poly Pizza (CC0 Storm cloud), OpenGameArt (CC0 Drops), and
-//! Kenney Holiday Kit (CC0 `snowflake-a.glb`), plus custom user-supplied `.glb` bytes.
+//! Used by [`crate::world::EarthGeometry::glb`] for custom user-supplied 3D `.glb` assets, while
+//! atmospheric precipitation is handled by the GPU-instanced 2D [`crate::precipitation::PrecipitationPlugin`].
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
-
-use strata_render::scene3d::{RetainedDynamicMesh, RteTileVertex};
-
-use crate::geodesy::{Geodetic, LocalFrame};
 use crate::json::Json;
-
-const CC0_CLOUD_GLB: &[u8] = include_bytes!("../assets/weather_cloud.glb");
-const CC0_RAIN_GLB: &[u8] = include_bytes!("../assets/weather_rain.glb");
-const CC0_SNOW_GLB: &[u8] = include_bytes!("../assets/weather_snow.glb");
-
-static DEFAULT_CLOUD_MESH: OnceLock<WeatherMesh> = OnceLock::new();
-static DEFAULT_RAIN_MESH: OnceLock<WeatherMesh> = OnceLock::new();
-static DEFAULT_SNOW_MESH: OnceLock<WeatherMesh> = OnceLock::new();
 
 /// Normalized unit-scale triangle mesh extracted from a glTF 2.0 `.glb` asset.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,26 +11,6 @@ pub struct WeatherMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub indices: Vec<u32>,
-}
-
-impl WeatherMesh {
-    fn fallback_octahedron() -> Self {
-        let p = [
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [-1.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [0.0, 0.0, -1.0],
-        ];
-        Self {
-            positions: p.to_vec(),
-            normals: p.to_vec(),
-            indices: vec![
-                0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 1, 5, 2, 1, 5, 3, 2, 5, 4, 3, 5, 1, 4,
-            ],
-        }
-    }
 }
 
 fn j_field<'a>(obj: &'a [(String, Json)], key: &str) -> Option<&'a Json> {
@@ -241,33 +206,13 @@ pub fn parse_glb_mesh(bytes: &[u8]) -> Result<WeatherMesh, String> {
     })
 }
 
-/// Returns the CC0 3D cloud mesh (`weather_cloud.glb`).
-pub fn cc0_cloud_mesh() -> &'static WeatherMesh {
-    DEFAULT_CLOUD_MESH.get_or_init(|| {
-        parse_glb_mesh(CC0_CLOUD_GLB).unwrap_or_else(|_| WeatherMesh::fallback_octahedron())
-    })
-}
-
-/// Returns the CC0 3D raindrop mesh (`weather_rain.glb`).
-pub fn cc0_rain_mesh() -> &'static WeatherMesh {
-    DEFAULT_RAIN_MESH.get_or_init(|| {
-        parse_glb_mesh(CC0_RAIN_GLB).unwrap_or_else(|_| WeatherMesh::fallback_octahedron())
-    })
-}
-
-/// Returns the CC0 3D snowflake mesh (`weather_snow.glb`).
-pub fn cc0_snow_mesh() -> &'static WeatherMesh {
-    DEFAULT_SNOW_MESH.get_or_init(|| {
-        parse_glb_mesh(CC0_SNOW_GLB).unwrap_or_else(|_| WeatherMesh::fallback_octahedron())
-    })
-}
-
-/// Customizable 3D weather configuration (3D orbital cloud map + 2.5D-only clouds, rain, snow).
+/// Global and local atmospheric cloud-shell configuration (precipitation is configured separately
+/// via [`crate::precipitation::PrecipitationConfig`] and [`crate::precipitation::PrecipitationPlugin`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeatherConfig {
-    /// Render live equirectangular global cloud map in 3D space (fades out into 2.5D).
+    /// Render live equirectangular global cloud map in 3D space and overhead in 2.5D.
     pub global_cloud_map: bool,
-    /// Opacity of the 3D global cloud map (`0.0..=1.0`).
+    /// Opacity of the cloud layer (`0.0..=1.0`).
     pub global_cloud_opacity: f32,
     /// Resolution tier for the live global cloud map (`1K`, `2K`, `4K`, `8K`).
     pub cloud_resolution: crate::astro::CloudMapResolution,
@@ -275,43 +220,7 @@ pub struct WeatherConfig {
     pub cloud_map_url: String,
     /// Global cloud drift offset speed in radians/second (defaults to `0.0`).
     pub global_cloud_spin_rad_s: f64,
-
-    /// Render 3D CC0 cloud models overhead (ONLY visible when Earth transitions into 2.5D).
-    pub clouds_25d: bool,
-    /// Number of 2.5D cloud instances around focus.
-    pub cloud_count: usize,
-    /// Mean cloud base altitude in metres above focus ground.
-    pub cloud_altitude_m: f32,
-    /// Scale of 2.5D cloud meshes in metres.
-    pub cloud_scale_m: f32,
-    /// Horizontal wind drift vector `[east_mps, north_mps]` for 2.5D clouds.
-    pub cloud_wind_mps: [f32; 2],
-    /// Cloud tint RGBA.
-    pub cloud_color: [f32; 4],
-
-    /// Render 3D CC0 raindrops (ONLY visible in 2.5D).
-    pub rain: bool,
-    /// Number of raindrop instances in the local volume.
-    pub rain_density: usize,
-    /// Raindrop fall speed in m/s.
-    pub rain_speed_mps: f32,
-    /// Raindrop half-size in metres.
-    pub rain_scale_m: f32,
-    /// Raindrop RGBA tint.
-    pub rain_color: [f32; 4],
-
-    /// Render 3D CC0 snowflakes (ONLY visible in 2.5D).
-    pub snow: bool,
-    /// Number of snowflake instances in the local volume.
-    pub snow_density: usize,
-    /// Snowflake fall speed in m/s.
-    pub snow_speed_mps: f32,
-    /// Snowflake half-size in metres.
-    pub snow_scale_m: f32,
-    /// Snowflake RGBA tint.
-    pub snow_color: [f32; 4],
-
-    /// Elapsed weather animation seconds (drives wind drift and precipitation fall).
+    /// Elapsed weather animation seconds (drives global cloud drift).
     pub weather_time_s: f64,
 }
 
@@ -324,22 +233,6 @@ impl Default for WeatherConfig {
             cloud_resolution,
             cloud_map_url: cloud_resolution.url().to_string(),
             global_cloud_spin_rad_s: 0.0,
-            clouds_25d: false,
-            cloud_count: 0,
-            cloud_altitude_m: 1_800.0,
-            cloud_scale_m: 1_200.0,
-            cloud_wind_mps: [22.0, 8.0],
-            cloud_color: [0.97, 0.98, 1.0, 0.90],
-            rain: false,
-            rain_density: 260,
-            rain_speed_mps: 32.0,
-            rain_scale_m: 1.8,
-            rain_color: [0.72, 0.86, 1.0, 0.76],
-            snow: false,
-            snow_density: 220,
-            snow_speed_mps: 5.5,
-            snow_scale_m: 2.6,
-            snow_color: [0.96, 0.98, 1.0, 0.94],
             weather_time_s: 0.0,
         }
     }
@@ -367,180 +260,4 @@ impl WeatherConfig {
             self.cloud_resolution.url()
         }
     }
-}
-
-#[inline]
-fn det_hash(seed: u32) -> f64 {
-    let mut x = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
-    x = ((x >> ((x >> 28).wrapping_add(4))) ^ x).wrapping_mul(277_803_737);
-    let out = (x >> 22) ^ x;
-    (out as f64) / (u32::MAX as f64)
-}
-
-#[inline]
-fn batch_instance_into_local_enu(
-    frame: &LocalFrame,
-    mesh: &WeatherMesh,
-    offset_enu: [f64; 3],
-    scale: [f64; 3],
-    yaw_rad: f64,
-    out_verts: &mut Vec<RteTileVertex>,
-    out_inds: &mut Vec<u32>,
-) {
-    let base_v = out_verts.len() as u32;
-    let (sy, cy) = yaw_rad.sin_cos();
-    let e = frame.east;
-    let n = frame.north;
-    let u = frame.up;
-
-    for (p, nrm) in mesh.positions.iter().zip(mesh.normals.iter()) {
-        // Model local X/Y horizontal, Z up -> rotate yaw in EN plane
-        let lx = p[0] as f64 * scale[0];
-        let ly = p[1] as f64 * scale[1];
-        let lz = p[2] as f64 * scale[2];
-        let rx = lx * cy - ly * sy + offset_enu[0];
-        let ry = lx * sy + ly * cy + offset_enu[1];
-        let rz = lz + offset_enu[2];
-
-        let world_off = [
-            (e.x * rx + n.x * ry + u.x * rz) as f32,
-            (e.y * rx + n.y * ry + u.y * rz) as f32,
-            (e.z * rx + n.z * ry + u.z * rz) as f32,
-        ];
-
-        let nx = nrm[0] as f64 * cy - nrm[1] as f64 * sy;
-        let ny = nrm[0] as f64 * sy + nrm[1] as f64 * cy;
-        let nz = nrm[2] as f64;
-        let wn = [
-            (e.x * nx + n.x * ny + u.x * nz) as f32,
-            (e.y * nx + n.y * ny + u.y * nz) as f32,
-            (e.z * nx + n.z * ny + u.z * nz) as f32,
-        ];
-        out_verts.push(RteTileVertex::new(world_off, wn, [0.0, 0.0]));
-    }
-    for &idx in &mesh.indices {
-        out_inds.push(base_v + idx);
-    }
-}
-
-/// Optional custom `.glb` mesh overrides for 2.5D weather.
-#[derive(Debug, Clone, Default)]
-pub struct CustomWeatherMeshes {
-    pub cloud: Option<Arc<WeatherMesh>>,
-    pub rain: Option<Arc<WeatherMesh>>,
-    pub snow: Option<Arc<WeatherMesh>>,
-}
-
-/// Generates batched [`RetainedDynamicMesh`] layers for 2.5D clouds, rain, and snow.
-///
-/// Returns an empty `Vec` whenever `local_25d_blend <= 0.02` so 3D orbital view stays purely
-/// covered by the global satellite cloudmap.
-pub fn build_25d_weather_meshes(
-    focus: Geodetic,
-    camera_range_m: f64,
-    local_25d_blend: f32,
-    weather: &WeatherConfig,
-    custom: Option<&CustomWeatherMeshes>,
-    revision: u64,
-    _cached_ids: &mut HashMap<u64, u64>,
-) -> Vec<RetainedDynamicMesh> {
-    if local_25d_blend <= 0.02 {
-        return Vec::new();
-    }
-    let alpha_fade = ((local_25d_blend - 0.02) / 0.48).clamp(0.0, 1.0);
-    let frame = LocalFrame::at(focus.lat_deg, focus.lon_deg);
-    let anchor_ecef = crate::geodesy::geodetic_to_ecef(focus);
-    let anchor = [anchor_ecef.x, anchor_ecef.y, anchor_ecef.z];
-    let t = weather.weather_time_s;
-    let mut out = Vec::with_capacity(2);
-
-    #[inline]
-    fn pick_mesh<'a>(
-        custom: Option<&'a Arc<WeatherMesh>>,
-        default: &'a WeatherMesh,
-    ) -> &'a WeatherMesh {
-        custom.map(Arc::as_ref).unwrap_or(default)
-    }
-
-    // 1. 2.5D 3D CC0 Raindrops (clouds use the continuous cloud texture layer in fs_cloud, never 3D cloud models)
-    if weather.rain && weather.rain_density > 0 {
-        let mesh = pick_mesh(custom.and_then(|c| c.rain.as_ref()), cc0_rain_mesh());
-        let count = weather.rain_density.min(1_000);
-        let mut verts = Vec::with_capacity(count * mesh.positions.len());
-        let mut inds = Vec::with_capacity(count * mesh.indices.len());
-        let vol_r = (camera_range_m * 0.55).clamp(180.0, 12_000.0);
-        let vol_h = (camera_range_m * 0.70).clamp(240.0, 6_000.0);
-        let p_scale = (weather.rain_scale_m as f64) * (camera_range_m / 1_500.0).clamp(0.4, 8.0);
-        for i in 0..count as u32 {
-            let h0 = det_hash(i * 29 + 101);
-            let h1 = det_hash(i * 29 + 102);
-            let h2 = det_hash(i * 29 + 103);
-            let east = (h0 - 0.5) * 2.0 * vol_r;
-            let north = (h1 - 0.5) * 2.0 * vol_r;
-            let up = ((h2 * vol_h) - (weather.rain_speed_mps as f64 * t)).rem_euclid(vol_h) + 8.0;
-            batch_instance_into_local_enu(
-                &frame,
-                mesh,
-                [east, north, up],
-                [p_scale * 0.45, p_scale * 0.45, p_scale * 2.2],
-                0.0,
-                &mut verts,
-                &mut inds,
-            );
-        }
-        let mut col = weather.rain_color;
-        col[3] *= alpha_fade;
-        out.push(RetainedDynamicMesh {
-            id: 0x9E47_0002,
-            revision,
-            anchor_ecef: anchor,
-            vertices: Arc::new(verts),
-            indices: Arc::new(inds),
-            color: col,
-            unlit: false,
-        });
-    }
-
-    // 3. 2.5D 3D CC0 Snowflakes
-    if weather.snow && weather.snow_density > 0 {
-        let mesh = pick_mesh(custom.and_then(|c| c.snow.as_ref()), cc0_snow_mesh());
-        let count = weather.snow_density.min(900);
-        let mut verts = Vec::with_capacity(count * mesh.positions.len());
-        let mut inds = Vec::with_capacity(count * mesh.indices.len());
-        let vol_r = (camera_range_m * 0.55).clamp(180.0, 12_000.0);
-        let vol_h = (camera_range_m * 0.70).clamp(240.0, 6_000.0);
-        let p_scale = (weather.snow_scale_m as f64) * (camera_range_m / 1_500.0).clamp(0.4, 8.0);
-        for i in 0..count as u32 {
-            let h0 = det_hash(i * 37 + 211);
-            let h1 = det_hash(i * 37 + 212);
-            let h2 = det_hash(i * 37 + 213);
-            let h3 = det_hash(i * 37 + 214);
-            let flutter = (t * (1.2 + h3) + h0 * std::f64::consts::TAU).sin() * (p_scale * 1.4);
-            let east = (h0 - 0.5) * 2.0 * vol_r + flutter;
-            let north = (h1 - 0.5) * 2.0 * vol_r + flutter * 0.6;
-            let up = ((h2 * vol_h) - (weather.snow_speed_mps as f64 * t)).rem_euclid(vol_h) + 8.0;
-            batch_instance_into_local_enu(
-                &frame,
-                mesh,
-                [east, north, up],
-                [p_scale, p_scale, p_scale],
-                t * (0.8 + h3) + h0 * std::f64::consts::TAU,
-                &mut verts,
-                &mut inds,
-            );
-        }
-        let mut col = weather.snow_color;
-        col[3] *= alpha_fade;
-        out.push(RetainedDynamicMesh {
-            id: 0x9E47_0003,
-            revision,
-            anchor_ecef: anchor,
-            vertices: Arc::new(verts),
-            indices: Arc::new(inds),
-            color: col,
-            unlit: false,
-        });
-    }
-
-    out
 }

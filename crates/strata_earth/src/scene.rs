@@ -332,8 +332,10 @@ pub struct EarthInput {
     pub elevation_enabled: bool,
     /// Toggleable space skybox, Sun/Moon, day/night terminator, satellites, and city lights.
     pub space: SpaceEnvironmentConfig,
-    /// Toggleable 3D global cloud map and 2.5D-only 3D CC0 clouds, rain, and snow models.
+    /// Toggleable global and local 2.5D cloud-shell map configuration.
     pub weather: crate::gltf::WeatherConfig,
+    /// Physically accurate, GPU-instanced 2D camera-local precipitation configuration.
+    pub precipitation: crate::precipitation::PrecipitationConfig,
     /// Optional animated wavy ocean renders on non-land water surfaces.
     pub ocean_waves: OceanWavesConfig,
 }
@@ -451,6 +453,7 @@ impl Default for EarthInput {
             elevation_enabled: true,
             space: SpaceEnvironmentConfig::default(),
             weather: crate::gltf::WeatherConfig::default(),
+            precipitation: crate::precipitation::PrecipitationConfig::default(),
             ocean_waves: OceanWavesConfig::default(),
         }
     }
