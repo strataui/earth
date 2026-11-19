@@ -192,7 +192,7 @@ impl EarthViewState {
         self.notify_ui_changed();
     }
 
-    /// Jumps camera target smoothly to a geographic location & framing.
+    /// Jumps camera target immediately to a geographic location & framing.
     pub fn jump_to(
         &mut self,
         lat_deg: f64,
@@ -204,6 +204,17 @@ impl EarthViewState {
         self.orbit
             .jump_to(lat_deg, lon_deg, range_m, heading_deg, tilt_deg);
         self.sync_camera();
+        self.notify_ui_changed();
+    }
+
+    /// Initiates a smooth three-stage global transit: pulls all the way back to a whole-world
+    /// overview, orbits/pans to `(lat_deg, lon_deg)`, and zooms in to `altitude_m` (defaulting to
+    /// [`crate::controller::DEFAULT_FLY_TO_ALTITUDE_M`] = `75 m`, or the equivalent 2D zoom value
+    /// in 2D map mode).
+    pub fn fly_to(&mut self, lat_deg: f64, lon_deg: f64, altitude_m: Option<f64>) {
+        self.orbit
+            .set_is_2d_hint(self.viewport.view_mode() == EarthViewMode::Mode2D);
+        self.orbit.fly_to(lat_deg, lon_deg, altitude_m);
         self.notify_ui_changed();
     }
 
@@ -511,6 +522,13 @@ impl EarthView {
     /// Borrows inner state mutably.
     pub fn with_state_mut<R>(&self, f: impl FnOnce(&mut EarthViewState) -> R) -> R {
         f(&mut self.state.borrow_mut())
+    }
+
+    /// Smoothly transits to any `(lat_deg, lon_deg)` point on Earth via a three-stage global
+    /// pull-back, orbital/2D slew, and descent to `altitude_m` (defaulting to `75 m` when `None`,
+    /// or the equivalent 2D zoom value in 2D map mode).
+    pub fn fly_to(&self, lat_deg: f64, lon_deg: f64, altitude_m: Option<f64>) {
+        self.state.borrow_mut().fly_to(lat_deg, lon_deg, altitude_m);
     }
 
     /// Advances smooth damping, transitions, weather, ocean waves, and label updates by `dt_s` seconds.

@@ -87,8 +87,55 @@ use std::time::{Duration, Instant};
 
 /// Continuous exponential zoom rate (natural-log range units per second) when holding zoom keys.
 pub const KEY_ZOOM_LN_PER_SEC: f64 = 1.95;
+/// Default destination altitude above surface (`75 m`, within `50..=100 m`) when `altitude_m` is `None`.
+pub const DEFAULT_FLY_TO_ALTITUDE_M: f64 = 75.0;
+/// Full-world overview range (`18,500 km`) reached during the 3D pull-back phase of [`EarthOrbitController::fly_to`].
+pub const GLOBAL_OVERVIEW_RANGE_M: f64 = 18_500_000.0;
 
 const DRAG_VELOCITY_WINDOW: Duration = Duration::from_millis(90);
+
+#[inline]
+fn smootherstep01(u: f64) -> f64 {
+    let t = u.clamp(0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+#[inline]
+fn shortest_angle_delta_deg(from_deg: f64, to_deg: f64) -> f64 {
+    ((to_deg - from_deg) + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// Converts a camera altitude in metres into a continuous 2D Web Mercator zoom value (`0.0..=22.0`).
+#[inline]
+pub fn zoom_2d_for_altitude(altitude_m: f64) -> f64 {
+    let world_span_m = 2.0 * std::f64::consts::PI * wgs84::A;
+    let tan_half_fov = (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
+    let visible_m = 2.0 * altitude_m.max(1.0) * tan_half_fov;
+    let ratio = (world_span_m / visible_m.max(1e-6)).max(1e-6);
+    (ratio.log2() + 1.0).clamp(0.0, 22.0)
+}
+
+/// Converts a continuous 2D Web Mercator zoom value (`0.0..=22.0`) into the corresponding camera altitude in metres.
+#[inline]
+pub fn altitude_for_zoom_2d(zoom: f64) -> f64 {
+    let world_span_m = 2.0 * std::f64::consts::PI * wgs84::A;
+    let tan_half_fov = (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
+    let z = zoom.clamp(0.0, 22.0);
+    let visible_m = world_span_m / 2.0f64.powf(z - 1.0);
+    (visible_m / (2.0 * tan_half_fov)).clamp(MIN_RANGE_M, MAX_RANGE_M)
+}
+
+/// Initiates a smooth three-stage global transit on `controller`: pulls back to a whole-world
+/// overview, orbits/pans to `(lat_deg, lon_deg)`, and zooms in to `altitude_m` (defaulting to
+/// [`DEFAULT_FLY_TO_ALTITUDE_M`] = `75 m`, converted to 2D zoom in 2D map mode).
+pub fn fly_to(
+    controller: &mut EarthOrbitController,
+    lat_deg: f64,
+    lon_deg: f64,
+    altitude_m: Option<f64>,
+) {
+    controller.fly_to(lat_deg, lon_deg, altitude_m);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragAction {
@@ -101,6 +148,31 @@ struct DragVelSample {
     t: Instant,
     dx: f64,
     dy: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrbitalTransit {
+    start_lat_deg: f64,
+    start_lon_deg: f64,
+    target_lat_deg: f64,
+    target_lon_deg: f64,
+    start_dir: [f64; 3],
+    target_dir: [f64; 3],
+    central_angle_rad: f64,
+    antipodal_axis: [f64; 3],
+    start_range_m: f64,
+    apex_range_m: f64,
+    end_range_3d_m: f64,
+    end_zoom_2d: f64,
+    start_heading_deg: f64,
+    start_tilt_deg: f64,
+    ascent_s: f64,
+    slew_start_s: f64,
+    slew_s: f64,
+    descent_start_s: f64,
+    descent_s: f64,
+    total_s: f64,
+    elapsed_s: f64,
 }
 
 /// Interactive camera controller supporting 3D globe arcball, 2.5D close terrain orbit,
@@ -130,6 +202,7 @@ pub struct EarthOrbitController {
     drag_start_instant: Option<Instant>,
     carry_pan_vel: (f64, f64),
     carry_orbit_vel: (f64, f64),
+    active_transit: Option<OrbitalTransit>,
     zoom_in_held: bool,
     zoom_out_held: bool,
     zoom_fast_modifier: bool,
@@ -164,6 +237,7 @@ impl Default for EarthOrbitController {
             drag_start_instant: None,
             carry_pan_vel: (0.0, 0.0),
             carry_orbit_vel: (0.0, 0.0),
+            active_transit: None,
             zoom_in_held: false,
             zoom_out_held: false,
             zoom_fast_modifier: false,
@@ -202,11 +276,24 @@ impl EarthOrbitController {
         self.drag_action.is_some()
     }
 
+    /// Returns `true` while a three-stage [`Self::fly_to`] global transit animation is in progress.
+    #[inline]
+    pub fn is_flying(&self) -> bool {
+        self.active_transit.is_some()
+    }
+
+    /// Cancels any active [`Self::fly_to`] transit animation at the current camera pose.
+    #[inline]
+    pub fn cancel_fly_to(&mut self) {
+        self.active_transit = None;
+    }
+
     /// Sets whether the continuous zoom-in key (e.g. `K`) is currently held down.
     #[inline]
     pub fn set_zoom_in_held(&mut self, held: bool) {
         self.zoom_in_held = held;
         if held {
+            self.active_transit = None;
             self.zoom_cursor_px = None;
         }
     }
@@ -216,6 +303,7 @@ impl EarthOrbitController {
     pub fn set_zoom_out_held(&mut self, held: bool) {
         self.zoom_out_held = held;
         if held {
+            self.active_transit = None;
             self.zoom_cursor_px = None;
         }
     }
@@ -283,8 +371,96 @@ impl EarthOrbitController {
         self.drag_start_instant = None;
         self.carry_pan_vel = (0.0, 0.0);
         self.carry_orbit_vel = (0.0, 0.0);
+        self.active_transit = None;
         self.zoom_cursor_px = None;
         self.sync_dirs_from_geo();
+    }
+
+    /// Smoothly transits to any `(lat_deg, lon_deg)` point on Earth via a three-stage global
+    /// trajectory:
+    /// 1. Pulls all the way back to [`GLOBAL_OVERVIEW_RANGE_M`] (`16,500 km`) so the whole world is visible.
+    /// 2. Orbits/pans across the globe along the shortest path to `(lat_deg, lon_deg)`.
+    /// 3. Zooms smoothly down to `altitude_m` (defaulting to [`DEFAULT_FLY_TO_ALTITUDE_M`] = `75 m`
+    ///    when `None`; in 2D map mode, `altitude_m` is converted to the equivalent 2D zoom level
+    ///    via [`zoom_2d_for_altitude`]).
+    pub fn fly_to(&mut self, lat_deg: f64, lon_deg: f64, altitude_m: Option<f64>) {
+        let target_lat = lat_deg.clamp(-89.95, 89.95);
+        let target_lon = (lon_deg + 180.0).rem_euclid(360.0) - 180.0;
+        let requested_alt = altitude_m.unwrap_or(DEFAULT_FLY_TO_ALTITUDE_M);
+        let end_range_3d_m = requested_alt.clamp(MIN_RANGE_M, MAX_RANGE_M);
+        let end_zoom_2d = zoom_2d_for_altitude(requested_alt);
+
+        let start_lat = self.lat_deg.clamp(-89.95, 89.95);
+        let start_lon = (self.lon_deg + 180.0).rem_euclid(360.0) - 180.0;
+        let start_dir = lat_lon_to_unit_dir(start_lat, start_lon);
+        let target_dir = lat_lon_to_unit_dir(target_lat, target_lon);
+
+        let u0 = DVec3::new(start_dir[0], start_dir[1], start_dir[2]);
+        let u1 = DVec3::new(target_dir[0], target_dir[1], target_dir[2]);
+        let dot = u0.dot(u1).clamp(-1.0, 1.0);
+        let central_angle_rad = dot.acos();
+
+        let z_axis = DVec3::new(0.0, 0.0, 1.0);
+        let mut anti = z_axis.cross(u0);
+        if anti.length() < 1e-4 {
+            anti = DVec3::new(1.0, 0.0, 0.0).cross(u0);
+        }
+        let anti = anti.normalize();
+
+        let start_range_m = self.range_m.clamp(MIN_RANGE_M, MAX_RANGE_M);
+        let apex_range_m = GLOBAL_OVERVIEW_RANGE_M
+            .max(start_range_m)
+            .max(end_range_3d_m)
+            .min(MAX_RANGE_M);
+
+        let climb_ln = (apex_range_m / start_range_m.max(MIN_RANGE_M)).max(1.0).ln();
+        let ascent_s = (0.38 + climb_ln * 0.085).clamp(0.40, 1.45);
+
+        let angular_deg = central_angle_rad.to_degrees();
+        let slew_s = (0.35 + (angular_deg / 180.0) * 0.95).clamp(0.35, 1.30);
+
+        let drop_ln = (apex_range_m / end_range_3d_m.max(MIN_RANGE_M)).max(1.0).ln();
+        let descent_s = (0.38 + drop_ln * 0.095).clamp(0.40, 1.55);
+
+        let slew_start_s = ascent_s * 0.85;
+        let slew_end_s = slew_start_s + slew_s;
+        let descent_start_s = (slew_end_s - slew_s * 0.15).max(ascent_s);
+        let total_s = descent_start_s + descent_s;
+
+        self.drag_action = None;
+        self.drag_samples.clear();
+        self.drag_start_instant = None;
+        self.spin_vel_rad_s = 0.0;
+        self.pan_vel_gc_deg_s = (0.0, 0.0);
+        self.orbit_vel_deg_s = (0.0, 0.0);
+        self.carry_pan_vel = (0.0, 0.0);
+        self.carry_orbit_vel = (0.0, 0.0);
+        self.zoom_cursor_px = None;
+        self.ground_needs_snap = true;
+
+        self.active_transit = Some(OrbitalTransit {
+            start_lat_deg: start_lat,
+            start_lon_deg: start_lon,
+            target_lat_deg: target_lat,
+            target_lon_deg: target_lon,
+            start_dir,
+            target_dir,
+            central_angle_rad,
+            antipodal_axis: [anti.x, anti.y, anti.z],
+            start_range_m,
+            apex_range_m,
+            end_range_3d_m,
+            end_zoom_2d,
+            start_heading_deg: self.heading_deg,
+            start_tilt_deg: self.tilt_deg,
+            ascent_s,
+            slew_start_s,
+            slew_s,
+            descent_start_s,
+            descent_s,
+            total_s,
+            elapsed_s: 0.0,
+        });
     }
 
     /// Computes active ground focus weight (`0.0` at globe altitudes / 2D, `1.0` near terrain).
@@ -450,20 +626,26 @@ impl EarthOrbitController {
         adjusted
     }
 
+    /// Returns the continuous 2D Web Mercator zoom value (`0.0..=22.0`) corresponding to `self.range_m`.
+    #[inline]
+    pub fn zoom_2d(&self) -> f64 {
+        zoom_2d_for_altitude(self.range_m)
+    }
+
     /// Approximates active Web Mercator / slippy tile zoom level (`0..=19`) in 2D mode.
     pub fn level_for_2d(&self) -> u8 {
-        let world_span_m = 2.0 * std::f64::consts::PI * wgs84::A;
-        let visible_m = 2.0 * self.range_m * (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
-        let ratio = (world_span_m / visible_m.max(1.0)).max(1.0);
-        (ratio.log2() + 1.0).round().clamp(0.0, 19.0) as u8
+        self.zoom_2d().round().clamp(0.0, 19.0) as u8
     }
 
     /// Resets camera pitch (`tilt_deg`) back to `0.0` (nadir), returning `true` if pitch changed.
     pub fn reset_pitch(&mut self) -> bool {
-        let changed = self.tilt_deg.abs() > 1e-6 || self.orbit_vel_deg_s.1.abs() > 1e-6;
+        let changed = self.tilt_deg.abs() > 1e-6
+            || self.orbit_vel_deg_s.1.abs() > 1e-6
+            || self.active_transit.is_some();
         self.tilt_deg = 0.0;
         self.orbit_vel_deg_s = (0.0, 0.0);
         self.carry_orbit_vel = (0.0, 0.0);
+        self.active_transit = None;
         self.drag_samples.clear();
         self.drag_start_instant = None;
         self.drag_action = None;
@@ -561,6 +743,7 @@ impl EarthOrbitController {
 
     fn handle_mouse_down_at(&mut self, button: u32, x: f64, y: f64, now: Instant) -> bool {
         self.last_pointer = Some((x, y));
+        self.active_transit = None;
         self.carry_pan_vel = self.pan_vel_gc_deg_s;
         self.carry_orbit_vel = self.orbit_vel_deg_s;
         self.drag_samples.clear();
@@ -786,13 +969,114 @@ impl EarthOrbitController {
         if delta_y.abs() < 1e-6 {
             return;
         }
+        self.active_transit = None;
         let steps = (delta_y / 110.0).clamp(-3.5, 3.5);
         let factor = (steps * 0.18).exp();
         self.target_range_m = (self.target_range_m * factor).clamp(MIN_RANGE_M, MAX_RANGE_M);
         self.zoom_cursor_px = Some((x, y));
     }
 
-    /// Advances smooth zoom easing, continuous held-key zoom, inertia momentum, and ground-elevation collision clamping.
+    fn step_orbital_transit(&mut self, dt: f64, is_2d: bool) -> bool {
+        let Some(mut tr) = self.active_transit else {
+            return false;
+        };
+        tr.elapsed_s = (tr.elapsed_s + dt).min(tr.total_s);
+        let t = tr.elapsed_s;
+
+        let end_range_m = if is_2d {
+            altitude_for_zoom_2d(tr.end_zoom_2d)
+        } else {
+            tr.end_range_3d_m
+        };
+        let apex_range_m = if is_2d {
+            MAX_RANGE_M
+        } else {
+            tr.apex_range_m.max(end_range_m)
+        };
+
+        // Stage 1 (pull back to whole-world view) & Stage 3 (zoom in to destination altitude)
+        if t <= tr.ascent_s {
+            let u1 = smootherstep01(t / tr.ascent_s.max(1e-6));
+            let ln_r = tr.start_range_m.ln() + (apex_range_m.ln() - tr.start_range_m.ln()) * u1;
+            self.range_m = ln_r.exp().clamp(MIN_RANGE_M, MAX_RANGE_M);
+            self.tilt_deg = if is_2d {
+                0.0
+            } else {
+                tr.start_tilt_deg * (1.0 - u1)
+            };
+            let dh = shortest_angle_delta_deg(tr.start_heading_deg, 0.0);
+            self.heading_deg = if is_2d {
+                0.0
+            } else {
+                normalize_deg(tr.start_heading_deg + dh * u1)
+            };
+        } else if t < tr.descent_start_s {
+            self.range_m = apex_range_m;
+            self.tilt_deg = 0.0;
+            self.heading_deg = 0.0;
+        } else {
+            let u3 = smootherstep01((t - tr.descent_start_s) / tr.descent_s.max(1e-6));
+            let ln_r = apex_range_m.ln() + (end_range_m.ln() - apex_range_m.ln()) * u3;
+            self.range_m = ln_r.exp().clamp(MIN_RANGE_M, MAX_RANGE_M);
+            self.tilt_deg = 0.0;
+            self.heading_deg = 0.0;
+        }
+        self.target_range_m = self.range_m;
+
+        // Stage 2 (global orbit / pan from origin to destination)
+        let w = smootherstep01((t - tr.slew_start_s) / tr.slew_s.max(1e-6));
+        if is_2d {
+            let s_lat = tr.start_lat_deg.clamp(-85.05112878, 85.05112878);
+            let e_lat = tr.target_lat_deg.clamp(-85.05112878, 85.05112878);
+            let d_lon = shortest_angle_delta_deg(tr.start_lon_deg, tr.target_lon_deg);
+            self.lat_deg = (s_lat + (e_lat - s_lat) * w).clamp(-85.05112878, 85.05112878);
+            self.lon_deg = ((tr.start_lon_deg + d_lon * w) + 180.0).rem_euclid(360.0) - 180.0;
+        } else {
+            let theta = tr.central_angle_rad;
+            let dir = if theta < 1e-6 {
+                tr.target_dir
+            } else if theta > std::f64::consts::PI - 1e-4 {
+                let u0 = DVec3::new(tr.start_dir[0], tr.start_dir[1], tr.start_dir[2]);
+                let axis = DVec3::new(
+                    tr.antipodal_axis[0],
+                    tr.antipodal_axis[1],
+                    tr.antipodal_axis[2],
+                );
+                let v = rotate_vec_axis_angle(u0, axis, w * theta).normalize();
+                [v.x, v.y, v.z]
+            } else {
+                let sin_theta = theta.sin();
+                let a = ((1.0 - w) * theta).sin() / sin_theta;
+                let b = (w * theta).sin() / sin_theta;
+                normalize3([
+                    a * tr.start_dir[0] + b * tr.target_dir[0],
+                    a * tr.start_dir[1] + b * tr.target_dir[1],
+                    a * tr.start_dir[2] + b * tr.target_dir[2],
+                ])
+            };
+            let (lat, lon) = unit_dir_to_lat_lon(dir);
+            self.lat_deg = lat;
+            self.lon_deg = lon;
+        }
+
+        if tr.elapsed_s >= tr.total_s - 1e-9 {
+            let lat_lim = if is_2d { 85.05112878 } else { 89.95 };
+            self.lat_deg = tr.target_lat_deg.clamp(-lat_lim, lat_lim);
+            self.lon_deg = tr.target_lon_deg;
+            self.range_m = end_range_m;
+            self.target_range_m = end_range_m;
+            self.tilt_deg = 0.0;
+            self.heading_deg = 0.0;
+            self.active_transit = None;
+        } else {
+            self.active_transit = Some(tr);
+        }
+        self.sync_dirs_from_geo();
+        true
+    }
+
+    /// Advances smooth zoom easing, continuous held-key zoom, global [`Self::fly_to`] transits,
+    /// inertia momentum, and ground-elevation collision clamping.
     ///
     /// Returns `true` if any camera state changed during this step.
     pub fn step_damping(
@@ -811,6 +1095,7 @@ impl EarthOrbitController {
         // 0. Continuous held-key zoom (`zoom_in_held` -> closer, `zoom_out_held` -> farther)
         let key_zoom_dir = (self.zoom_out_held as i32 - self.zoom_in_held as i32) as f64;
         if key_zoom_dir != 0.0 {
+            self.active_transit = None;
             let rate = if self.zoom_fast_modifier {
                 KEY_ZOOM_LN_PER_SEC * 1.6
             } else {
@@ -819,6 +1104,11 @@ impl EarthOrbitController {
             let factor = (key_zoom_dir * rate * dt).exp();
             self.target_range_m = (self.target_range_m * factor).clamp(MIN_RANGE_M, MAX_RANGE_M);
             self.zoom_cursor_px = None;
+        }
+
+        let transit_active = self.step_orbital_transit(dt, is_2d);
+        if transit_active {
+            changed = true;
         }
 
         // 1. Update smoothed terrain height under focus point
@@ -1294,5 +1584,102 @@ mod tests {
             "holding pointer still before mouseup must release cleanly with zero drift"
         );
     }
+
+    #[test]
+    fn fly_to_default_altitude_pulls_back_to_whole_world_orbits_and_zooms_to_75m() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        // Start zoomed close to San Francisco with tilt and heading.
+        ctrl.jump_to(37.7749, -122.4194, 420.0, 35.0, 52.0);
+
+        // Transit across the Pacific Date Line to Tokyo with `altitude_m = None` (defaults to 75m).
+        fly_to(&mut ctrl, 35.6762, 139.6503, None);
+        assert!(ctrl.is_flying());
+
+        let mut peak_range_m = ctrl.range_m;
+        let mut steps = 0usize;
+        while ctrl.is_flying() && steps < 1000 {
+            assert!(ctrl.step_damping(1.0 / 120.0, false, |_, _| 0.0));
+            peak_range_m = peak_range_m.max(ctrl.range_m);
+            steps += 1;
+        }
+        assert!(
+            !ctrl.is_flying(),
+            "fly_to should complete within reasonable duration (steps={steps})"
+        );
+        assert!(
+            peak_range_m >= GLOBAL_OVERVIEW_RANGE_M * 0.99,
+            "fly_to must pull all the way back to see the whole world ({}), peak was {}",
+            GLOBAL_OVERVIEW_RANGE_M,
+            peak_range_m
+        );
+        assert!(
+            (ctrl.lat_deg - 35.6762).abs() < 1e-4 && (ctrl.lon_deg - 139.6503).abs() < 1e-4,
+            "expected final destination at Tokyo, got ({}, {})",
+            ctrl.lat_deg,
+            ctrl.lon_deg
+        );
+        assert!(
+            (ctrl.range_m - DEFAULT_FLY_TO_ALTITUDE_M).abs() < 1e-4
+                && (50.0..=100.0).contains(&ctrl.range_m),
+            "omitting altitude must land at 50-100m default ({}), got {}",
+            DEFAULT_FLY_TO_ALTITUDE_M,
+            ctrl.range_m
+        );
+    }
+
+    #[test]
+    fn fly_to_in_2d_mode_converts_altitude_to_zoom_and_roundtrips() {
+        for alt in [75.0, 500.0, 4_000.0, 120_000.0, 5_000_000.0, 16_500_000.0] {
+            let z = zoom_2d_for_altitude(alt);
+            let roundtrip = altitude_for_zoom_2d(z);
+            assert!(
+                ((roundtrip - alt) / alt).abs() < 1e-6,
+                "2D zoom conversion must invert altitude accurately: alt={alt}, z={z}, rt={roundtrip}"
+            );
+        }
+
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        ctrl.set_is_2d_hint(true);
+        ctrl.jump_to(51.5074, -0.1278, 2_000.0, 0.0, 0.0);
+
+        let custom_alt_m = 1_200.0;
+        let expected_zoom = zoom_2d_for_altitude(custom_alt_m);
+        ctrl.fly_to(-33.8688, 151.2093, Some(custom_alt_m));
+
+        let mut min_zoom_during_pullback = ctrl.zoom_2d();
+        while ctrl.is_flying() {
+            ctrl.step_damping(1.0 / 120.0, true, |_, _| 0.0);
+            min_zoom_during_pullback = min_zoom_during_pullback.min(ctrl.zoom_2d());
+        }
+        assert!(
+            min_zoom_during_pullback < 2.0,
+            "2D fly_to must pull out to whole-world zoom (<2.0), got min zoom {min_zoom_during_pullback}"
+        );
+        assert!(
+            (ctrl.zoom_2d() - expected_zoom).abs() < 1e-4,
+            "2D fly_to must land at exact converted zoom {expected_zoom}, got {}",
+            ctrl.zoom_2d()
+        );
+        assert!((ctrl.lat_deg - (-33.8688)).abs() < 1e-4);
+        assert!((ctrl.lon_deg - 151.2093).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fly_to_antipodal_and_manual_interrupt_work_cleanly() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.jump_to(0.0, 0.0, 1_000.0, 0.0, 0.0);
+        ctrl.fly_to(0.0, 180.0, Some(90.0));
+        for _ in 0..90 {
+            ctrl.step_damping(1.0 / 60.0, false, |_, _| 0.0);
+            assert!(ctrl.lat_deg.is_finite() && ctrl.lon_deg.is_finite() && ctrl.range_m.is_finite());
+        }
+        assert!(ctrl.is_flying());
+        // Manual mouse press cancels fly_to immediately so user retains instant control.
+        ctrl.handle_mouse_down(0, 720.0, 450.0);
+        assert!(!ctrl.is_flying());
+    }
 }
+
 
