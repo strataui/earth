@@ -317,10 +317,10 @@ name = "earth_preview"
 version = "0.1.0"
 dependencies = [
  "strata-earth",
+ "strata-layout",
+ "strata-render",
  "strata-ui",
  "strata-ui-platform",
- "strata_layout",
- "strata_render",
 ]
 
 [[package]]
@@ -1630,18 +1630,107 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strata-a11y"
+version = "0.1.0"
+dependencies = [
+ "accesskit",
+ "strata-dom",
+ "strata-layout",
+ "strata-primitives",
+ "uuid",
+]
+
+[[package]]
+name = "strata-device"
+version = "0.1.0"
+dependencies = [
+ "strata-dom",
+ "strata-primitives",
+]
+
+[[package]]
+name = "strata-dom"
+version = "0.1.0"
+dependencies = [
+ "strata-primitives",
+]
+
+[[package]]
 name = "strata-earth"
 version = "0.1.0"
 dependencies = [
  "flate2",
  "image",
  "libc",
+ "strata-layout",
+ "strata-primitives",
+ "strata-render",
+ "strata-style",
  "strata-ui",
- "strata_layout",
- "strata_primitives",
- "strata_render",
- "strata_style",
  "ureq",
+]
+
+[[package]]
+name = "strata-gpu-path"
+version = "0.1.0"
+dependencies = [
+ "strata-primitives",
+]
+
+[[package]]
+name = "strata-js"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "strata-web-api",
+]
+
+[[package]]
+name = "strata-layout"
+version = "0.1.0"
+dependencies = [
+ "strata-primitives",
+ "strata-style",
+]
+
+[[package]]
+name = "strata-macro"
+version = "0.1.0"
+
+[[package]]
+name = "strata-primitives"
+version = "0.1.0"
+
+[[package]]
+name = "strata-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "miniz_oxide 0.8.9",
+ "pollster",
+ "strata-dom",
+ "strata-gpu-path",
+ "strata-js",
+ "strata-layout",
+ "strata-macro",
+ "strata-primitives",
+ "strata-style",
+ "wgpu",
+]
+
+[[package]]
+name = "strata-storage"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "strata-vfs",
+]
+
+[[package]]
+name = "strata-style"
+version = "0.1.0"
+dependencies = [
+ "strata-primitives",
 ]
 
 [[package]]
@@ -1650,25 +1739,25 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "strata-a11y",
+ "strata-device",
+ "strata-dom",
+ "strata-gpu-path",
+ "strata-js",
+ "strata-layout",
+ "strata-macro",
+ "strata-primitives",
+ "strata-render",
+ "strata-storage",
+ "strata-style",
  "strata-ui-platform",
- "strata_a11y",
- "strata_device",
- "strata_dom",
- "strata_gpu_path",
- "strata_js",
- "strata_layout",
- "strata_macro",
- "strata_primitives",
- "strata_render",
- "strata_storage",
- "strata_style",
- "strata_vfs",
- "strata_web_api",
+ "strata-vfs",
+ "strata-web-api",
 ]
 
 [[package]]
 name = "strata-ui-platform"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "cairo-rs",
  "gtk",
@@ -1677,120 +1766,21 @@ dependencies = [
  "pangocairo",
  "pollster",
  "raw-window-handle",
- "strata_layout",
- "strata_primitives",
- "strata_render",
- "strata_style",
+ "strata-layout",
+ "strata-primitives",
+ "strata-render",
+ "strata-style",
  "wgpu",
  "windows-sys",
  "x11",
 ]
 
 [[package]]
-name = "strata_a11y"
-version = "0.1.0"
-dependencies = [
- "accesskit",
- "strata_dom",
- "strata_layout",
- "strata_primitives",
- "uuid",
-]
-
-[[package]]
-name = "strata_device"
-version = "0.1.0"
-dependencies = [
- "strata_dom",
- "strata_primitives",
-]
-
-[[package]]
-name = "strata_dom"
-version = "0.1.1"
-dependencies = [
- "strata_primitives",
-]
-
-[[package]]
-name = "strata_earth_golden"
-version = "0.1.0"
-dependencies = [
- "strata-earth",
- "strata_layout",
- "strata_render",
- "strata_style",
-]
-
-[[package]]
-name = "strata_gpu_path"
-version = "0.1.0"
-dependencies = [
- "strata_primitives",
-]
-
-[[package]]
-name = "strata_js"
-version = "0.1.0"
-dependencies = [
- "regex",
- "strata_web_api",
-]
-
-[[package]]
-name = "strata_layout"
-version = "0.1.0"
-dependencies = [
- "strata_primitives",
- "strata_style",
-]
-
-[[package]]
-name = "strata_macro"
-version = "0.1.1"
-
-[[package]]
-name = "strata_primitives"
+name = "strata-vfs"
 version = "0.1.0"
 
 [[package]]
-name = "strata_render"
-version = "0.1.1"
-dependencies = [
- "bytemuck",
- "miniz_oxide 0.8.9",
- "pollster",
- "strata_dom",
- "strata_gpu_path",
- "strata_js",
- "strata_layout",
- "strata_macro",
- "strata_primitives",
- "strata_style",
- "wgpu",
-]
-
-[[package]]
-name = "strata_storage"
-version = "0.1.0"
-dependencies = [
- "ring",
- "strata_vfs",
-]
-
-[[package]]
-name = "strata_style"
-version = "0.1.1"
-dependencies = [
- "strata_primitives",
-]
-
-[[package]]
-name = "strata_vfs"
-version = "0.1.0"
-
-[[package]]
-name = "strata_web_api"
+name = "strata-web-api"
 version = "0.1.0"
 dependencies = [
  "brotli",
@@ -1802,6 +1792,16 @@ dependencies = [
  "serde",
  "serde_json",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "strata_earth_golden"
+version = "0.1.0"
+dependencies = [
+ "strata-earth",
+ "strata-layout",
+ "strata-render",
+ "strata-style",
 ]
 
 [[package]]
