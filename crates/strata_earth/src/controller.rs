@@ -513,8 +513,8 @@ impl EarthOrbitController {
         if is_2d {
             0.0
         } else {
-            let local_w = (1.0 - smoothstep(40_000.0, LOCAL_TRANSITION_RANGE_M, self.range_m))
-                * smoothstep(8.0, 28.0, self.tilt_deg);
+            let local_w =
+                1.0 - smoothstep(FULL_25D_PITCH_TAPER_START_M, LOCAL_TRANSITION_RANGE_M, self.range_m);
             let mut h = normalize_deg(self.heading_deg);
             if h > 180.0 {
                 h -= 360.0;
@@ -906,8 +906,7 @@ impl EarthOrbitController {
         let local_w = if self.is_2d_hint {
             0.0
         } else {
-            (1.0 - smoothstep(FULL_25D_PITCH_TAPER_START_M, LOCAL_TRANSITION_RANGE_M, self.range_m))
-                * smoothstep(8.0, 28.0, self.tilt_deg)
+            1.0 - smoothstep(FULL_25D_PITCH_TAPER_START_M, LOCAL_TRANSITION_RANGE_M, self.range_m)
         };
         let d_heading = dx * 0.28 * local_w;
         self.heading_deg = normalize_deg(self.heading_deg + d_heading);
@@ -918,12 +917,14 @@ impl EarthOrbitController {
     fn pan_2d(&mut self, dx: f64, dy: f64, now: Instant) {
         let visible_m = 2.0 * self.range_m * (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
         let m_per_px = visible_m / self.viewport_h.max(1.0);
-        let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.15);
-        let d_lon = -(dx * m_per_px) / (wgs84::A * cos_lat).to_radians();
-        let d_lat = (dy * m_per_px) / wgs84::A.to_radians();
+        // Flat 2D map uses uniform equirectangular metres (`cos_scale = 1.0` at all latitudes),
+        // keeping drag tracking 1:1 with the pointer from Equator to Antarctica.
+        let deg_per_px = m_per_px / wgs84::A.to_radians();
+        let d_lon = -dx * deg_per_px;
+        let d_lat = dy * deg_per_px;
         self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
         self.lat_deg = (self.lat_deg + d_lat).clamp(-85.05112878, 85.05112878);
-        self.record_drag_sample_at(now, d_lon * cos_lat, d_lat);
+        self.record_drag_sample_at(now, d_lon, d_lat);
         self.sync_dirs_from_geo();
     }
 
@@ -995,7 +996,7 @@ impl EarthOrbitController {
     fn fallback_tangent_delta_m(&self, dx: f64, dy: f64) -> (f64, f64) {
         let visible_m = 2.0 * self.range_m * (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
         let m_per_px = visible_m / self.viewport_h.max(1.0);
-        let h = self.heading_deg.to_radians();
+        let h = self.effective_heading_deg(false).to_radians();
         // Dragging right (dx > 0) shifts camera left along -right; dragging down (dy > 0) shifts forward.
         let right_step = -dx * m_per_px;
         let fwd_step = dy * m_per_px;
@@ -1188,14 +1189,18 @@ impl EarthOrbitController {
             if self.pan_vel_gc_deg_s.0.abs() > pan_stop || self.pan_vel_gc_deg_s.1.abs() > pan_stop
             {
                 let lat_lim = if is_2d { 85.05112878 } else { 89.95 };
-                let min_cos =
-                    if is_2d || self.range_m <= LOCAL_TRANSITION_RANGE_M || self.tilt_deg >= 4.0 {
-                        0.15
-                    } else {
-                        0.25
-                    };
-                let cos_lat = self.lat_deg.to_radians().cos().abs().max(min_cos);
-                let d_lon = (self.pan_vel_gc_deg_s.0 / cos_lat) * dt;
+                let d_lon = if is_2d {
+                    self.pan_vel_gc_deg_s.0 * dt
+                } else {
+                    let min_cos =
+                        if self.range_m <= LOCAL_TRANSITION_RANGE_M || self.tilt_deg >= 4.0 {
+                            0.15
+                        } else {
+                            0.25
+                        };
+                    let cos_lat = self.lat_deg.to_radians().cos().abs().max(min_cos);
+                    (self.pan_vel_gc_deg_s.0 / cos_lat) * dt
+                };
                 let d_lat = self.pan_vel_gc_deg_s.1 * dt;
                 self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
                 let unclamped_lat = self.lat_deg + d_lat;
@@ -1318,9 +1323,9 @@ impl EarthOrbitController {
             let visible_m = 2.0 * old_range * (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
             let m_per_px = visible_m / self.viewport_h.max(1.0);
             let shift_scale = (1.0 - ratio).clamp(0.0, 0.5);
-            let cos_lat = self.lat_deg.to_radians().cos().abs().max(0.15);
-            let d_lon = (dx * m_per_px * shift_scale) / (wgs84::A * cos_lat).to_radians();
-            let d_lat = (dy * m_per_px * shift_scale) / wgs84::A.to_radians();
+            let deg_per_px = m_per_px / wgs84::A.to_radians();
+            let d_lon = dx * deg_per_px * shift_scale;
+            let d_lat = dy * deg_per_px * shift_scale;
             self.lon_deg = ((self.lon_deg + d_lon) + 180.0).rem_euclid(360.0) - 180.0;
             self.lat_deg = (self.lat_deg + d_lat).clamp(-85.05112878, 85.05112878);
             self.sync_dirs_from_geo();
@@ -1872,6 +1877,70 @@ mod tests {
         assert!(
             (ctrl.lon_deg - lon_at_zoom_start).abs() < 1e-3,
             "focus longitude must not keep drifting sideways once centered zoom begins"
+        );
+    }
+
+    #[test]
+    fn pitch_down_to_nadir_in_25d_keeps_heading_and_allows_horizontal_yaw() {
+        let mut ctrl = EarthOrbitController::new();
+        ctrl.set_viewport_size(1440.0, 900.0);
+        // Start in 2.5D at a non-zero heading (135 deg) and steep oblique pitch (62 deg).
+        ctrl.jump_to(46.5775, 7.9850, 3_200.0, 135.0, 62.0);
+        let (_, up_before) = ctrl.to_camera_and_up(false, 0.0);
+        let up_before = up_before.expect("2.5D camera has explicit heading up vector");
+
+        // Right-mouse-down and drag purely vertically DOWN (dx = 0, dy > 0) all the way to 0 deg nadir
+        // (looking straight down at 90 degrees). Must NOT introduce any unintended yaw!
+        let t0 = Instant::now();
+        ctrl.handle_mouse_down_at(2, 720.0, 200.0, t0);
+        for step in 1..=16 {
+            let y = 200.0 + (step as f64) * 22.0;
+            ctrl.handle_mouse_move_at(720.0, y, t0 + Duration::from_millis(step * 12));
+            let eff_h = ctrl.effective_heading_deg(false);
+            assert!(
+                (eff_h - 135.0).abs() < 1e-6,
+                "pure vertical pitch-down in 2.5D must never induce yaw (step={step}, tilt={}, eff_h={eff_h})",
+                ctrl.tilt_deg
+            );
+        }
+        assert!(
+            ctrl.tilt_deg < 1e-6,
+            "dragging down should reach straight-down 0 deg nadir tilt, got {}",
+            ctrl.tilt_deg
+        );
+        let (_, up_at_nadir) = ctrl.to_camera_and_up(false, 0.0);
+        let up_at_nadir = up_at_nadir.expect("nadir camera keeps heading up vector");
+        let dot_same = up_before[0] * up_at_nadir[0]
+            + up_before[1] * up_at_nadir[1]
+            + up_before[2] * up_at_nadir[2];
+        assert!(
+            dot_same > 0.9999,
+            "camera heading up vector must remain completely unchanged when pitching straight down, dot={dot_same}"
+        );
+
+        // Now, while STILL at 0 deg nadir (looking straight down 90 deg), dragging left/right must smoothly yaw!
+        let h_before_yaw = ctrl.heading_deg;
+        ctrl.handle_mouse_move_at(840.0, 552.0, t0 + Duration::from_millis(220));
+        ctrl.handle_mouse_up_at(2, t0 + Duration::from_millis(240));
+        assert!(
+            (ctrl.heading_deg - h_before_yaw).abs() > 20.0,
+            "right-dragging left/right at 0 deg nadir must smoothly yaw heading (before={h_before_yaw}, after={})",
+            ctrl.heading_deg
+        );
+        let eff_after = ctrl.effective_heading_deg(false);
+        assert!(
+            (eff_after - ctrl.heading_deg).abs() < 1e-6,
+            "effective heading at 0 deg nadir in 2.5D must match heading_deg ({eff_after} vs {})",
+            ctrl.heading_deg
+        );
+        let (_, up_after_yaw) = ctrl.to_camera_and_up(false, 0.0);
+        let up_after_yaw = up_after_yaw.expect("yawed nadir camera has heading up vector");
+        let dot_turned = up_at_nadir[0] * up_after_yaw[0]
+            + up_at_nadir[1] * up_after_yaw[1]
+            + up_at_nadir[2] * up_after_yaw[2];
+        assert!(
+            dot_turned < 0.92,
+            "resolved nadir camera up vector must rotate cleanly when dragging left/right, dot={dot_turned}"
         );
     }
 }

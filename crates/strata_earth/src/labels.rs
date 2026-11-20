@@ -2176,6 +2176,7 @@ pub struct EarthScreenProjector {
     vp: [[f32; 4]; 4],
     focus_lat: f64,
     focus_lon: f64,
+    cam_lon: f64,
     focus_frame: LocalFrame,
     focus_ecef: DVec3,
     cos_scale: f64,
@@ -2196,21 +2197,13 @@ impl EarthScreenProjector {
         let map_2d = ll.map_2d_morph as f64;
         let cam_u = crate::worker::RetainedTerrainBuilder::camera_from_input(input);
         let eye = DVec3::new(cam_u.eye_ecef[0], cam_u.eye_ecef[1], cam_u.eye_ecef[2]);
-        let focus_surface = if flat_t >= 0.99 && map_2d <= 1e-4 {
-            Geodetic::new(
-                (cam.focus.lat_deg * 50.0).round() / 50.0,
-                (cam.focus.lon_deg * 50.0).round() / 50.0,
-                0.0,
-            )
-        } else if flat_t > 1e-6 {
-            Geodetic::new(
-                (cam.focus.lat_deg * 200.0).round() / 200.0,
-                (cam.focus.lon_deg * 200.0).round() / 200.0,
-                0.0,
-            )
-        } else {
-            Geodetic::new(cam.focus.lat_deg, cam.focus.lon_deg, 0.0)
-        };
+        let morph = crate::geodesy::stabilized_surface_morph(
+            cam.focus,
+            flat_t,
+            map_2d,
+            input.tile_projection,
+        );
+        let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
         let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
         let focus_ecef = geodetic_to_ecef(focus_surface);
         let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
@@ -2220,6 +2213,7 @@ impl EarthScreenProjector {
             vp: cam_u.view_proj_rte,
             focus_lat: focus_surface.lat_deg,
             focus_lon: focus_surface.lon_deg,
+            cam_lon: crate::geodesy::wrap_longitude(cam.focus.lon_deg),
             focus_frame,
             focus_ecef,
             cos_scale,
@@ -2241,7 +2235,15 @@ impl EarthScreenProjector {
         let p_world = if self.flat_t <= 1e-6 {
             p_curved
         } else {
-            let dlon_deg = ((lon_deg - self.focus_lon + 180.0).rem_euclid(360.0)) - 180.0;
+            let dlon_deg = if crate::geodesy::is_canonical_2d_morph(self.map_2d)
+                && self.flat_t >= crate::geodesy::CANONICAL_2D_MORPH_THRESHOLD
+            {
+                let nearest_lon =
+                    self.cam_lon + crate::geodesy::wrap_longitude(lon_deg - self.cam_lon);
+                nearest_lon - self.focus_lon
+            } else {
+                ((lon_deg - self.focus_lon + 180.0).rem_euclid(360.0)) - 180.0
+            };
             let dlat_deg = lat_deg - self.focus_lat;
             let east_m = dlon_deg.to_radians() * EARTH_RADIUS_M * self.cos_scale;
             let north_m = dlat_deg.to_radians() * EARTH_RADIUS_M;

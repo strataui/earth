@@ -685,9 +685,52 @@ struct CachedSoundingEntry {
     sounding: OpenMeteoSounding,
 }
 
+const OPEN_METEO_TEMP_MAX_IN_FLIGHT: usize = 4;
+const OPEN_METEO_TEMP_BASE_BACKOFF_SECS: u64 = 30;
+const OPEN_METEO_TEMP_MAX_BACKOFF_SECS: u64 = 300;
+
 struct OpenMeteoCache {
     entries: HashMap<(i32, i32), CachedSoundingEntry>,
     in_flight: HashSet<(i32, i32)>,
+    failed_until: HashMap<(i32, i32), (Instant, u32)>,
+    global_backoff_until: Option<Instant>,
+    consecutive_failures: u32,
+}
+
+impl OpenMeteoCache {
+    fn record_failure(&mut self, key: (i32, i32), base_backoff: Duration) {
+        self.in_flight.remove(&key);
+        let cell_fails = self
+            .failed_until
+            .get(&key)
+            .map(|(_, c)| c.saturating_add(1))
+            .unwrap_or(1);
+        let shift = (cell_fails - 1).min(4);
+        let secs = (base_backoff.as_secs().max(1) << shift).min(OPEN_METEO_TEMP_MAX_BACKOFF_SECS);
+        let backoff = Duration::from_secs(secs).max(base_backoff);
+        self.failed_until
+            .insert(key, (Instant::now() + backoff, cell_fails));
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let g_shift = (self.consecutive_failures - 1).min(4);
+        let g_secs =
+            (base_backoff.as_secs().max(1) << g_shift).min(OPEN_METEO_TEMP_MAX_BACKOFF_SECS);
+        let g_backoff = Duration::from_secs(g_secs).max(base_backoff);
+        self.global_backoff_until = Some(Instant::now() + g_backoff);
+    }
+
+    fn record_success(&mut self, key: (i32, i32), sounding: OpenMeteoSounding) {
+        self.in_flight.remove(&key);
+        self.failed_until.remove(&key);
+        self.global_backoff_until = None;
+        self.consecutive_failures = 0;
+        self.entries.insert(
+            key,
+            CachedSoundingEntry {
+                fetched_at: Instant::now(),
+                sounding,
+            },
+        );
+    }
 }
 
 /// Optional live real-world atmospheric sounding provider backed by Open-Meteo (`api.open-meteo.com`).
@@ -699,6 +742,8 @@ struct OpenMeteoCache {
 pub struct OpenMeteoTemperatureProvider {
     endpoint: String,
     ttl: Duration,
+    base_backoff: Duration,
+    transport: Option<Arc<dyn crate::tiles::HttpTransport>>,
     cache: Arc<Mutex<OpenMeteoCache>>,
 }
 
@@ -715,15 +760,31 @@ impl OpenMeteoTemperatureProvider {
         Self {
             endpoint: Self::DEFAULT_ENDPOINT.to_string(),
             ttl: Duration::from_secs(600),
+            base_backoff: Duration::from_secs(OPEN_METEO_TEMP_BASE_BACKOFF_SECS),
+            transport: None,
             cache: Arc::new(Mutex::new(OpenMeteoCache {
                 entries: HashMap::new(),
                 in_flight: HashSet::new(),
+                failed_until: HashMap::new(),
+                global_backoff_until: None,
+                consecutive_failures: 0,
             })),
         }
     }
 
+    pub fn with_transport(transport: Arc<dyn crate::tiles::HttpTransport>) -> Self {
+        let mut p = Self::new();
+        p.transport = Some(transport);
+        p
+    }
+
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = endpoint.into();
+        self
+    }
+
+    pub fn with_failure_backoff(mut self, backoff: Duration) -> Self {
+        self.base_backoff = backoff.max(Duration::from_millis(50));
         self
     }
 
@@ -738,26 +799,36 @@ impl OpenMeteoTemperatureProvider {
     pub fn insert_cached_sounding(&self, lat_deg: f64, lon_deg: f64, sounding: OpenMeteoSounding) {
         let key = Self::quantize_cell(lat_deg, lon_deg);
         if let Ok(mut guard) = self.cache.lock() {
-            guard.entries.insert(
-                key,
-                CachedSoundingEntry {
-                    fetched_at: Instant::now(),
-                    sounding,
-                },
-            );
-            guard.in_flight.remove(&key);
+            guard.record_success(key, sounding);
         }
     }
 
     fn ensure_cell_fetched(&self, key: (i32, i32)) {
-        if std::env::var_os("STRATA_EARTH_OFFLINE").is_some() {
+        if self.transport.is_none() && std::env::var_os("STRATA_EARTH_OFFLINE").is_some() {
             return;
         }
+        let now = Instant::now();
         let should_spawn = if let Ok(mut guard) = self.cache.lock() {
             if let Some(entry) = guard.entries.get(&key) {
                 if entry.fetched_at.elapsed() < self.ttl {
                     return;
                 }
+            }
+            if guard
+                .global_backoff_until
+                .is_some_and(|until| now < until)
+            {
+                return;
+            }
+            if guard
+                .failed_until
+                .get(&key)
+                .is_some_and(|(until, _)| now < *until)
+            {
+                return;
+            }
+            if guard.in_flight.len() >= OPEN_METEO_TEMP_MAX_IN_FLIGHT {
+                return;
             }
             guard.in_flight.insert(key)
         } else {
@@ -774,33 +845,43 @@ impl OpenMeteoTemperatureProvider {
             self.endpoint, lat, lon
         );
         let cache = Arc::clone(&self.cache);
-        let _ = std::thread::Builder::new()
+        let base_backoff = self.base_backoff;
+        let custom_transport = self.transport.clone();
+        let spawn_res = std::thread::Builder::new()
             .name("strata-earth-meteo".to_string())
             .spawn(move || {
-                let agent = ureq::AgentBuilder::new()
-                    .timeout_connect(Duration::from_secs(5))
-                    .timeout_read(Duration::from_secs(8))
-                    .build();
-                let parsed = agent
-                    .get(&url)
-                    .set("User-Agent", "strata-earth/0.1 (atmospheric-sounding)")
-                    .call()
-                    .ok()
-                    .and_then(|resp| resp.into_string().ok())
-                    .and_then(|body| parse_open_meteo_sounding_json(&body).ok());
+                let parsed = if let Some(transport) = custom_transport {
+                    transport
+                        .fetch(&url)
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .and_then(|body| parse_open_meteo_sounding_json(&body).ok())
+                } else {
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout_connect(Duration::from_secs(5))
+                        .timeout_read(Duration::from_secs(8))
+                        .build();
+                    agent
+                        .get(&url)
+                        .set("User-Agent", "strata-earth/0.1 (atmospheric-sounding)")
+                        .call()
+                        .ok()
+                        .and_then(|resp| resp.into_string().ok())
+                        .and_then(|body| parse_open_meteo_sounding_json(&body).ok())
+                };
                 if let Ok(mut guard) = cache.lock() {
-                    guard.in_flight.remove(&key);
                     if let Some(sounding) = parsed {
-                        guard.entries.insert(
-                            key,
-                            CachedSoundingEntry {
-                                fetched_at: Instant::now(),
-                                sounding,
-                            },
-                        );
+                        guard.record_success(key, sounding);
+                    } else {
+                        guard.record_failure(key, base_backoff);
                     }
                 }
             });
+        if spawn_res.is_err() {
+            if let Ok(mut guard) = self.cache.lock() {
+                guard.record_failure(key, base_backoff);
+            }
+        }
     }
 }
 
@@ -834,6 +915,8 @@ pub enum ParticleSprite {
     Snowflake,
     /// Pure mathematical translucent sleet / ice pellet (zero asset files).
     SleetPellet,
+    /// Pure mathematical multi-streak distant virga rain-shaft / snow-squall curtain veil.
+    Curtain,
     /// Arbitrary user-supplied 2D RGBA8 texture (cached on GPU by `(id, revision)`).
     Texture {
         id: u64,
@@ -857,7 +940,7 @@ pub enum ParticleBillboard {
 /// Generalized configuration for one GPU-instanced camera-local 2D precipitation particle layer.
 ///
 /// Works identically for fast 2D rain streaks, mathematical 2D snowflakes, sleet pellets,
-/// ash, petals, dust, or any custom 2D RGBA8 texture.
+/// distant regional rain/snow curtains, ash, petals, dust, or any custom 2D RGBA8 texture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrecipitationLayer {
     /// Stable unique layer identifier (drives GPU hash seed and toroidal phase tracking).
@@ -884,6 +967,9 @@ pub struct PrecipitationLayer {
     pub spin_rad_s: f32,
     /// Base camera-local toroidal wrap box dimensions `[extent_xy_m, extent_z_m]`.
     pub volume_size_m: [f32; 2],
+    /// Fraction of `volume_size_m[0]` to shift the wrap box forward along the camera's ground-projected
+    /// view direction (`0.0` = centered on eye, `0.28..0.44` = dense forward vista ahead of the lens).
+    pub forward_bias_frac: f32,
     /// Screen-space pixel size clamps `[min_px, max_px]` preserving crispness across altitudes.
     pub screen_px_clamp: [f32; 2],
     /// Multiplicative RGBA tint (`alpha` scales layer opacity).
@@ -908,6 +994,7 @@ impl PrecipitationLayer {
             flutter: [0.0, 0.0],
             spin_rad_s: 0.0,
             volume_size_m: [42.0, 32.0],
+            forward_bias_frac: 0.24,
             screen_px_clamp: [1.8, 62.0],
             color: [0.84, 0.92, 1.0, 0.86],
             seed: 101,
@@ -929,6 +1016,7 @@ impl PrecipitationLayer {
             flutter: [0.70, 1.35],
             spin_rad_s: 1.45,
             volume_size_m: [40.0, 28.0],
+            forward_bias_frac: 0.22,
             screen_px_clamp: [3.8, 16.0],
             color: [0.98, 0.99, 1.0, 0.95],
             seed: 211,
@@ -950,9 +1038,54 @@ impl PrecipitationLayer {
             flutter: [0.18, 2.1],
             spin_rad_s: 0.6,
             volume_size_m: [40.0, 30.0],
+            forward_bias_frac: 0.24,
             screen_px_clamp: [2.5, 11.0],
             color: [0.90, 0.96, 1.0, 0.88],
             seed: 307,
+        }
+    }
+
+    /// Creates a sweeping regional far-field rain-shaft / virga curtain veil (`ParticleSprite::Curtain`).
+    pub fn rain_curtain(intensity: f32) -> Self {
+        Self {
+            id: 0x5052_0201,
+            sprite: ParticleSprite::Curtain,
+            billboard: ParticleBillboard::VelocityAligned,
+            intensity: intensity.clamp(0.0, 2.5),
+            max_particles: 160,
+            fall_speed_mps: 24.0,
+            wind_mps: [3.5, 1.0],
+            particle_size_m: [72.0, 230.0],
+            velocity_stretch: 0.012,
+            flutter: [0.0, 0.0],
+            spin_rad_s: 0.0,
+            volume_size_m: [900.0, 420.0],
+            forward_bias_frac: 0.44,
+            screen_px_clamp: [28.0, 240.0],
+            color: [0.74, 0.82, 0.92, 0.13],
+            seed: 503,
+        }
+    }
+
+    /// Creates a billowing regional far-field snow-squall mist veil (`ParticleSprite::Curtain`).
+    pub fn snow_curtain(intensity: f32) -> Self {
+        Self {
+            id: 0x5052_0202,
+            sprite: ParticleSprite::Curtain,
+            billboard: ParticleBillboard::CameraFacing,
+            intensity: intensity.clamp(0.0, 2.5),
+            max_particles: 150,
+            fall_speed_mps: 2.8,
+            wind_mps: [2.6, 0.8],
+            particle_size_m: [92.0, 92.0],
+            velocity_stretch: 0.0,
+            flutter: [10.0, 0.24],
+            spin_rad_s: 0.0,
+            volume_size_m: [900.0, 420.0],
+            forward_bias_frac: 0.44,
+            screen_px_clamp: [32.0, 220.0],
+            color: [0.92, 0.95, 0.99, 0.14],
+            seed: 607,
         }
     }
 
@@ -983,6 +1116,7 @@ impl PrecipitationLayer {
             flutter: [0.35, 1.1],
             spin_rad_s: 0.8,
             volume_size_m: [42.0, 30.0],
+            forward_bias_frac: 0.22,
             screen_px_clamp: [4.0, 24.0],
             color: [1.0, 1.0, 1.0, 0.90],
             seed: (id as u32).wrapping_mul(31).wrapping_add(17),
@@ -1001,6 +1135,11 @@ impl PrecipitationLayer {
 
     pub fn with_wind(mut self, east_mps: f32, north_mps: f32) -> Self {
         self.wind_mps = [east_mps, north_mps];
+        self
+    }
+
+    pub fn with_forward_bias(mut self, frac: f32) -> Self {
+        self.forward_bias_frac = frac.clamp(0.0, 0.65);
         self
     }
 
@@ -1048,25 +1187,34 @@ pub enum PrecipitationMode {
 /// Declarative precipitation configuration stored on [`crate::scene::EarthInput`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrecipitationConfig {
-    /// Master enable toggle (`false` by default; zero overhead when off).
+    /// Master enable toggle (`false` by default; zero overhead when off unless driven by `base_weather`).
     pub enabled: bool,
     /// Precipitation selection mode (`Physical`, `Rain`, `Snow`, or `CustomLayers`).
     pub mode: PrecipitationMode,
     /// Overall precipitation intensity / amount multiplier (`0.0..=2.0`, default `0.85`).
     pub intensity: f32,
-    /// Default raindrop fall speed in m/s (`26.0 m/s` default for crisp, fast rain streaks).
+    /// Default raindrop fall speed in m/s (`28.0 m/s` default for crisp, fast rain streaks).
     pub rain_speed_mps: f32,
     /// Default snowflake fall speed in m/s (`2.2 m/s` default for gentle drifting flakes).
     pub snow_speed_mps: f32,
-    /// Ambient horizontal wind vector `[east_mps, north_mps]` (overridden by live provider if available).
+    /// Ambient horizontal wind vector `[east_mps, north_mps]` (kept synchronized with [`Self::wind_speed_mps`] / [`Self::wind_angle_deg`]).
     pub wind_mps: [f32; 2],
+    /// Explicit wind speed in m/s (default `3.64 m/s`).
+    pub wind_speed_mps: f32,
+    /// Explicit wind compass direction in degrees (`0°=N, 90°=E, 180°=S, 270°=W`, blowing TO; default `74.0°`).
+    pub wind_angle_deg: f32,
     /// Atmospheric column model (base temperature, MSL/Terrain anchor, lapse rate, humidity, cloud ceiling).
     pub atmosphere: AtmosphereConfig,
     /// When `true` (default), precipitation fades smoothly into and stops completely above the cloud ceiling.
     pub respect_cloud_ceiling: bool,
     /// When `true`, enables the built-in non-blocking [`OpenMeteoTemperatureProvider`] to fetch real
-    /// vertical pressure-level temperatures at the camera's geographic location & altitude.
+    /// vertical pressure-level temperatures and wind at the camera's geographic location & altitude.
     pub use_live_temperature: bool,
+    /// Synchronize temperature column, wind speed/angle, and intensity with [`crate::scene::EarthInput::base_weather`] (`true` default).
+    pub sync_with_base_weather: bool,
+    /// Emit altitude-scaled mid-field particles and regional far-field rain-shaft / snow-squall curtains
+    /// so precipitation visibly spans the full landscape when zoomed out (`true` default).
+    pub far_field_curtains: bool,
 }
 
 impl Default for PrecipitationConfig {
@@ -1078,9 +1226,13 @@ impl Default for PrecipitationConfig {
             rain_speed_mps: 28.0,
             snow_speed_mps: 2.2,
             wind_mps: [3.5, 1.0],
+            wind_speed_mps: 3.64,
+            wind_angle_deg: 74.0,
             atmosphere: AtmosphereConfig::default(),
             respect_cloud_ceiling: true,
             use_live_temperature: false,
+            sync_with_base_weather: true,
+            far_field_curtains: true,
         }
     }
 }
@@ -1115,6 +1267,50 @@ impl PrecipitationConfig {
         self.use_live_temperature = live;
         self
     }
+
+    /// Sets wind velocity by `(speed_mps, angle_deg)` (`0°=N, 90°=E`, direction blowing TO)
+    /// and synchronizes [`Self::wind_mps`].
+    pub fn with_wind_angle(mut self, speed_mps: f32, angle_deg: f32) -> Self {
+        let w = crate::weather_api::WindVector::new(speed_mps, angle_deg);
+        self.wind_speed_mps = w.speed_mps;
+        self.wind_angle_deg = w.angle_deg;
+        self.wind_mps = w.to_enu_mps();
+        self
+    }
+
+    /// Sets wind velocity in local ENU metres per second and synchronizes speed & angle.
+    pub fn with_wind_enu(mut self, east_mps: f32, north_mps: f32) -> Self {
+        self.wind_mps = [east_mps, north_mps];
+        let w = crate::weather_api::WindVector::from_enu_mps([east_mps, north_mps]);
+        self.wind_speed_mps = w.speed_mps;
+        self.wind_angle_deg = w.angle_deg;
+        self
+    }
+
+    pub fn with_sync_with_base_weather(mut self, sync: bool) -> Self {
+        self.sync_with_base_weather = sync;
+        self
+    }
+
+    pub fn with_far_field_curtains(mut self, enabled: bool) -> Self {
+        self.far_field_curtains = enabled;
+        self
+    }
+
+    /// Resolves configured wind velocity in `[east_mps, north_mps]`, honoring both direct
+    /// `(wind_speed_mps, wind_angle_deg)` edits and direct `wind_mps` overrides.
+    pub fn resolved_wind_enu(&self) -> [f32; 2] {
+        let enu_changed =
+            (self.wind_mps[0] - 3.5).abs() > 1e-3 || (self.wind_mps[1] - 1.0).abs() > 1e-3;
+        let polar_default =
+            (self.wind_speed_mps - 3.64).abs() < 0.02 && (self.wind_angle_deg - 74.0).abs() < 0.15;
+        if enu_changed && polar_default {
+            self.wind_mps
+        } else {
+            crate::weather_api::WindVector::new(self.wind_speed_mps, self.wind_angle_deg)
+                .to_enu_mps()
+        }
+    }
 }
 
 /// Complete physical & camera context supplied to a [`PrecipitationEvaluator`] every frame.
@@ -1140,10 +1336,155 @@ pub struct PrecipitationEvalContext<'a> {
 pub type PrecipitationEvaluator =
     Arc<dyn Fn(&PrecipitationEvalContext<'_>) -> Vec<PrecipitationLayer> + Send + Sync>;
 
-/// Default physically accurate precipitation evaluator.
+fn push_rain_shells(
+    out: &mut Vec<PrecipitationLayer>,
+    eff_intensity: f32,
+    phase_weight: f32,
+    env: f32,
+    agl_m: f32,
+    fall_speed: f32,
+    wind: [f32; 2],
+    far_field: bool,
+) {
+    if phase_weight <= 0.015 {
+        return;
+    }
+    let alpha_phase = phase_weight.sqrt();
+    // Shell 0: Near foreground crisp streaks (scaled gently with AGL, thinning smoothly at very high altitude).
+    let near_w = 1.0 - smoothstep_f32(750.0, 2_400.0, agl_m) * 0.58;
+    let near_xy = (42.0 + 0.08 * agl_m).clamp(42.0, 185.0);
+    let near_z = (32.0 + 0.05 * agl_m).clamp(32.0, 125.0);
+    let near_scale = (near_xy / 42.0).sqrt();
+    let mut near = PrecipitationLayer::rain(eff_intensity * phase_weight * near_w)
+        .with_speed(fall_speed)
+        .with_wind(wind[0], wind[1])
+        .with_forward_bias(0.24);
+    near.volume_size_m = [near_xy, near_z];
+    near.particle_size_m = [0.052 * near_scale, 1.08 * near_scale];
+    near.max_particles = ((5_000.0 * (0.85 + 0.22 * near_scale)).min(7_000.0)) as u32;
+    near.color[3] *= (0.45 + 0.55 * env).clamp(0.0, 1.0) * alpha_phase * near_w;
+    out.push(near);
+
+    if !far_field {
+        return;
+    }
+
+    // Shell 1: Mid-field city/valley-scale streaks spanning 140m .. 1,650m ahead of the camera.
+    let mid_in = smoothstep_f32(35.0, 260.0, agl_m);
+    if mid_in > 0.02 {
+        let mid_xy = (145.0 + 0.54 * agl_m).clamp(145.0, 1_650.0);
+        let mid_z = (95.0 + 0.34 * agl_m).clamp(95.0, 920.0);
+        let ms = (mid_xy / 145.0).powf(0.75);
+        let mut mid = PrecipitationLayer::rain(eff_intensity * phase_weight * mid_in)
+            .with_speed(fall_speed * 0.96)
+            .with_wind(wind[0], wind[1])
+            .with_forward_bias(0.36);
+        mid.id = 0x5052_0101;
+        mid.seed = 419;
+        mid.volume_size_m = [mid_xy, mid_z];
+        mid.particle_size_m = [0.18 * ms, 4.2 * ms];
+        mid.velocity_stretch = 0.045;
+        mid.max_particles = 2_400;
+        mid.screen_px_clamp = [1.4, 24.0];
+        mid.color = [0.78, 0.87, 0.97, 0.46 * env * alpha_phase * mid_in];
+        out.push(mid);
+    }
+
+    // Shell 2: Far regional virga rain-shaft curtains spanning 520m .. 5,600m across valleys & peaks.
+    let far_in = smoothstep_f32(140.0, 520.0, agl_m);
+    if far_in > 0.02 {
+        let far_xy = (520.0 + 1.55 * agl_m).clamp(520.0, 5_600.0);
+        let far_z = (300.0 + 0.72 * agl_m).clamp(300.0, 2_400.0);
+        let fs = (far_xy / 900.0).clamp(0.65, 3.6);
+        let mut far = PrecipitationLayer::rain_curtain(eff_intensity * phase_weight * far_in)
+            .with_speed(fall_speed * 0.85)
+            .with_wind(wind[0], wind[1])
+            .with_forward_bias(0.44);
+        far.volume_size_m = [far_xy, far_z];
+        far.particle_size_m = [72.0 * fs, 230.0 * fs];
+        far.color[3] *= (0.40 + 0.60 * env).clamp(0.0, 1.0) * alpha_phase * far_in;
+        out.push(far);
+    }
+}
+
+fn push_snow_shells(
+    out: &mut Vec<PrecipitationLayer>,
+    eff_intensity: f32,
+    phase_weight: f32,
+    env: f32,
+    agl_m: f32,
+    fall_speed: f32,
+    wind: [f32; 2],
+    far_field: bool,
+) {
+    if phase_weight <= 0.015 {
+        return;
+    }
+    let alpha_phase = phase_weight.sqrt();
+    // Shell 0: Near foreground mathematical 6-fold snowflakes.
+    let near_w = 1.0 - smoothstep_f32(700.0, 2_200.0, agl_m) * 0.55;
+    let near_xy = (42.0 + 0.075 * agl_m).clamp(42.0, 180.0);
+    let near_z = (28.0 + 0.048 * agl_m).clamp(28.0, 120.0);
+    let near_scale = (near_xy / 42.0).powf(0.45);
+    let mut near = PrecipitationLayer::snow(eff_intensity * phase_weight * near_w)
+        .with_speed(fall_speed)
+        .with_wind(wind[0] * 0.78, wind[1] * 0.78)
+        .with_forward_bias(0.22);
+    near.volume_size_m = [near_xy, near_z];
+    near.particle_size_m = [0.18 * near_scale, 0.18 * near_scale];
+    near.max_particles = ((4_200.0 * (0.88 + 0.18 * near_scale)).min(5_800.0)) as u32;
+    near.color[3] *= (0.45 + 0.55 * env).clamp(0.0, 1.0) * alpha_phase * near_w;
+    out.push(near);
+
+    if !far_field {
+        return;
+    }
+
+    // Shell 1: Mid-field valley snow flurries spanning 140m .. 1,550m (zero panning wrap aliasing!).
+    let mid_in = smoothstep_f32(35.0, 240.0, agl_m);
+    if mid_in > 0.02 {
+        let mid_xy = (140.0 + 0.52 * agl_m).clamp(140.0, 1_550.0);
+        let mid_z = (90.0 + 0.32 * agl_m).clamp(90.0, 880.0);
+        let ms = (mid_xy / 140.0).powf(0.68);
+        let mut mid = PrecipitationLayer::snow(eff_intensity * phase_weight * mid_in)
+            .with_speed(fall_speed * 1.15)
+            .with_wind(wind[0] * 0.82, wind[1] * 0.82)
+            .with_forward_bias(0.35);
+        mid.id = 0x5052_0102;
+        mid.seed = 433;
+        mid.volume_size_m = [mid_xy, mid_z];
+        mid.particle_size_m = [0.58 * ms, 0.58 * ms];
+        mid.flutter = [1.8 * ms, 0.95];
+        mid.max_particles = 2_200;
+        mid.screen_px_clamp = [2.2, 8.8];
+        mid.color = [0.95, 0.97, 1.0, 0.56 * env * alpha_phase * mid_in];
+        out.push(mid);
+    }
+
+    // Shell 2: Far regional snow-squall mist clouds spanning 520m .. 5,600m across valleys & ridges.
+    let far_in = smoothstep_f32(140.0, 500.0, agl_m);
+    if far_in > 0.02 {
+        let far_xy = (520.0 + 1.55 * agl_m).clamp(520.0, 5_600.0);
+        let far_z = (300.0 + 0.72 * agl_m).clamp(300.0, 2_400.0);
+        let fs = (far_xy / 900.0).clamp(0.65, 3.6);
+        let mut far = PrecipitationLayer::snow_curtain(eff_intensity * phase_weight * far_in)
+            .with_speed((fall_speed * 1.4).max(2.6))
+            .with_wind(wind[0] * 0.85, wind[1] * 0.85)
+            .with_forward_bias(0.44);
+        far.volume_size_m = [far_xy, far_z];
+        far.particle_size_m = [95.0 * fs, 95.0 * fs];
+        far.color[3] *= (0.42 + 0.58 * env).clamp(0.0, 1.0) * alpha_phase * far_in;
+        out.push(far);
+    }
+}
+
+/// Default physically accurate multi-shell precipitation evaluator.
 ///
 /// - Stops cleanly above the precipitating cloud ceiling (`cloud_envelope <= 0.002`).
-/// - Adapts camera-local wrap volume smoothly to camera height Above Ground Level (`camera_agl_m`).
+/// - Emits 3 altitude-proportional world-locked shells (Near crisp drops/flakes, Mid city/valley
+///   streaks/flakes, and Far regional `Curtain` virga rain-shaft / snow-squall veils up to `5.6 km`)
+///   so zoomed-out vistas show precipitation falling across the entire landscape rather than only
+///   immediately around the lens.
 /// - In [`PrecipitationMode::Physical`], smoothly transitions between fast 2D rain streaks,
 ///   sleet/mixed pellets, and simplistic mathematical 2D snowflakes across the wet-bulb melting layer.
 pub fn physical_precipitation_evaluator(
@@ -1161,65 +1502,69 @@ pub fn physical_precipitation_evaluator(
         return Vec::new();
     }
 
-    // Scale the camera-local volume gently with height AGL so particles remain crisp & dense
-    // near street level (45 m) while filling the wider vista smoothly up toward the cloud base.
-    let agl_scale = 1.0 + 0.32 * smoothstep_f32(300.0, 4_200.0, ctx.camera_agl_m as f32);
+    let agl = ctx.camera_agl_m.max(0.0) as f32;
     let eff_intensity = (ctx.intensity * env).clamp(0.0, 2.5);
     let wind = ctx.wind_mps;
+    let far_field = ctx.config.far_field_curtains;
 
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(7);
     match &ctx.config.mode {
         PrecipitationMode::Physical => {
             let phase = ctx.atmosphere.phase;
-            if phase.rain > 0.015 {
-                let mut rain = PrecipitationLayer::rain(eff_intensity * phase.rain)
-                    .with_speed(ctx.config.rain_speed_mps)
-                    .with_wind(wind[0], wind[1]);
-                rain.volume_size_m[0] *= agl_scale;
-                rain.volume_size_m[1] *= agl_scale;
-                rain.max_particles = ((rain.max_particles as f32) * agl_scale).min(12_000.0) as u32;
-                rain.color[3] *= (0.45 + 0.55 * env).clamp(0.0, 1.0) * phase.rain.sqrt();
-                out.push(rain);
-            }
+            push_rain_shells(
+                &mut out,
+                eff_intensity,
+                phase.rain,
+                env,
+                agl,
+                ctx.config.rain_speed_mps,
+                wind,
+                far_field,
+            );
             if phase.sleet > 0.04 {
+                let near_xy = (40.0 + 0.075 * agl).clamp(40.0, 175.0);
+                let near_z = (30.0 + 0.05 * agl).clamp(30.0, 120.0);
                 let mut sleet = PrecipitationLayer::sleet(eff_intensity * phase.sleet)
-                    .with_wind(wind[0] * 0.9, wind[1] * 0.9);
-                sleet.volume_size_m[0] *= agl_scale;
-                sleet.volume_size_m[1] *= agl_scale;
-                sleet.max_particles = ((sleet.max_particles as f32) * agl_scale).min(8_000.0) as u32;
+                    .with_wind(wind[0] * 0.9, wind[1] * 0.9)
+                    .with_forward_bias(0.24);
+                sleet.volume_size_m = [near_xy, near_z];
                 sleet.color[3] *= (0.45 + 0.55 * env).clamp(0.0, 1.0) * phase.sleet.sqrt();
                 out.push(sleet);
             }
-            if phase.snow > 0.015 {
-                let mut snow = PrecipitationLayer::snow(eff_intensity * phase.snow)
-                    .with_speed(ctx.config.snow_speed_mps)
-                    .with_wind(wind[0] * 0.75, wind[1] * 0.75);
-                snow.volume_size_m[0] *= agl_scale;
-                snow.volume_size_m[1] *= agl_scale;
-                snow.max_particles = ((snow.max_particles as f32) * agl_scale).min(10_000.0) as u32;
-                snow.color[3] *= (0.45 + 0.55 * env).clamp(0.0, 1.0) * phase.snow.sqrt();
-                out.push(snow);
-            }
+            push_snow_shells(
+                &mut out,
+                eff_intensity,
+                phase.snow,
+                env,
+                agl,
+                ctx.config.snow_speed_mps,
+                wind,
+                far_field,
+            );
         }
         PrecipitationMode::Rain => {
-            let mut rain = PrecipitationLayer::rain(eff_intensity)
-                .with_speed(ctx.config.rain_speed_mps)
-                .with_wind(wind[0], wind[1]);
-            rain.volume_size_m[0] *= agl_scale;
-            rain.volume_size_m[1] *= agl_scale;
-            rain.max_particles = ((rain.max_particles as f32) * agl_scale).min(12_000.0) as u32;
-            rain.color[3] *= env;
-            out.push(rain);
+            push_rain_shells(
+                &mut out,
+                eff_intensity,
+                1.0,
+                env,
+                agl,
+                ctx.config.rain_speed_mps,
+                wind,
+                far_field,
+            );
         }
         PrecipitationMode::Snow => {
-            let mut snow = PrecipitationLayer::snow(eff_intensity)
-                .with_speed(ctx.config.snow_speed_mps)
-                .with_wind(wind[0] * 0.75, wind[1] * 0.75);
-            snow.volume_size_m[0] *= agl_scale;
-            snow.volume_size_m[1] *= agl_scale;
-            snow.max_particles = ((snow.max_particles as f32) * agl_scale).min(10_000.0) as u32;
-            snow.color[3] *= env;
-            out.push(snow);
+            push_snow_shells(
+                &mut out,
+                eff_intensity,
+                1.0,
+                env,
+                agl,
+                ctx.config.snow_speed_mps,
+                wind,
+                far_field,
+            );
         }
         PrecipitationMode::CustomLayers(layers) => {
             for layer in layers {
@@ -1246,8 +1591,8 @@ struct LayerToroidalPhase {
     phase_z: f64,
 }
 
-/// First-class `strata_earth` plugin rendering physically accurate, camera-local 2D precipitation
-/// (rain, sleet, mathematical 2D snowflakes, and custom 2D textured layers) on the GPU.
+/// First-class `strata_earth` plugin rendering physically accurate, multi-shell 2D precipitation
+/// (rain, sleet, mathematical 2D snowflakes, regional curtains, and custom 2D textured layers) on the GPU.
 pub struct PrecipitationPlugin {
     pub enabled: bool,
     config_override: Option<PrecipitationConfig>,
@@ -1331,14 +1676,11 @@ impl PrecipitationPlugin {
 
     fn compute_camera_geo_and_basis(
         ctx: &EarthParticleContext<'_>,
-    ) -> (DVec3, Geodetic, DVec3, DVec3, DVec3) {
+    ) -> (DVec3, DVec3, Geodetic, DVec3, DVec3, DVec3) {
         let up_hint = ctx
             .input
             .camera_up_ecef
             .map(|[x, y, z]| DVec3::new(x, y, z));
-        let placement = ctx.input.camera.placement_with_up(up_hint);
-        let eye_world = placement.eye;
-
         let flat_t = ctx.low_level.local_25d_blend.max(ctx.low_level.map_2d_morph);
         let morph = stabilized_surface_morph(
             ctx.input.camera.focus,
@@ -1346,6 +1688,9 @@ impl PrecipitationPlugin {
             ctx.low_level.map_2d_morph as f64,
             ctx.input.tile_projection,
         );
+        let placement = ctx.input.camera.placement_for_morph(morph, up_hint);
+        let eye_world = placement.eye;
+        let aim_world = placement.aim;
 
         let focus_geo = ctx.input.camera.focus;
         let (focus_origin, focus_frame) =
@@ -1359,7 +1704,11 @@ impl PrecipitationPlugin {
             let rel_u = rel.dot(focus_frame.up).max(0.0);
             let m_per_deg = crate::geodesy::wgs84::A.to_radians();
             let lat = (focus_geo.lat_deg + rel_n / m_per_deg).clamp(-89.95, 89.95);
-            let cos_lat = lat.to_radians().cos().abs().max(0.15);
+            let cos_lat = if crate::geodesy::is_canonical_2d_morph(morph.map_2d_morph) {
+                1.0
+            } else {
+                lat.to_radians().cos().abs().max(0.15)
+            };
             let lon = ((focus_geo.lon_deg + rel_e / (m_per_deg * cos_lat)) + 180.0)
                 .rem_euclid(360.0)
                 - 180.0;
@@ -1374,7 +1723,38 @@ impl PrecipitationPlugin {
             eye_geo.height_m,
             morph,
         );
-        (eye_world, eye_geo, eye_frame.east, eye_frame.north, eye_frame.up)
+        (
+            eye_world,
+            aim_world,
+            eye_geo,
+            eye_frame.east,
+            eye_frame.north,
+            eye_frame.up,
+        )
+    }
+
+    fn effective_intensity(
+        cfg: &PrecipitationConfig,
+        weather_snapshot: Option<&crate::weather_api::WeatherSnapshot>,
+    ) -> f32 {
+        let base_p = if cfg.sync_with_base_weather {
+            weather_snapshot
+                .map(|ws| ws.precipitation_intensity.clamp(0.0, 2.5))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if cfg.enabled {
+            if base_p > 0.02 {
+                base_p
+            } else {
+                cfg.intensity.clamp(0.0, 2.5)
+            }
+        } else if base_p > 0.02 {
+            base_p
+        } else {
+            0.0
+        }
     }
 
     fn is_below_ceiling_for_tick(&self, ctx: &EarthPluginFrameContext<'_>) -> bool {
@@ -1382,17 +1762,27 @@ impl PrecipitationPlugin {
             return false;
         }
         let cfg = self.active_config(&ctx.input.precipitation);
-        if !cfg.enabled || cfg.intensity <= 0.002 {
+        let eff_int = Self::effective_intensity(cfg, ctx.weather_snapshot.as_ref());
+        if eff_int <= 0.002 {
             return false;
         }
         if !cfg.respect_cloud_ceiling {
             return true;
         }
-        // Conservative upper altitude test (ground <= 9,000 m) to skip ticking in orbital space.
-        let max_ceiling = match cfg.atmosphere.cloud_ceiling {
-            CloudCeiling::FixedMsl(alt) => alt,
-            CloudCeiling::AboveGround(agl) => agl + 9_000.0,
-            CloudCeiling::CloudShell => CLOUD_SHELL_ALTITUDE_M,
+        let max_ceiling = if cfg.sync_with_base_weather {
+            ctx.weather_snapshot
+                .map(|ws| ws.atmosphere.cloud_ceiling_msl_m)
+                .unwrap_or_else(|| match cfg.atmosphere.cloud_ceiling {
+                    CloudCeiling::FixedMsl(alt) => alt,
+                    CloudCeiling::AboveGround(agl) => agl + 9_000.0,
+                    CloudCeiling::CloudShell => CLOUD_SHELL_ALTITUDE_M,
+                })
+        } else {
+            match cfg.atmosphere.cloud_ceiling {
+                CloudCeiling::FixedMsl(alt) => alt,
+                CloudCeiling::AboveGround(agl) => agl + 9_000.0,
+                CloudCeiling::CloudShell => CLOUD_SHELL_ALTITUDE_M,
+            }
         };
         ctx.altitude_m <= max_ceiling + 250.0
     }
@@ -1436,13 +1826,15 @@ impl EarthPlugin for PrecipitationPlugin {
         textures_out: &mut Vec<Arc<RetainedTileTexture>>,
     ) {
         let cfg = self.active_config(&ctx.input.precipitation).clone();
-        if !self.enabled || !cfg.enabled || cfg.intensity <= 0.002 {
+        let eff_intensity = Self::effective_intensity(&cfg, ctx.weather_snapshot.as_ref());
+        if !self.enabled || eff_intensity <= 0.002 {
             self.pending_dt_s = 0.0;
             self.last_eye_world = None;
             return;
         }
 
-        let (eye_world, eye_geo, east, north, up) = Self::compute_camera_geo_and_basis(ctx);
+        let (eye_world, aim_world, eye_geo, east, north, up) =
+            Self::compute_camera_geo_and_basis(ctx);
         let ground_elev_m = if ctx.input.elevation_enabled {
             ctx.sample_ground_elevation_m(eye_geo.lat_deg, eye_geo.lon_deg)
                 .max(0.0)
@@ -1460,6 +1852,14 @@ impl EarthPlugin for PrecipitationPlugin {
         };
         let sample = if let Some(ref custom_provider) = self.temperature_provider {
             custom_provider.sample(query, &cfg.atmosphere)
+        } else if cfg.sync_with_base_weather {
+            if let Some(ws) = ctx.weather_snapshot {
+                ws.atmosphere
+            } else if cfg.use_live_temperature {
+                self.live_meteo.sample(query, &cfg.atmosphere)
+            } else {
+                StaticAtmosphereProvider.sample(query, &cfg.atmosphere)
+            }
         } else if cfg.use_live_temperature {
             self.live_meteo.sample(query, &cfg.atmosphere)
         } else {
@@ -1498,7 +1898,31 @@ impl EarthPlugin for PrecipitationPlugin {
             return;
         }
 
-        let eff_wind = sample.wind_mps.unwrap_or(cfg.wind_mps);
+        // Resolve wind velocity cleanly: unified Base Weather snapshot -> live sounding -> configured wind speed/angle.
+        let eff_wind = if cfg.sync_with_base_weather {
+            ctx.weather_snapshot
+                .map(|ws| ws.wind.to_enu_mps())
+                .or(sample.wind_mps)
+                .unwrap_or_else(|| cfg.resolved_wind_enu())
+        } else {
+            sample.wind_mps.unwrap_or_else(|| cfg.resolved_wind_enu())
+        };
+
+        // Ground-projected horizontal forward vector for forward-biased frustum filling (fades cleanly to 0 at nadir).
+        let look_vec = aim_world.sub(eye_world);
+        let look_len = look_vec.length().max(1e-6);
+        let look_dir = look_vec.scale(1.0 / look_len);
+        let look_e = look_dir.dot(east);
+        let look_n = look_dir.dot(north);
+        let horiz_len = (look_e * look_e + look_n * look_n).sqrt();
+        let forward_horiz = if horiz_len > 0.04 {
+            let ramp = smoothstep_f64(0.04, 0.25, horiz_len);
+            let scale = ramp / horiz_len;
+            east.scale(look_e * scale).add(north.scale(look_n * scale))
+        } else {
+            DVec3::new(0.0, 0.0, 0.0)
+        };
+
         let eval_ctx = PrecipitationEvalContext {
             config: &cfg,
             camera_lat_deg: eye_geo.lat_deg,
@@ -1508,7 +1932,7 @@ impl EarthPlugin for PrecipitationPlugin {
             camera_agl_m,
             atmosphere: sample,
             cloud_envelope,
-            intensity: cfg.intensity,
+            intensity: eff_intensity,
             time_s: self.sim_time_s,
             wind_mps: eff_wind,
             view_mode: ctx.input.view_mode,
@@ -1529,26 +1953,30 @@ impl EarthPlugin for PrecipitationPlugin {
             let extent_xy = (layer.volume_size_m[0] as f64).max(4.0);
             let extent_z = (layer.volume_size_m[1] as f64).max(4.0);
 
-            // Incremental f64 toroidal phase update in normalized [0, 1) cycles:
-            // - Camera panning right (+delta_e) subtracts from phase_e -> drops stream left!
-            // - Wind blowing east (+wind[0]) adds to phase_e -> drops drift east!
-            // - Gravity downward (+fall_speed_mps) subtracts from phase_z -> drops fall down!
-            // - Smooth volume resizing across zoom causes zero phase snapping!
+            // Incremental f64 toroidal phase update in normalized [0, 1) cycles with sub-Nyquist
+            // pan clamping on tight near-camera shells to prevent wrap-aliasing / perceived state
+            // resets during fast high-altitude panning while preserving exact opposite-direction flow!
+            let max_pan_cycle = if extent_xy < 240.0 { 0.16 } else { 0.35 };
+            let pan_e = (-delta_e / extent_xy).clamp(-max_pan_cycle, max_pan_cycle);
+            let pan_n = (-delta_n / extent_xy).clamp(-max_pan_cycle, max_pan_cycle);
+            let pan_u = (-delta_u / extent_z).clamp(-0.24, 0.24);
+
             let state = self.layer_phases.entry(layer.id).or_default();
-            state.phase_e = (state.phase_e
-                + ((layer.wind_mps[0] as f64) * dt_step - delta_e) / extent_xy)
-                .rem_euclid(1.0);
-            state.phase_n = (state.phase_n
-                + ((layer.wind_mps[1] as f64) * dt_step - delta_n) / extent_xy)
-                .rem_euclid(1.0);
-            state.phase_z = (state.phase_z
-                + (-(layer.fall_speed_mps as f64) * dt_step - delta_u) / extent_z)
-                .rem_euclid(1.0);
+            state.phase_e =
+                (state.phase_e + ((layer.wind_mps[0] as f64) * dt_step) / extent_xy + pan_e)
+                    .rem_euclid(1.0);
+            state.phase_n =
+                (state.phase_n + ((layer.wind_mps[1] as f64) * dt_step) / extent_xy + pan_n)
+                    .rem_euclid(1.0);
+            state.phase_z =
+                (state.phase_z - ((layer.fall_speed_mps as f64) * dt_step) / extent_z + pan_u)
+                    .rem_euclid(1.0);
 
             let sprite = match &layer.sprite {
                 ParticleSprite::RainStreak => RetainedParticleSprite::ProceduralStreak,
                 ParticleSprite::Snowflake => RetainedParticleSprite::ProceduralSnowflake,
                 ParticleSprite::SleetPellet => RetainedParticleSprite::ProceduralPellet,
+                ParticleSprite::Curtain => RetainedParticleSprite::ProceduralCurtain,
                 ParticleSprite::Texture {
                     id,
                     revision,
@@ -1580,6 +2008,20 @@ impl EarthPlugin for PrecipitationPlugin {
                 1.0e9_f32
             };
 
+            let bias_m = layer.forward_bias_frac.clamp(0.0, 0.65) * (extent_xy as f32);
+            let forward_bias_world = [
+                (forward_horiz.x as f32) * bias_m,
+                (forward_horiz.y as f32) * bias_m,
+                (forward_horiz.z as f32) * bias_m,
+            ];
+            let near_clip = if matches!(layer.sprite, ParticleSprite::Curtain) {
+                (extent_xy as f32 * 0.14).clamp(45.0, 320.0)
+            } else if extent_xy > 240.0 {
+                (extent_xy as f32 * 0.06).clamp(8.0, 65.0)
+            } else {
+                (extent_xy as f32 * 0.032).clamp(0.8, 3.5)
+            };
+
             layers_out.push(RetainedParticleLayer {
                 id: layer.id,
                 particle_count,
@@ -1588,6 +2030,7 @@ impl EarthPlugin for PrecipitationPlugin {
                 basis_east: [east.x as f32, east.y as f32, east.z as f32],
                 basis_north: [north.x as f32, north.y as f32, north.z as f32],
                 basis_up: [up.x as f32, up.y as f32, up.z as f32],
+                forward_bias_world,
                 wrapped_phase: [
                     state.phase_e as f32,
                     state.phase_n as f32,
@@ -1599,12 +2042,7 @@ impl EarthPlugin for PrecipitationPlugin {
                     ceiling_for_shader,
                     fade_band as f32,
                 ],
-                volume_params: [
-                    extent_xy as f32,
-                    extent_z as f32,
-                    0.22,
-                    (extent_xy as f32 * 0.032).clamp(0.8, 3.5),
-                ],
+                volume_params: [extent_xy as f32, extent_z as f32, 0.24, near_clip],
                 motion_params: [
                     layer.fall_speed_mps,
                     layer.wind_mps[0],

@@ -100,7 +100,7 @@ pub struct SpaceEnvironmentConfig {
     pub city_lights: bool,
     /// Brightness multiplier for deterministic city lights (`1.0` default).
     pub city_lights_intensity: f32,
-    /// Solar position & lighting source mode (defaults to [`SunDirectionMode::SystemClock`]).
+    /// Solar position & lighting source mode (defaults to [`SunDirectionMode::SimulationTime`]).
     pub sun_direction: SunDirectionMode,
     /// Render physical limb-darkened Sun disc & solar corona (`true` default).
     pub sun_visible: bool,
@@ -201,10 +201,100 @@ impl SpaceEnvironmentConfig {
     }
 }
 
-/// Optional animated wavy ocean rendering on non-land water surfaces.
+/// Optional realistic 2.5D atmosphere, visible Sun, horizon-synced night stars, weather
+/// darkening, and real-time GPU mountain/terrain directional shadows.
+///
+/// Defaults keep heavy passes opt-in (`false`) for lightweight embedded maps; call
+/// [`Self::realistic()`] to enable the complete physical 2.5D atmosphere & shadow suite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalAtmosphereConfig {
+    /// Physical Rayleigh + Henyey-Greenstein Mie 2.5D sky & visible Sun disc reacting to solar angle.
+    pub realistic_sky: bool,
+    /// Show Yale BSC5 constellations, Milky Way skybox, and Moon above the 2.5D horizon at night.
+    pub night_stars_sync: bool,
+    /// Enable directional solar/twilight hillshading on 2.5D terrain slopes & mountains.
+    pub terrain_lighting: bool,
+    /// Enable real-time GPU directional shadow mapping (texel-snapped PCF) so mountains and 3D geo
+    /// objects cast shadows across terrain valleys.
+    pub terrain_shadows: bool,
+    /// Directional shadow darkness multiplier `[0.0..=1.0]` (`0.88` default).
+    pub shadow_strength: f32,
+    /// Shadow map resolution in pixels (`2048` default; clamped `512..=4096`).
+    pub shadow_map_size: u32,
+    /// Synchronize 2.5D sky darkening, solar attenuation, and precipitation mist haze with
+    /// [`EarthInput::base_weather`] and active [`EarthInput::precipitation`] (`true` default).
+    pub sync_with_weather: bool,
+}
+
+impl Default for LocalAtmosphereConfig {
+    fn default() -> Self {
+        Self {
+            realistic_sky: false,
+            night_stars_sync: false,
+            terrain_lighting: false,
+            terrain_shadows: false,
+            shadow_strength: 0.88,
+            shadow_map_size: 2048,
+            sync_with_weather: true,
+        }
+    }
+}
+
+impl LocalAtmosphereConfig {
+    /// Returns a preset enabling the full physical 2.5D sky, Sun, night stars, terrain lighting,
+    /// real-time mountain shadows, and unified weather synchronization.
+    pub fn realistic() -> Self {
+        Self {
+            realistic_sky: true,
+            night_stars_sync: true,
+            terrain_lighting: true,
+            terrain_shadows: true,
+            shadow_strength: 0.88,
+            shadow_map_size: 2048,
+            sync_with_weather: true,
+        }
+    }
+
+    pub fn with_realistic_sky(mut self, enabled: bool) -> Self {
+        self.realistic_sky = enabled;
+        self
+    }
+
+    pub fn with_night_stars_sync(mut self, enabled: bool) -> Self {
+        self.night_stars_sync = enabled;
+        self
+    }
+
+    pub fn with_terrain_lighting(mut self, enabled: bool) -> Self {
+        self.terrain_lighting = enabled;
+        self
+    }
+
+    pub fn with_terrain_shadows(mut self, enabled: bool) -> Self {
+        self.terrain_shadows = enabled;
+        self
+    }
+
+    pub fn with_shadow_strength(mut self, strength: f32) -> Self {
+        self.shadow_strength = strength.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn with_shadow_map_size(mut self, size: u32) -> Self {
+        self.shadow_map_size = size.clamp(512, 4096);
+        self
+    }
+
+    pub fn with_sync_with_weather(mut self, sync: bool) -> Self {
+        self.sync_with_weather = sync;
+        self
+    }
+}
+
+/// Optional GPU-native physical wavy ocean rendering on non-land water surfaces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OceanWavesConfig {
-    /// Enables animated multi-octave Gerstner waves and sun-glint crests on non-land surfaces (`false` default).
+    /// Enables per-pixel 8-octave directional Gerstner waves, sky reflections, and sun/moon glitter (`false` default).
     pub enabled: bool,
     /// Wave height / slope amplitude multiplier (`1.0` default).
     pub wave_strength: f32,
@@ -214,8 +304,21 @@ pub struct OceanWavesConfig {
     pub glint_intensity: f32,
     /// Animation speed multiplier (`1.0` default).
     pub speed: f32,
-    /// Translucent wave surface opacity over underlying bathymetry/satellite water (`0.36` default).
+    /// Ocean shading blend opacity over underlying water imagery (`0.82` default).
     pub opacity: f32,
+    /// Fallback wind speed in m/s when not synchronized with unified weather (`8.0` default).
+    pub wind_speed_mps: f32,
+    /// Fallback compass heading in degrees (`0°=N, 90°=E`) that waves travel toward (`60.0°` default).
+    pub wind_angle_deg: f32,
+    /// Synchronize wave direction & Beaufort sea state smoothly with [`EarthInput::base_weather`] (`true` default).
+    pub sync_with_weather: bool,
+    /// Opt-in coastal shoreline context: computes a cached O(N) Euclidean Distance-to-Shore SDF
+    /// for Snell's-law wave refraction, periodic breaking surf lines, and rhythmic beach swash (`false` default).
+    pub coastal_shoaling: bool,
+    /// Distance from shoreline in metres over which waves refract, shoal, and break (`360.0 m` default).
+    pub shoaling_range_m: f32,
+    /// Smooth dual-train wind cross-fade duration in seconds (`4.0 s` default).
+    pub wind_transition_s: f32,
 }
 
 impl Default for OceanWavesConfig {
@@ -226,7 +329,13 @@ impl Default for OceanWavesConfig {
             wave_scale: 1.0,
             glint_intensity: 1.0,
             speed: 1.0,
-            opacity: 0.36,
+            opacity: 0.82,
+            wind_speed_mps: 8.0,
+            wind_angle_deg: 60.0,
+            sync_with_weather: true,
+            coastal_shoaling: false,
+            shoaling_range_m: 360.0,
+            wind_transition_s: 4.0,
         }
     }
 }
@@ -267,6 +376,32 @@ impl OceanWavesConfig {
 
     pub fn with_opacity(mut self, opacity: f32) -> Self {
         self.opacity = opacity.clamp(0.0, 1.0);
+        self
+    }
+
+    pub fn with_wind(mut self, speed_mps: f32, angle_deg: f32) -> Self {
+        self.wind_speed_mps = speed_mps.clamp(0.0, 60.0);
+        self.wind_angle_deg = angle_deg.rem_euclid(360.0);
+        self
+    }
+
+    pub fn with_coastal_shoaling(mut self, enabled: bool) -> Self {
+        self.coastal_shoaling = enabled;
+        self
+    }
+
+    pub fn with_sync_with_weather(mut self, sync: bool) -> Self {
+        self.sync_with_weather = sync;
+        self
+    }
+
+    pub fn with_shoaling_range_m(mut self, range_m: f32) -> Self {
+        self.shoaling_range_m = range_m.clamp(40.0, 2_000.0);
+        self
+    }
+
+    pub fn with_wind_transition_s(mut self, transition_s: f32) -> Self {
+        self.wind_transition_s = transition_s.clamp(0.4, 20.0);
         self
     }
 }
@@ -332,12 +467,111 @@ pub struct EarthInput {
     pub elevation_enabled: bool,
     /// Toggleable space skybox, Sun/Moon, day/night terminator, satellites, and city lights.
     pub space: SpaceEnvironmentConfig,
+    /// Optional realistic 2.5D atmosphere, visible Sun, horizon-synced night stars, weather
+    /// darkening, and directional terrain/mountain shadow mapping.
+    pub local_atmosphere: LocalAtmosphereConfig,
+    /// Optional unified Base Weather API configuration shared across precipitation, clouds,
+    /// 2.5D sky/haze, and ocean waves.
+    pub base_weather: crate::weather_api::BaseWeatherConfig,
     /// Toggleable global and local 2.5D cloud-shell map configuration.
     pub weather: crate::gltf::WeatherConfig,
     /// Physically accurate, GPU-instanced 2D camera-local precipitation configuration.
     pub precipitation: crate::precipitation::PrecipitationConfig,
-    /// Optional animated wavy ocean renders on non-land water surfaces.
+    /// Optional GPU-native physical wavy ocean renders on non-land water surfaces.
     pub ocean_waves: OceanWavesConfig,
+    /// Optional idle high-resolution refinement loading sharper tiles in the current view when
+    /// the camera rests stationary (`enabled: false` by default).
+    pub idle_high_res: IdleHighResConfig,
+}
+
+/// Opt-in configuration for progressive high-resolution tile refinement while the camera is idle.
+///
+/// Disabled by default (`enabled: false`) so tile bandwidth and GPU memory stay minimal unless
+/// explicitly opted in. When enabled and the camera remains stationary on a view, visible tiles
+/// near the center of the view frustum progressively refine to higher detail levels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IdleHighResConfig {
+    /// Master opt-in toggle (`false` by default).
+    pub enabled: bool,
+    /// Stationary idle delay in seconds before refinement starts (default `0.45 s`).
+    pub idle_delay_s: f64,
+    /// Effective SSE threshold scale while fully idle (`< 1.0` loads finer zoom levels; default `0.42`).
+    pub sse_scale: f64,
+    /// Additional quadtree leaf tile budget granted while idle (default `192`).
+    pub extra_leaf_budget: usize,
+    /// Maximum extra zoom levels above normal moving LOD permitted while idle (default `2`).
+    pub max_extra_levels: u8,
+    /// Priority weight `[0.0..=1.0]` biasing idle refinement toward the center of the camera gaze (default `0.65`).
+    pub view_center_bias: f64,
+}
+
+impl Default for IdleHighResConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_delay_s: 0.45,
+            sse_scale: 0.42,
+            extra_leaf_budget: 192,
+            max_extra_levels: 2,
+            view_center_bias: 0.65,
+        }
+    }
+}
+
+impl IdleHighResConfig {
+    /// Enables idle high-resolution refinement with balanced defaults.
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_idle_delay_s(mut self, delay_s: f64) -> Self {
+        self.idle_delay_s = delay_s.clamp(0.05, 10.0);
+        self
+    }
+
+    pub fn with_sse_scale(mut self, sse_scale: f64) -> Self {
+        self.sse_scale = sse_scale.clamp(0.18, 1.0);
+        self
+    }
+
+    pub fn with_extra_leaf_budget(mut self, extra_leaves: usize) -> Self {
+        self.extra_leaf_budget = extra_leaves.min(512);
+        self
+    }
+
+    pub fn with_max_extra_levels(mut self, extra_levels: u8) -> Self {
+        self.max_extra_levels = extra_levels.min(4);
+        self
+    }
+
+    pub fn with_view_center_bias(mut self, bias: f64) -> Self {
+        self.view_center_bias = bias.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Converts this config and an active progressive idle factor (`0.0..=1.0`) into LOD traversal parameters.
+    #[inline]
+    pub fn to_lod_params(&self, idle_factor: f32) -> crate::geodesy::IdleLodParams {
+        let t = (idle_factor as f64).clamp(0.0, 1.0);
+        if !self.enabled || t <= 1e-4 {
+            return crate::geodesy::IdleLodParams::inactive();
+        }
+        let target_scale = self.sse_scale.clamp(0.18, 1.0);
+        let eff_scale = 1.0 + (target_scale - 1.0) * t;
+        let extra_leaves = ((self.extra_leaf_budget.min(512) as f64) * t).round() as usize;
+        let max_extra = ((self.max_extra_levels.min(4) as f64) * t)
+            .ceil()
+            .clamp(1.0, self.max_extra_levels.max(1).min(4) as f64) as u8;
+        crate::geodesy::IdleLodParams {
+            sse_scale: eff_scale,
+            view_center_bias: self.view_center_bias.clamp(0.0, 1.0),
+            extra_leaves,
+            max_extra_levels: max_extra,
+        }
+    }
 }
 
 impl EarthInput {
@@ -452,9 +686,12 @@ impl Default for EarthInput {
             fallback_tint: Color::rgba(128, 128, 128, 255),
             elevation_enabled: true,
             space: SpaceEnvironmentConfig::default(),
+            local_atmosphere: LocalAtmosphereConfig::default(),
+            base_weather: crate::weather_api::BaseWeatherConfig::default(),
             weather: crate::gltf::WeatherConfig::default(),
             precipitation: crate::precipitation::PrecipitationConfig::default(),
             ocean_waves: OceanWavesConfig::default(),
+            idle_high_res: IdleHighResConfig::default(),
         }
     }
 }
@@ -533,6 +770,7 @@ impl EarthScene {
     pub fn new() -> Self {
         let world = std::sync::Arc::new(std::sync::RwLock::new(EarthWorld::new()));
         let mut retained_builder = crate::worker::RetainedTerrainBuilder::new();
+        retained_builder.set_deterministic_ids_for_cpu_scene();
         retained_builder.set_world(std::sync::Arc::clone(&world));
         Self {
             scene: Scene3D::new(),
@@ -840,8 +1078,15 @@ impl EarthScene {
                 SurfaceMode::QuadtreeLod => {
                     let mut leaves = Vec::new();
                     let horizon_cull = input.low_level_state().map_2d_morph < 0.15;
-                    let raw_leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_options(
+                    let elev_on = input.elevation_enabled
+                        && input.low_level_state().map_2d_morph < 0.99
+                        && input.camera.altitude_m() <= 350_000.0;
+                    let src_ro: &dyn TileSource = &*source;
+                    let raw_leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_elevation(
                         &input.camera,
+                        input
+                            .camera_up_ecef
+                            .map(|u| strata_render::camera64::DVec3::new(u[0], u[1], u[2])),
                         input.viewport.width.max(1.0) as f64,
                         input.viewport.height.max(1.0) as f64,
                         input.sse_threshold.max(0.5),
@@ -849,6 +1094,39 @@ impl EarthScene {
                         input.tile_grid.max(2),
                         horizon_cull,
                         crate::geodesy::MAX_QUADTREE_LEAVES,
+                        input.tile_projection,
+                        crate::geodesy::IdleLodParams::inactive(),
+                        0.0,
+                        |k| {
+                            if !elev_on {
+                                return 0.0;
+                            }
+                            let mut probe = k;
+                            loop {
+                                if let Some(e) = src_ro.peek_cached_elevation(probe) {
+                                    if probe == k {
+                                        return e.average_elevation_m();
+                                    }
+                                    let dl = k.level.saturating_sub(probe.level).min(24);
+                                    let scale = (1u64 << dl) as f64;
+                                    let dx =
+                                        (k.x as u64).saturating_sub((probe.x as u64) << dl) as f64;
+                                    let dy =
+                                        (k.y as u64).saturating_sub((probe.y as u64) << dl) as f64;
+                                    return e.average_elevation_in_uv_rect_m(
+                                        (dx / scale).clamp(0.0, 1.0) as f32,
+                                        (dy / scale).clamp(0.0, 1.0) as f32,
+                                        ((dx + 1.0) / scale).clamp(0.0, 1.0) as f32,
+                                        ((dy + 1.0) / scale).clamp(0.0, 1.0) as f32,
+                                    );
+                                }
+                                let Some(parent) = probe.parent() else {
+                                    break;
+                                };
+                                probe = parent;
+                            }
+                            0.0
+                        },
                     );
                     for key in raw_leaves {
                         let bounds = if input.tile_projection
@@ -1111,7 +1389,12 @@ impl EarthScene {
         let low_state = input.low_level_state();
         let flat_q = (low_state.local_25d_blend * 1024.0).round() as u32;
         let morph_q = (low_state.map_2d_morph * 1024.0).round() as u32;
-        let (focus_lat_q, focus_lon_q) = if flat_q > 0 {
+        let (focus_lat_q, focus_lon_q) = if crate::geodesy::is_canonical_2d_morph(low_state.map_2d_morph as f64)
+            && (low_state.local_25d_blend.max(low_state.map_2d_morph) as f64)
+                >= crate::geodesy::CANONICAL_2D_MORPH_THRESHOLD
+        {
+            (0, 0)
+        } else if flat_q > 0 {
             (
                 (input.camera.focus.lat_deg * 1e5).round() as i64,
                 (input.camera.focus.lon_deg * 1e5).round() as i64,
@@ -1122,17 +1405,54 @@ impl EarthScene {
         let world_rev = self.world.read().map(|w| w.revision()).unwrap_or(0);
         let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
         if input.layers.terrain && effective_mode == SurfaceMode::QuadtreeLod {
-            let leaves = crate::geodesy::traverse_quadtree_lod_frustum6_projected(
-                &input.camera,
-                input.viewport.width.max(1.0) as f64,
-                input.viewport.height.max(1.0) as f64,
-                input.sse_threshold,
-                input.max_tile_level,
-                input.tile_grid.max(2),
-                low_state.map_2d_morph < 0.15,
-                crate::geodesy::MAX_QUADTREE_LEAVES,
-                input.tile_projection,
-            );
+            let is_canon_2d = crate::geodesy::is_canonical_2d_morph(low_state.map_2d_morph as f64)
+                && (low_state.local_25d_blend.max(low_state.map_2d_morph) as f64)
+                    >= crate::geodesy::CANONICAL_2D_MORPH_THRESHOLD;
+            let elev_on = input.elevation_enabled
+                && !is_canon_2d
+                && input.camera.altitude_m() <= 350_000.0;
+            let focus_elev = if elev_on {
+                self.retained_builder.sample_ground_elevation_m(
+                    input.camera.focus.lat_deg,
+                    input.camera.focus.lon_deg,
+                )
+            } else {
+                0.0
+            };
+            let src_ro: &dyn TileSource = &*source;
+            let leaves = if is_canon_2d {
+                crate::geodesy::traverse_quadtree_lod_2d_flat(
+                    &input.camera,
+                    input.viewport.width.max(1.0) as f64,
+                    input.viewport.height.max(1.0) as f64,
+                    input.sse_threshold,
+                    input.max_tile_level,
+                    input.tile_grid.max(2),
+                    crate::geodesy::MAX_QUADTREE_LEAVES,
+                    input.tile_projection,
+                )
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect()
+            } else {
+                crate::geodesy::traverse_quadtree_lod_frustum6_with_elevation(
+                    &input.camera,
+                    input
+                        .camera_up_ecef
+                        .map(|u| strata_render::camera64::DVec3::new(u[0], u[1], u[2])),
+                    input.viewport.width.max(1.0) as f64,
+                    input.viewport.height.max(1.0) as f64,
+                    input.sse_threshold,
+                    input.max_tile_level,
+                    input.tile_grid.max(2),
+                    low_state.map_2d_morph < 0.15,
+                    crate::geodesy::MAX_QUADTREE_LEAVES,
+                    input.tile_projection,
+                    crate::geodesy::IdleLodParams::inactive(),
+                    focus_elev,
+                    |k| self.retained_builder.tile_average_altitude_m(k, elev_on, src_ro),
+                )
+            };
             let with_skirts = input.terrain_skirts.unwrap_or(true);
             let sig = RetainedLeafSig {
                 mode: effective_mode,
@@ -1184,7 +1504,13 @@ impl EarthScene {
             .with_background(sky_gradient(input.daylight))
             .with_retained_terrain(frame)
             .with_retained_handle(self.retained_handle.clone());
-        let placement = input.camera.placement();
+        let morph = stabilized_surface_morph(
+            input.camera.focus,
+            low_state.local_25d_blend.max(low_state.map_2d_morph) as f64,
+            low_state.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let placement = input.camera.placement_for_morph(morph, None);
         let origin = geodetic_to_ecef(input.camera.focus);
         let aspect = (input.viewport.width / input.viewport.height.max(1.0)).max(0.01);
         scene.camera = Camera3D::Perspective {
@@ -1278,7 +1604,7 @@ impl EarthScene {
             input.tile_projection,
         );
         let up = input.camera_up_ecef.map(|[x, y, z]| DVec3::new(x, y, z));
-        let placement = input.camera.placement_with_up(up);
+        let placement = input.camera.placement_for_morph(morph, up);
         let elev_on = input.elevation_enabled;
         let rb = &self.retained_builder;
         let guard = self.world.read().ok()?;
@@ -1350,12 +1676,13 @@ impl EarthScene {
             input.tile_projection,
         );
         let up = input.camera_up_ecef.map(|[x, y, z]| DVec3::new(x, y, z));
-        let (ray_origin, ray_dir) = crate::geodesy::screen_to_ray_with_up(
+        let (ray_origin, ray_dir) = crate::geodesy::screen_to_ray_for_morph(
             screen_x,
             screen_y,
             input.viewport.width as f64,
             input.viewport.height as f64,
             &input.camera,
+            morph,
             up,
         );
         let elev_on = input.elevation_enabled;
@@ -2182,7 +2509,8 @@ pub fn push_graticule(overlay: &mut Overlay3D, step_deg: f64, origin: DVec3, eye
     if step_deg <= 0.0 || step_deg > 90.0 {
         return;
     }
-    const SAMPLES: usize = 144;
+    const MERIDIAN_SAMPLES: usize = 144;
+    const PARALLEL_SAMPLES: usize = 180;
     let color = Color::rgba(148, 163, 184, 90);
     let altitude = 2_000.0;
 
@@ -2196,32 +2524,40 @@ pub fn push_graticule(overlay: &mut Overlay3D, step_deg: f64, origin: DVec3, eye
         }
     };
 
+    let mut emit_meridian = |lon_deg: f64| {
+        let points = (0..=MERIDIAN_SAMPLES)
+            .map(|i| {
+                let lat = -85.0 + 170.0 * i as f64 / MERIDIAN_SAMPLES as f64;
+                geodetic_to_ecef(Geodetic::new(lat, lon_deg, altitude)).sub(origin)
+            })
+            .collect();
+        emit(points);
+    };
+
+    emit_meridian(0.0);
+    emit_meridian(180.0);
     let mut meridian = step_deg;
-    while meridian < 180.0 {
-        for sign in [-1.0, 1.0] {
-            let points = (0..=SAMPLES)
-                .map(|i| {
-                    let lat = -85.0 + 170.0 * i as f64 / SAMPLES as f64;
-                    geodetic_to_ecef(Geodetic::new(lat, meridian * sign, altitude)).sub(origin)
-                })
-                .collect();
-            emit(points);
-        }
+    while meridian < 180.0 - 1e-6 {
+        emit_meridian(-meridian);
+        emit_meridian(meridian);
         meridian += step_deg;
     }
 
-    let mut parallel = 0.0;
-    while parallel <= 90.0 - step_deg {
-        for sign in [-1.0, 1.0] {
-            let lat = parallel * sign;
-            let points = (0..=SAMPLES)
-                .map(|i| {
-                    let lon = 180.0 * i as f64 / SAMPLES as f64;
-                    geodetic_to_ecef(Geodetic::new(lat, lon, altitude)).sub(origin)
-                })
-                .collect();
-            emit(points);
-        }
+    let mut emit_parallel = |lat_deg: f64| {
+        let points = (0..=PARALLEL_SAMPLES)
+            .map(|i| {
+                let lon = -180.0 + 360.0 * i as f64 / PARALLEL_SAMPLES as f64;
+                geodetic_to_ecef(Geodetic::new(lat_deg, lon, altitude)).sub(origin)
+            })
+            .collect();
+        emit(points);
+    };
+
+    emit_parallel(0.0);
+    let mut parallel = step_deg;
+    while parallel <= 90.0 - step_deg + 1e-6 {
+        emit_parallel(-parallel);
+        emit_parallel(parallel);
         parallel += step_deg;
     }
 }

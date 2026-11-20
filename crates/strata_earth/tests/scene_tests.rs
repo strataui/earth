@@ -1087,3 +1087,569 @@ fn test_adaptive_terrain_skirts_in_scene_build() {
         "Quadtree LOD with auto-skirts must have more triangles than with skirts disabled"
     );
 }
+
+#[test]
+fn test_world_mesh_eviction_on_remove_clear_replace_and_set_polyline_points() {
+    use strata_earth::{
+        EarthGeometry, EarthMaterial, EarthObject, EarthObjectId, EarthWorld, GeoPosition,
+        Geodetic, SurfaceMorphParams, TileProjection,
+    };
+
+    let mut world = EarthWorld::new();
+    let rev0 = world.revision();
+    assert!(
+        world.get_mut(EarthObjectId(999_999)).is_none(),
+        "missing object must return None"
+    );
+    assert_eq!(
+        world.revision(),
+        rev0,
+        "get_mut on missing ID must not increment world revision"
+    );
+
+    let pts1 = vec![
+        GeoPosition::sea_level(37.7749, -122.4194, 100.0),
+        GeoPosition::sea_level(37.7849, -122.4094, 200.0),
+    ];
+    let poly_id = world.spawn(EarthObject::new(
+        pts1[0],
+        EarthGeometry::Polyline {
+            points: pts1,
+            radius_m: 15.0,
+        },
+    ));
+    let box_id = world.spawn(
+        EarthObject::new(
+            GeoPosition::sea_level(37.7749, -122.4194, 50.0),
+            EarthGeometry::cube(20.0),
+        )
+        .with_material(EarthMaterial::standard(Color::rgba(255, 0, 0, 255))),
+    );
+
+    let morph = SurfaceMorphParams {
+        focus: Geodetic::new(37.7749, -122.4194, 0.0),
+        flat_blend: 0.0,
+        map_2d_morph: 0.0,
+        projection: TileProjection::default(),
+    };
+    let eye = strata_render::camera64::DVec3::new(0.0, 0.0, 7_000_000.0);
+    let _ = world.compile_retained(eye, 900.0, 55.0, false, morph, &|_, _| 0.0);
+    assert_eq!(world.mesh_count(), 2, "two distinct meshes should be resident");
+
+    // Mutate polyline points and radius in place without leaking old mesh
+    let pts2 = vec![
+        GeoPosition::sea_level(37.7749, -122.4194, 100.0),
+        GeoPosition::sea_level(37.7900, -122.4000, 250.0),
+        GeoPosition::sea_level(37.8000, -122.3900, 300.0),
+    ];
+    assert!(world.set_polyline_points(poly_id, pts2));
+    assert!(world.set_polyline_radius(poly_id, 25.0));
+    let _ = world.compile_retained(eye, 900.0, 55.0, false, morph, &|_, _| 0.0);
+    assert_eq!(
+        world.mesh_count(),
+        2,
+        "in-place polyline update must evict old polyline mesh"
+    );
+
+    // Replace geometry in place
+    assert!(world.replace_geometry(poly_id, EarthGeometry::sphere(40.0)));
+    assert_eq!(
+        world.mesh_count(),
+        2,
+        "replace_geometry must evict unreferenced polyline mesh"
+    );
+
+    // Remove one object -> its mesh must be evicted
+    assert!(world.remove(poly_id));
+    assert_eq!(world.mesh_count(), 1, "remove must evict unreferenced mesh");
+
+    // Clear all objects -> mesh table must be empty
+    world.clear();
+    assert_eq!(world.mesh_count(), 0, "clear must evict all meshes");
+    let _ = box_id;
+}
+
+#[test]
+fn test_polyline_25d_pan_zero_rebuild_and_2d_wrapped_altitude_parity() {
+    use strata_earth::{
+        EarthGeometry, EarthObject, EarthWorld, GeoPosition, Geodetic, SurfaceMorphParams,
+        TileProjection,
+    };
+
+    let mut world = EarthWorld::new();
+    let pts = vec![
+        GeoPosition::sea_level(37.7749, -122.4194, 500.0),
+        GeoPosition::sea_level(37.7849, -122.4094, 900.0),
+    ];
+    let _id = world.spawn(EarthObject::new(
+        pts[0],
+        EarthGeometry::Polyline {
+            points: pts,
+            radius_m: 12.0,
+        },
+    ));
+    let eye = strata_render::camera64::DVec3::new(-2_700_000.0, -4_200_000.0, 3_800_000.0);
+
+    let morph_a = SurfaceMorphParams {
+        focus: Geodetic::new(37.7749, -122.4194, 0.0),
+        flat_blend: 1.0,
+        map_2d_morph: 0.0,
+        projection: TileProjection::default(),
+    };
+    let (assets_a, insts_a) =
+        world.compile_retained(eye, 900.0, 55.0, false, morph_a, &|_, _| 0.0);
+    assert_eq!(assets_a.len(), 1);
+    assert_eq!(insts_a.len(), 1);
+
+    // Pan focus in 2.5D mode: mesh asset Arc pointer and revision MUST stay identical (zero rebuild!)
+    let morph_b = SurfaceMorphParams {
+        focus: Geodetic::new(37.8100, -122.3800, 0.0),
+        flat_blend: 1.0,
+        map_2d_morph: 0.0,
+        projection: TileProjection::default(),
+    };
+    let (assets_b, insts_b) =
+        world.compile_retained(eye, 900.0, 55.0, false, morph_b, &|_, _| 0.0);
+    assert!(
+        std::sync::Arc::ptr_eq(&assets_a[0], &assets_b[0]),
+        "2.5D camera pan must not rebuild polyline tube mesh asset"
+    );
+    assert_ne!(
+        insts_a[0].anchor_ecef, insts_b[0].anchor_ecef,
+        "2.5D camera pan must update polyline instance anchor relative to new focus tangent plane"
+    );
+
+    // Canonical 2D mode with 360-degree wrapped camera focus
+    let morph_2d = SurfaceMorphParams {
+        focus: Geodetic::new(37.7749, -122.4194 + 360.0, 0.0),
+        flat_blend: 1.0,
+        map_2d_morph: 1.0,
+        projection: TileProjection::WebMercator,
+    };
+    let (assets_2d, insts_2d) =
+        world.compile_retained(eye, 900.0, 55.0, false, morph_2d, &|_, _| 0.0);
+    assert_eq!(assets_2d.len(), 1);
+    assert_eq!(insts_2d.len(), 1);
+}
+
+#[test]
+fn test_glb_multi_mesh_node_hierarchy_yup_to_zup_vertex_colors_and_embedded_texture() {
+    use strata_earth::{parse_glb_mesh, EarthWorld, GeoPosition, ObjectAnchor};
+
+    // Build a minimal valid 1x1 RGBA PNG in memory using the `image` crate
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([64, 192, 255, 255]));
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .expect("encode 1x1 PNG");
+    }
+
+    let mut bin: Vec<u8> = Vec::new();
+    let positions: [[f32; 3]; 3] = [[0.0, 2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]];
+    for p in positions {
+        for f in p {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    let uvs: [[f32; 2]; 3] = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+    for uv in uvs {
+        for f in uv {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    for _ in 0..3 {
+        for f in [1.0f32, 0.5, 0.25, 1.0] {
+            bin.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    for idx in [0u16, 1, 2] {
+        bin.extend_from_slice(&idx.to_le_bytes());
+    }
+    while bin.len() % 4 != 0 {
+        bin.push(0);
+    }
+    let png_offset = bin.len();
+    let png_len = png_bytes.len();
+    bin.extend_from_slice(&png_bytes);
+    while bin.len() % 4 != 0 {
+        bin.push(0);
+    }
+
+    let json = format!(
+        r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0, 1]}}],
+            "nodes": [
+                {{"mesh": 0}},
+                {{"mesh": 1, "translation": [0.0, 3.0, 0.0]}}
+            ],
+            "meshes": [
+                {{"primitives": [{{"attributes": {{"POSITION": 0, "TEXCOORD_0": 1, "COLOR_0": 2}}, "indices": 3, "material": 0}}]}},
+                {{"primitives": [{{"attributes": {{"POSITION": 0, "TEXCOORD_0": 1}}, "indices": 3, "material": 0}}]}}
+            ],
+            "materials": [{{
+                "pbrMetallicRoughness": {{
+                    "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+                    "baseColorTexture": {{"index": 0}},
+                    "metallicFactor": 0.2,
+                    "roughnessFactor": 0.4
+                }}
+            }}],
+            "textures": [{{"source": 0}}],
+            "images": [{{"bufferView": 4, "mimeType": "image/png"}}],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}},
+                {{"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2"}},
+                {{"bufferView": 2, "componentType": 5126, "count": 3, "type": "VEC4"}},
+                {{"bufferView": 3, "componentType": 5123, "count": 3, "type": "SCALAR"}}
+            ],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 24}},
+                {{"buffer": 0, "byteOffset": 60, "byteLength": 48}},
+                {{"buffer": 0, "byteOffset": 108, "byteLength": 6}},
+                {{"buffer": 0, "byteOffset": {png_offset}, "byteLength": {png_len}}}
+            ],
+            "buffers": [{{"byteLength": {total_bin}}}]
+        }}"#,
+        total_bin = bin.len()
+    );
+    let mut json_bytes = json.into_bytes();
+    while json_bytes.len() % 4 != 0 {
+        json_bytes.push(b' ');
+    }
+
+    let total_len = 12 + 8 + json_bytes.len() + 8 + bin.len();
+    let mut glb = Vec::with_capacity(total_len);
+    glb.extend_from_slice(&0x4654_6C67u32.to_le_bytes());
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&(total_len as u32).to_le_bytes());
+    glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    glb.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
+    glb.extend_from_slice(&json_bytes);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(&0x004E_4942u32.to_le_bytes());
+    glb.extend_from_slice(&bin);
+
+    let parsed = parse_glb_mesh(&glb).expect("parse multi-mesh textured GLB");
+    assert_eq!(
+        parsed.positions.len(),
+        6,
+        "both meshes/nodes in the scene must be parsed (2 x 3 vertices)"
+    );
+    assert_eq!(parsed.indices.len(), 6);
+    // Vertex 0 was (0, 2, 0) in glTF Y-up -> (0, 0, 2) in ENU Z-up!
+    assert!((parsed.positions[0][0] - 0.0).abs() < 1e-5);
+    assert!((parsed.positions[0][1] - 0.0).abs() < 1e-5);
+    assert!((parsed.positions[0][2] - 2.0).abs() < 1e-5);
+    // Second node had Y-up translation (0, 3, 0) -> vertex 0 of node 1 is at Y=5 -> Z=5 in ENU!
+    assert!((parsed.positions[3][2] - 5.0).abs() < 1e-5);
+    assert!(parsed.vertex_colors.is_some(), "COLOR_0 must be decoded");
+    let tex = parsed
+        .albedo_texture
+        .as_ref()
+        .expect("embedded PNG baseColorTexture must be decoded");
+    assert_eq!(tex.width, 1);
+    assert_eq!(tex.height, 1);
+    assert_eq!(&tex.rgba8[..], &[64, 192, 255, 255]);
+
+    let mut world = EarthWorld::new();
+    let obj_id = world
+        .spawn_glb(
+            GeoPosition::sea_level(37.7749, -122.4194, 100.0),
+            &glb,
+            1.0,
+            ObjectAnchor::Center,
+        )
+        .expect("spawn_glb ok");
+    assert!(world.get(obj_id).is_some());
+    assert!(
+        world
+            .spawn_glb(
+                GeoPosition::sea_level(0.0, 0.0, 0.0),
+                b"not a glb",
+                1.0,
+                ObjectAnchor::Center
+            )
+            .is_err(),
+        "corrupt GLB bytes must return Err from spawn_glb"
+    );
+}
+
+#[test]
+fn test_transparent_objects_sorted_back_to_front_and_albedo_texture_propagated() {
+    use strata_earth::{
+        EarthGeometry, EarthMaterial, EarthObject, EarthWorld, GeoPosition, Geodetic,
+        SurfaceMorphParams, TileProjection,
+    };
+
+    let mut world = EarthWorld::new();
+    // Spawn near transparent object first, then far transparent object, then opaque textured object
+    let near_pos = GeoPosition::sea_level(0.0, 0.0, 500_000.0);
+    let far_pos = GeoPosition::sea_level(0.0, 0.0, 10_000.0);
+    let opaque_pos = GeoPosition::sea_level(0.0, 0.0, 100_000.0);
+
+    let _near_id = world.spawn(
+        EarthObject::new(near_pos, EarthGeometry::cube(100.0))
+            .with_material(EarthMaterial::standard(Color::rgba(255, 0, 0, 128))),
+    );
+    let _far_id = world.spawn(
+        EarthObject::new(far_pos, EarthGeometry::cube(100.0))
+            .with_material(EarthMaterial::standard(Color::rgba(0, 255, 0, 128))),
+    );
+    let tex_mat = EarthMaterial::standard(Color::rgba(255, 255, 255, 255))
+        .with_albedo_rgba8(1, 1, vec![10, 20, 30, 255]);
+    let _opaque_id = world
+        .spawn(EarthObject::new(opaque_pos, EarthGeometry::cube(100.0)).with_material(tex_mat));
+
+    // Eye is along +X at 8,000,000 m (directly above lat=0, lon=0)
+    let eye = strata_render::camera64::DVec3::new(8_000_000.0, 0.0, 0.0);
+    let morph = SurfaceMorphParams {
+        focus: Geodetic::new(0.0, 0.0, 0.0),
+        flat_blend: 0.0,
+        map_2d_morph: 0.0,
+        projection: TileProjection::default(),
+    };
+    let (_assets, instances) =
+        world.compile_retained(eye, 900.0, 55.0, false, morph, &|_, _| 0.0);
+    assert_eq!(instances.len(), 3);
+    // Opaque object must come first and carry its albedo texture
+    assert!((instances[0].base_color[3] - 1.0).abs() < 1e-4);
+    assert!(instances[0].albedo_texture.is_some());
+    // Among transparent objects, far_pos (smaller X) must precede near_pos (larger X)
+    assert!(
+        instances[1].anchor_ecef[0] < instances[2].anchor_ecef[0],
+        "transparent objects must be depth-sorted back-to-front relative to camera eye"
+    );
+}
+
+#[test]
+fn test_custom_mesh_out_of_bounds_indices_rejected_without_raycast_panic() {
+    use strata_earth::{
+        raycast_viewport, EarthGeometry, EarthObject, EarthVertex, EarthWorld, GeoPosition,
+        Geodetic, SurfaceMorphParams, TileProjection,
+    };
+
+    let mut world = EarthWorld::new();
+    let pos = GeoPosition::sea_level(0.0, 0.0, 0.0);
+    world.spawn(EarthObject::new(
+        pos,
+        EarthGeometry::CustomMesh {
+            vertices: vec![
+                EarthVertex::new([-100.0, -100.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0]),
+                EarthVertex::new([100.0, -100.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0]),
+                EarthVertex::new([0.0, 100.0, 100.0], [0.0, 0.0, 1.0], [0.5, 1.0]),
+            ],
+            indices: vec![0, 1, 2, 0, 99, u32::MAX],
+        },
+    ));
+
+    let mut inp = viewpoint(500.0);
+    inp.camera.focus = Geodetic::new(0.0, 0.0, 0.0);
+    inp.camera.eye_offset_m = [0.0, 0.0, 500.0];
+    inp.camera.aim_offset_m = [0.0, 0.0, 0.0];
+    let morph = SurfaceMorphParams {
+        focus: inp.camera.focus,
+        flat_blend: 0.0,
+        map_2d_morph: 0.0,
+        projection: TileProjection::default(),
+    };
+    let hit = raycast_viewport(
+        400.0,
+        300.0,
+        800.0,
+        600.0,
+        &inp.camera,
+        None,
+        false,
+        morph,
+        Some(&world),
+        &|_, _| 0.0,
+    );
+    assert!(
+        hit.is_some(),
+        "valid triangle should still be hit without panicking on invalid indices"
+    );
+}
+
+#[test]
+fn test_open_meteo_500hpa_url_and_offline_failure_backoff() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use strata_earth::{
+        AtmosphereConfig, AtmosphereQuery, BaseWeatherConfig, HttpTransport,
+        OpenMeteoTemperatureProvider, OpenMeteoWeatherProvider, TemperatureProvider, TileError,
+        WeatherProvider, WeatherQuery,
+    };
+
+    #[derive(Debug)]
+    struct CountingFailTransport {
+        calls: Arc<AtomicUsize>,
+        last_url: std::sync::Mutex<String>,
+    }
+
+    impl HttpTransport for CountingFailTransport {
+        fn fetch(&self, url: &str) -> Result<Vec<u8>, TileError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut g) = self.last_url.lock() {
+                *g = url.to_string();
+            }
+            Err(TileError::Decode("simulated offline error".to_string()))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let transport = Arc::new(CountingFailTransport {
+        calls: Arc::clone(&calls),
+        last_url: std::sync::Mutex::new(String::new()),
+    });
+    let provider = OpenMeteoWeatherProvider::with_transport(transport.clone())
+        .with_failure_backoff(Duration::from_secs(60));
+
+    let query = WeatherQuery {
+        lat_deg: 46.57,
+        lon_deg: 7.98,
+        altitude_msl_m: 2500.0,
+        ground_elevation_m: 1200.0,
+        unix_utc_s: 1_735_689_600.0,
+    };
+    let fallback_cfg = BaseWeatherConfig::default();
+
+    // Call sample across 10 consecutive simulated frames while offline
+    for _ in 0..10 {
+        let _ = provider.sample(query, &fallback_cfg);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let total_calls = calls.load(Ordering::SeqCst);
+    assert_eq!(
+        total_calls, 1,
+        "offline OpenMeteoWeatherProvider must back off after failure instead of spawning a thread every frame"
+    );
+    let url = transport.last_url.lock().unwrap().clone();
+    assert!(
+        url.contains("wind_speed_500hPa") && url.contains("wind_direction_500hPa"),
+        "Open-Meteo query URL must include 500hPa wind speed and direction: {url}"
+    );
+
+    // Same backoff guarantee for OpenMeteoTemperatureProvider
+    let temp_calls = Arc::new(AtomicUsize::new(0));
+    let temp_transport = Arc::new(CountingFailTransport {
+        calls: Arc::clone(&temp_calls),
+        last_url: std::sync::Mutex::new(String::new()),
+    });
+    let temp_provider = OpenMeteoTemperatureProvider::with_transport(temp_transport)
+        .with_failure_backoff(Duration::from_secs(60));
+    let atm_query = AtmosphereQuery {
+        lat_deg: 46.57,
+        lon_deg: 7.98,
+        altitude_msl_m: 2500.0,
+        ground_elevation_m: 1200.0,
+    };
+    let atm_fallback = AtmosphereConfig::default();
+    for _ in 0..10 {
+        let _ = temp_provider.sample(atm_query, &atm_fallback);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        temp_calls.load(Ordering::SeqCst),
+        1,
+        "offline OpenMeteoTemperatureProvider must back off after failure"
+    );
+}
+
+#[test]
+fn test_above_ground_cloud_ceiling_optics_gpu_buildings_graticule_object_labels_and_earth_view_setters() {
+    use strata_earth::{
+        BuildingFootprint, CloudCeiling, EarthGeometry, EarthObject, EarthPluginRegistry,
+        EarthViewport, GeoPosition, MemoryBuildingSource, MemoryTileSource, RetainedTerrainBuilder,
+    };
+
+    // 1. Verify CloudCeiling::AboveGround uses ground_elevation_m in resolve_weather_optics
+    let mut input = viewpoint(4_500.0);
+    input.precipitation.enabled = true;
+    input.precipitation.intensity = 0.9;
+    input.precipitation.respect_cloud_ceiling = true;
+    input.precipitation.atmosphere.cloud_ceiling = CloudCeiling::AboveGround(2_000.0);
+    let plugins = EarthPluginRegistry::standard();
+
+    // At sea level (ground=0m), ceiling is 2,000m MSL, so camera at 4,500m is ABOVE ceiling (zero storm darkening)
+    let cam_sea = RetainedTerrainBuilder::camera_from_input_with_plugins_weather_and_ground(
+        &input, &plugins, 0.0, 1, false, None, 0.0,
+    );
+    // Over 3,500m mountains, ceiling is 5,500m MSL, so camera at 4,500m is BELOW ceiling (storm darkening active)
+    let cam_mtn = RetainedTerrainBuilder::camera_from_input_with_plugins_weather_and_ground(
+        &input, &plugins, 0.0, 1, false, None, 3_500.0,
+    );
+    assert!(
+        cam_mtn.weather_darkness > cam_sea.weather_darkness + 0.2,
+        "AboveGround cloud ceiling over 3500m terrain must darken sky at 4500m camera altitude (got mtn={}, sea={})",
+        cam_mtn.weather_darkness,
+        cam_sea.weather_darkness
+    );
+
+    // 2. Verify GPU buildings and graticule dynamic meshes in RetainedTerrainBuilder
+    let mut b_input = viewpoint(1_200.0);
+    b_input.layers.buildings = true;
+    b_input.layers.graticule = true;
+    b_input.graticule_step_deg = 15.0;
+    let mut b_source = MemoryBuildingSource::new();
+    b_source.push(BuildingFootprint::new(
+        b_input.camera.focus.lat_deg,
+        b_input.camera.focus.lon_deg,
+        (40.0, 30.0),
+        85.0,
+    ));
+    let mut tile_src = MemoryTileSource::new();
+    let mut builder = RetainedTerrainBuilder::new();
+    builder.set_building_source(Some(Box::new(b_source)));
+    let (frame, _) = builder.build_frame(&b_input, &mut tile_src, 1, true);
+    assert!(
+        frame.dynamic_meshes.len() >= 2,
+        "RetainedTerrainBuilder must emit GPU dynamic meshes for both buildings and graticule (got {})",
+        frame.dynamic_meshes.len()
+    );
+
+    // 3. Verify EarthViewport object label projection and layer toggles
+    let mut vp = EarthViewport::new(&viewpoint(2_000.0), Box::new(MemoryTileSource::new()));
+    vp.set_buildings_enabled(true);
+    assert!(vp.buildings_enabled());
+    vp.set_graticule_enabled(false);
+    assert!(!vp.graticule_enabled());
+    let focus = vp.input().camera.focus;
+    let vp_obj = vp.spawn_object(
+        EarthObject::new(
+            GeoPosition::sea_level(focus.lat_deg, focus.lon_deg, 10.0),
+            EarthGeometry::sphere(15.0),
+        )
+        .with_label("ALPHA-UAV-01"),
+    );
+    let projected = vp.project_object_labels();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].text, "ALPHA-UAV-01");
+    assert!(vp.remove_object(vp_obj));
+
+    // 4. Verify EarthView top-level convenience setters when widget feature is active
+    #[cfg(feature = "widget")]
+    {
+        use strata_earth::{
+            EarthView, EarthViewMode, SpaceEnvironmentConfig, TileProviderPreset, WeatherConfig,
+        };
+        let view = EarthView::new(&viewpoint(2_000.0), Box::new(MemoryTileSource::new()));
+        view.set_labels_enabled(false);
+        assert!(!view.labels_enabled());
+        view.set_buildings_enabled(true);
+        assert!(view.buildings_enabled());
+        view.set_graticule_enabled(false);
+        assert!(!view.graticule_enabled());
+        view.set_sim_time_unix_s(1_740_000_000.0);
+        assert!((view.sim_time_unix_s() - 1_740_000_000.0).abs() < 1e-3);
+        view.set_space_config(SpaceEnvironmentConfig::default());
+        view.set_weather_config(WeatherConfig::default());
+        view.set_tile_preset(TileProviderPreset::OpenStreetMap);
+        view.set_view_mode_immediate(EarthViewMode::Mode3D);
+        assert_eq!(view.view_mode(), EarthViewMode::Mode3D);
+    }
+}

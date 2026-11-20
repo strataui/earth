@@ -2,18 +2,19 @@
 
 use crate::astro::{build_environment_assets_with_skybox, GlobalCloudMapStore};
 use crate::geodesy::{
-    build_tile_local_rtc_mesh_morphed, level_for_altitude, retained_camera_uniforms_with_up,
-    stabilized_surface_morph, tile_bounding_sphere, tile_bounds, tile_bounds_mercator,
-    traverse_quadtree_lod_2d_flat, traverse_quadtree_lod_frustum6_projected_with_up, wgs84,
-    EarthCamera, Frustum6, Geodetic, LocalFrame, PatchBounds, SurfaceMorphParams, TileKey,
-    TileProjection, MAX_QUADTREE_LEAVES,
+    build_tile_local_rtc_mesh_morphed, is_canonical_2d_morph, level_for_altitude,
+    retained_camera_uniforms_for_morph, screen_to_ray_for_morph, stabilized_surface_morph,
+    tile_bounding_sphere, tile_bounds, tile_bounds_mercator, traverse_quadtree_lod_2d_flat,
+    traverse_quadtree_lod_frustum6_with_elevation, wgs84, EarthCamera, Frustum6, Geodetic,
+    LocalFrame, PatchBounds, SurfaceMorphParams, TileKey, TileProjection,
+    CANONICAL_2D_MORPH_THRESHOLD, MAX_QUADTREE_LEAVES,
 };
 use crate::gltf::WeatherConfig;
 use crate::plugins::{
-    CachedPluginTexEntry, EarthDynamicOverlayContext, EarthParticleContext, EarthPlugin,
-    EarthPluginFrameContext, EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector,
-    EarthTileBuildContext, EarthWorldBuildContext, LoadedTileImagerySnapshot, OceanWavesPlugin,
-    WeatherPlugin,
+    CachedPluginTexEntry, EarthDynamicOverlayContext, EarthOceanContext, EarthParticleContext,
+    EarthPlugin, EarthPluginFrameContext, EarthPluginHooks, EarthPluginRegistry,
+    EarthTextureInjector, EarthTileBuildContext, EarthWorldBuildContext,
+    LoadedTileImagerySnapshot, OceanWavesPlugin, WeatherPlugin,
 };
 use crate::precipitation::{
     AtmosphereSample, PrecipitationConfig, PrecipitationEvaluator, PrecipitationPlugin,
@@ -23,12 +24,17 @@ use crate::raycast::{raycast_surface_ray, raycast_viewport, EarthRayHit};
 use crate::satellites::{SatelliteCatalogStore, SatelliteElement};
 use crate::scene::{
     compute_adaptive_skirt_depth, requested_tile, sky_gradient, surrounding_patches,
-    tile_patch_span_deg, EarthInput, EarthLowLevelState, EarthViewMode, OceanWavesConfig,
-    SpaceEnvironmentConfig, SurfaceMode,
+    tile_patch_span_deg, EarthInput, EarthLowLevelState, EarthViewMode, IdleHighResConfig,
+    LocalAtmosphereConfig, OceanWavesConfig, SpaceEnvironmentConfig, SurfaceMode,
 };
 use crate::skybox::SpaceSkyboxStore;
 use crate::tiles::{
+    stitch_elevation_with_neighbors, synthesize_elevation_from_neighbors, NeighborElevationEdges,
     TileElevation, TileImage, TileProviderConfig, TileProviderPreset, TileSource,
+};
+use crate::weather_api::{
+    BaseWeatherConfig, OpenMeteoWeatherProvider, StaticWeatherProvider, WeatherProvider,
+    WeatherQuery, WeatherSnapshot,
 };
 use crate::world::{EarthObject, EarthObjectId, EarthWorld, ResolvedObjectTransform};
 use std::collections::{HashMap, HashSet};
@@ -38,10 +44,41 @@ use std::thread::JoinHandle;
 use strata_render::camera64::DVec3;
 use strata_render::scene3d::{
     Background3D, RetainedCameraUniforms, RetainedDynamicMesh, RetainedEnvironmentAssets,
-    RetainedParticleLayer, RetainedScene3D, RetainedTerrainFrame, RetainedTileInstance,
-    RetainedTileMesh, RetainedTileTexture, TileKeyId,
+    RetainedOceanSurface, RetainedParticleLayer, RetainedScene3D, RetainedTerrainFrame,
+    RetainedTileInstance, RetainedTileMesh, RetainedTileTexture, TileKeyId,
 };
 use strata_style::types::Color;
+
+fn evaluate_base_weather_snapshot(
+    input: &EarthInput,
+    ground_elev_m: f64,
+    custom_provider: Option<&Arc<dyn WeatherProvider>>,
+    live_provider: Option<&OpenMeteoWeatherProvider>,
+) -> Option<WeatherSnapshot> {
+    if !input.base_weather.enabled {
+        return None;
+    }
+    let (_, _, unix_utc_s) = input.resolved_celestial_state();
+    let query = WeatherQuery {
+        lat_deg: input.camera.focus.lat_deg,
+        lon_deg: input.camera.focus.lon_deg,
+        altitude_msl_m: input.camera.altitude_m().max(0.0),
+        ground_elevation_m: ground_elev_m.max(0.0),
+        unix_utc_s,
+    };
+    let snap = if let Some(provider) = custom_provider {
+        provider.sample(query, &input.base_weather)
+    } else if input.base_weather.use_live_api {
+        if let Some(live) = live_provider {
+            live.sample(query, &input.base_weather)
+        } else {
+            StaticWeatherProvider.sample(query, &input.base_weather)
+        }
+    } else {
+        StaticWeatherProvider.sample(query, &input.base_weather)
+    };
+    Some(snap)
+}
 
 #[inline]
 fn hash_bytes_64(bytes: &[u8]) -> u64 {
@@ -259,6 +296,23 @@ fn record_frame_elevation(
     frame_elevs.insert(elev_tile, arc);
 }
 
+#[inline]
+fn tile_sub_uv_in_ancestor(child: TileKey, ancestor: TileKey) -> (f32, f32, f32, f32) {
+    let dl = child.level.saturating_sub(ancestor.level);
+    if dl == 0 {
+        return (0.0, 0.0, 1.0, 1.0);
+    }
+    let shift = dl.min(24);
+    let scale = (1u64 << shift) as f64;
+    let dx = (child.x as u64).saturating_sub((ancestor.x as u64) << shift) as f64;
+    let dy = (child.y as u64).saturating_sub((ancestor.y as u64) << shift) as f64;
+    let u0 = (dx / scale).clamp(0.0, 1.0) as f32;
+    let v0 = (dy / scale).clamp(0.0, 1.0) as f32;
+    let u1 = ((dx + 1.0) / scale).clamp(0.0, 1.0) as f32;
+    let v1 = ((dy + 1.0) / scale).clamp(0.0, 1.0) as f32;
+    (u0, v0, u1, v1)
+}
+
 /// Persistent CPU cache converting visible LOD leaves into GPU-ready tile-local RTC meshes and textures.
 pub struct RetainedTerrainBuilder {
     meshes: HashMap<(TileKeyId, u32, bool), CachedMeshEntry>,
@@ -266,6 +320,7 @@ pub struct RetainedTerrainBuilder {
     night_textures: HashMap<TileKey, CachedTexEntry>,
     plugin_textures: HashMap<u64, CachedPluginTexEntry>,
     cached_elev_arcs: HashMap<TileKey, (u64, Arc<TileElevation>)>,
+    elev_mean_cache: HashMap<(TileKey, u64), f64>,
     ground_snapshot: Option<Arc<RwLock<GroundElevSnapshot>>>,
     world: Arc<RwLock<EarthWorld>>,
     next_tex_id: u64,
@@ -276,6 +331,12 @@ pub struct RetainedTerrainBuilder {
     skybox_store: Arc<SpaceSkyboxStore>,
     plugins: EarthPluginRegistry,
     include_particles: bool,
+    include_ocean: bool,
+    weather_provider: Option<Arc<dyn WeatherProvider>>,
+    building_source: Option<Box<dyn crate::scene::BuildingSource + Send>>,
+    last_buildings_mesh: Option<Arc<RwLock<Option<RetainedDynamicMesh>>>>,
+    dynamic_mesh_id_base: u64,
+    live_weather: OpenMeteoWeatherProvider,
     last_plugin_rev: u64,
     last_ocean_waves: OceanWavesConfig,
     weather_ids: HashMap<u64, u64>,
@@ -285,6 +346,9 @@ pub struct RetainedTerrainBuilder {
     last_skybox_rev: u64,
     cached_env: Option<((u64, u64), Arc<RetainedEnvironmentAssets>)>,
 }
+
+static NEXT_BUILDER_TEX_ID_BLOCK: AtomicU64 = AtomicU64::new(1);
+static NEXT_BUILDER_DYN_MESH_ID_BLOCK: AtomicU64 = AtomicU64::new(0x9E48_0000);
 
 impl std::fmt::Debug for RetainedTerrainBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -337,15 +401,18 @@ impl RetainedTerrainBuilder {
     ) -> Self {
         let plugins = EarthPluginRegistry::standard();
         let last_plugin_rev = plugins.revision();
+        let next_tex_id = NEXT_BUILDER_TEX_ID_BLOCK.fetch_add(1_000_000_000, Ordering::Relaxed);
+        let dynamic_mesh_id_base = NEXT_BUILDER_DYN_MESH_ID_BLOCK.fetch_add(16, Ordering::Relaxed);
         Self {
             meshes: HashMap::new(),
             textures: HashMap::new(),
             night_textures: HashMap::new(),
             plugin_textures: HashMap::new(),
             cached_elev_arcs: HashMap::new(),
+            elev_mean_cache: HashMap::new(),
             ground_snapshot: Some(Arc::new(RwLock::new(GroundElevSnapshot::default()))),
             world: Arc::new(RwLock::new(EarthWorld::new())),
-            next_tex_id: 1,
+            next_tex_id,
             next_revision: 1,
             frame_counter: 0,
             cloud_store,
@@ -353,6 +420,12 @@ impl RetainedTerrainBuilder {
             skybox_store,
             plugins,
             include_particles: true,
+            include_ocean: true,
+            weather_provider: None,
+            building_source: None,
+            last_buildings_mesh: None,
+            dynamic_mesh_id_base,
+            live_weather: OpenMeteoWeatherProvider::new(),
             last_plugin_rev,
             last_ocean_waves: OceanWavesConfig::default(),
             weather_ids: HashMap::new(),
@@ -377,6 +450,38 @@ impl RetainedTerrainBuilder {
 
     pub(crate) fn set_include_particles(&mut self, include: bool) {
         self.include_particles = include;
+    }
+
+    pub(crate) fn set_include_ocean(&mut self, include: bool) {
+        self.include_ocean = include;
+    }
+
+    pub fn set_weather_provider(&mut self, provider: Option<Arc<dyn WeatherProvider>>) {
+        self.weather_provider = provider;
+    }
+
+    /// Installs or clears a [`crate::scene::BuildingSource`] used when `input.layers.buildings` is `true`.
+    pub fn set_building_source(
+        &mut self,
+        source: Option<Box<dyn crate::scene::BuildingSource + Send>>,
+    ) {
+        self.building_source = source;
+    }
+
+    pub(crate) fn set_last_buildings_mesh(
+        &mut self,
+        slot: Arc<RwLock<Option<RetainedDynamicMesh>>>,
+    ) {
+        self.last_buildings_mesh = Some(slot);
+    }
+
+    pub(crate) fn set_dynamic_mesh_id_base(&mut self, base: u64) {
+        self.dynamic_mesh_id_base = base;
+    }
+
+    pub(crate) fn set_deterministic_ids_for_cpu_scene(&mut self) {
+        self.next_tex_id = 1;
+        self.dynamic_mesh_id_base = 0x9E48_0000;
     }
 
     pub fn register_plugin<P: EarthPlugin>(&mut self, plugin: P) {
@@ -407,6 +512,57 @@ impl RetainedTerrainBuilder {
             .unwrap_or(0.0)
     }
 
+    /// Computes the average heightmap altitude in metres for `key` from already-loaded DEM
+    /// tiles (or their nearest loaded ancestor over `key`'s exact UV footprint), returning
+    /// `0.0` (sea level) whenever `elevation_enabled == false` or no DEM tile is loaded yet.
+    ///
+    /// Never triggers network I/O (`peek_cached_elevation` only).
+    pub(crate) fn tile_average_altitude_m(
+        &mut self,
+        key: TileKey,
+        elevation_enabled: bool,
+        source: &dyn TileSource,
+    ) -> f64 {
+        if !elevation_enabled {
+            return 0.0;
+        }
+        let mut probe = key;
+        loop {
+            if let Some((h, elev_arc)) = self.cached_elev_arcs.get(&probe) {
+                let h_val = *h;
+                let elev_arc = Arc::clone(elev_arc);
+                return if probe == key {
+                    *self
+                        .elev_mean_cache
+                        .entry((probe, h_val))
+                        .or_insert_with(|| elev_arc.average_elevation_m())
+                } else {
+                    let (u0, v0, u1, v1) = tile_sub_uv_in_ancestor(key, probe);
+                    elev_arc.average_elevation_in_uv_rect_m(u0, v0, u1, v1)
+                };
+            }
+            if let Some(elev) = source.peek_cached_elevation(probe) {
+                let h_val = hash_elevation_64(Some(&elev));
+                let elev_arc = Arc::new(elev);
+                self.cached_elev_arcs
+                    .insert(probe, (h_val, Arc::clone(&elev_arc)));
+                return if probe == key {
+                    let mean = elev_arc.average_elevation_m();
+                    self.elev_mean_cache.insert((probe, h_val), mean);
+                    mean
+                } else {
+                    let (u0, v0, u1, v1) = tile_sub_uv_in_ancestor(key, probe);
+                    elev_arc.average_elevation_in_uv_rect_m(u0, v0, u1, v1)
+                };
+            }
+            let Some(parent) = probe.parent() else {
+                break;
+            };
+            probe = parent;
+        }
+        0.0
+    }
+
     /// Clears cached GPU tile textures (and optionally elevation meshes) when switching tile providers.
     pub fn clear_provider_caches(&mut self, clear_elevation: bool) {
         self.textures.clear();
@@ -415,6 +571,7 @@ impl RetainedTerrainBuilder {
         if clear_elevation {
             self.meshes.clear();
             self.cached_elev_arcs.clear();
+            self.elev_mean_cache.clear();
             if let Some(ref snap_lock) = self.ground_snapshot {
                 if let Ok(mut guard) = snap_lock.write() {
                     *guard = GroundElevSnapshot::default();
@@ -498,8 +655,15 @@ impl RetainedTerrainBuilder {
         } else {
             input.camera_up_ecef.map(|u| DVec3::new(u[0], u[1], u[2]))
         };
-        let mut u = retained_camera_uniforms_with_up(
+        let morph = stabilized_morph_params(
+            cam.focus,
+            flat_t as f64,
+            map_t,
+            input.tile_projection,
+        );
+        let mut u = retained_camera_uniforms_for_morph(
             &cam,
+            morph,
             up_override,
             input.viewport.width as f64,
             input.viewport.height as f64,
@@ -523,6 +687,49 @@ impl RetainedTerrainBuilder {
         u
     }
 
+    pub fn camera_from_input_with_plugins_weather_and_ground(
+        input: &EarthInput,
+        plugins: &EarthPluginRegistry,
+        time_s: f64,
+        overlay_rev: u64,
+        is_dragging: bool,
+        weather_snapshot: Option<WeatherSnapshot>,
+        ground_elevation_m: f64,
+    ) -> RetainedCameraUniforms {
+        let mut u = Self::base_camera_from_input(input);
+        let ctx = EarthPluginFrameContext {
+            input,
+            low_level: input.low_level_state(),
+            altitude_m: input.camera.altitude_m(),
+            ground_elevation_m,
+            time_s,
+            overlay_rev,
+            is_dragging,
+            weather_snapshot,
+        };
+        plugins.run_prepare_camera(&ctx, &mut u);
+        u
+    }
+
+    pub fn camera_from_input_with_plugins_and_weather(
+        input: &EarthInput,
+        plugins: &EarthPluginRegistry,
+        time_s: f64,
+        overlay_rev: u64,
+        is_dragging: bool,
+        weather_snapshot: Option<WeatherSnapshot>,
+    ) -> RetainedCameraUniforms {
+        Self::camera_from_input_with_plugins_weather_and_ground(
+            input,
+            plugins,
+            time_s,
+            overlay_rev,
+            is_dragging,
+            weather_snapshot,
+            0.0,
+        )
+    }
+
     pub fn camera_from_input_with_plugins(
         input: &EarthInput,
         plugins: &EarthPluginRegistry,
@@ -530,28 +737,29 @@ impl RetainedTerrainBuilder {
         overlay_rev: u64,
         is_dragging: bool,
     ) -> RetainedCameraUniforms {
-        let mut u = Self::base_camera_from_input(input);
-        let ctx = EarthPluginFrameContext {
+        let weather_snapshot = evaluate_base_weather_snapshot(input, 0.0, None, None);
+        Self::camera_from_input_with_plugins_and_weather(
             input,
-            low_level: input.low_level_state(),
-            altitude_m: input.camera.altitude_m(),
+            plugins,
             time_s,
             overlay_rev,
             is_dragging,
-        };
-        plugins.run_prepare_camera(&ctx, &mut u);
-        u
+            weather_snapshot,
+        )
     }
 
     pub fn camera_from_input(input: &EarthInput) -> RetainedCameraUniforms {
         let mut u = Self::base_camera_from_input(input);
+        let weather_snapshot = evaluate_base_weather_snapshot(input, 0.0, None, None);
         let ctx = EarthPluginFrameContext {
             input,
             low_level: input.low_level_state(),
             altitude_m: input.camera.altitude_m(),
+            ground_elevation_m: 0.0,
             time_s: input.weather.weather_time_s,
             overlay_rev: 0,
             is_dragging: false,
+            weather_snapshot,
         };
         crate::plugins::CelestialPlugin::default().on_prepare_camera(&ctx, &mut u);
         crate::plugins::CityLightsPlugin::default().on_prepare_camera(&ctx, &mut u);
@@ -819,9 +1027,10 @@ impl RetainedTerrainBuilder {
     }
 
     fn prune_lru_caches(&mut self) {
-        const MAX_CACHED_MESHES: usize = 512;
-        const MAX_CACHED_TEXTURES: usize = 768;
+        const MAX_CACHED_MESHES: usize = 768;
+        const MAX_CACHED_TEXTURES: usize = 1024;
         const MAX_CACHED_NIGHT: usize = 256;
+        const MAX_CACHED_ELEV_MEANS: usize = 1024;
 
         fn trim_oldest<K: Clone + Eq + std::hash::Hash, V>(
             map: &mut HashMap<K, V>,
@@ -847,6 +1056,48 @@ impl RetainedTerrainBuilder {
         trim_oldest(&mut self.textures, MAX_CACHED_TEXTURES, |t| t.last_used_frame);
         trim_oldest(&mut self.night_textures, MAX_CACHED_NIGHT, |t| t.last_used_frame);
         trim_oldest(&mut self.plugin_textures, MAX_CACHED_TEXTURES, |t| t.last_used_frame);
+        if self.elev_mean_cache.len() > MAX_CACHED_ELEV_MEANS {
+            self.elev_mean_cache.clear();
+        }
+    }
+
+    fn downsample_cached_children(
+        key: TileKey,
+        res: u32,
+        source: &dyn TileSource,
+    ) -> Option<TileElevation> {
+        if key.level >= 15 {
+            return None;
+        }
+        let mut kids: [Option<TileElevation>; 4] = [None, None, None, None];
+        for (q, slot) in kids.iter_mut().enumerate() {
+            let ck = key.child(q as u8)?;
+            *slot = Some(source.peek_cached_elevation(ck)?);
+        }
+        let n = res.clamp(2, 65) as usize;
+        let denom = (n - 1) as f32;
+        let mut heights_m = Vec::with_capacity(n * n);
+        for row in 0..n {
+            let v = row as f32 / denom;
+            let qy = if v >= 0.5 { 1usize } else { 0usize };
+            let cv = (v * 2.0 - qy as f32).clamp(0.0, 1.0);
+            for col in 0..n {
+                let u = col as f32 / denom;
+                let qx = if u >= 0.5 { 1usize } else { 0usize };
+                let cu = (u * 2.0 - qx as f32).clamp(0.0, 1.0);
+                let q_idx = (qy << 1) | qx;
+                let h = kids[q_idx]
+                    .as_ref()
+                    .map(|k| k.sample_bilinear(cu, cv))
+                    .unwrap_or(0.0);
+                heights_m.push(h);
+            }
+        }
+        Some(TileElevation {
+            width: n as u32,
+            height: n as u32,
+            heights_m,
+        })
     }
 
     fn resolve_elevation_or_ancestor(
@@ -877,17 +1128,452 @@ impl RetainedTerrainBuilder {
             if let Some(elev) = source.peek_cached_elevation(a) {
                 return Ok((Some(elev), a));
             }
+            if let Some((_, arc)) = self.cached_elev_arcs.get(&a) {
+                return Ok((Some((**arc).clone()), a));
+            }
             anc = a.parent();
         }
-        if probe.level > 11 {
-            if let Some(p11) = Self::ancestor_at_level(probe, 11) {
-                if let Ok(Some(elev)) = source.elevation(p11) {
-                    return Ok((Some(elev), p11));
+        if probe.level > 6 {
+            let step_lvl = if probe.level > 11 {
+                11
+            } else {
+                probe.level.saturating_sub(3).max(5)
+            };
+            if let Some(step) = Self::ancestor_at_level(probe, step_lvl) {
+                if let Ok(Some(elev)) = source.elevation(step) {
+                    return Ok((Some(elev), step));
                 }
             }
         }
         Ok((None, key))
     }
+}
+
+#[derive(Clone)]
+struct ResolvedLeafElev {
+    elev_tile: TileKey,
+    is_exact: bool,
+    is_synthesized: bool,
+    elev_err: bool,
+    elev: Option<Arc<TileElevation>>,
+    elev_hash: u64,
+}
+
+fn fill_partial_edge_samples(
+    samples: &[Option<f32>],
+    fallback: Option<&[f32]>,
+) -> Option<Vec<f32>> {
+    let n = samples.len();
+    if n < 2 {
+        return None;
+    }
+    let any_present = samples.iter().any(|s| s.is_some());
+    if !any_present {
+        return None;
+    }
+    if let Some(fb) = fallback {
+        if fb.len() == n {
+            return Some(
+                samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| s.unwrap_or(fb[i]))
+                    .collect(),
+            );
+        }
+    }
+    // Linearly bridge any missing sub-segments along a partially loaded neighbor edge.
+    let mut out = vec![0.0f32; n];
+    let mut first_valid: Option<usize> = None;
+    for (i, s) in samples.iter().enumerate() {
+        if let Some(v) = *s {
+            out[i] = v;
+            if first_valid.is_none() {
+                first_valid = Some(i);
+            }
+        }
+    }
+    let first = first_valid?;
+    for i in 0..first {
+        out[i] = out[first];
+    }
+    let mut prev = first;
+    for i in (first + 1)..n {
+        if samples[i].is_some() {
+            let span = (i - prev) as f32;
+            if i > prev + 1 {
+                let a = out[prev];
+                let b = out[i];
+                for j in (prev + 1)..i {
+                    let t = (j - prev) as f32 / span;
+                    out[j] = a + (b - a) * t;
+                }
+            }
+            prev = i;
+        }
+    }
+    for i in (prev + 1)..n {
+        out[i] = out[prev];
+    }
+    Some(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn peek_source_or_cached_elev<'a>(
+    key: TileKey,
+    peek_cache: &'a mut HashMap<TileKey, Option<Arc<TileElevation>>>,
+    cached_arcs: &HashMap<TileKey, (u64, Arc<TileElevation>)>,
+    source: &dyn TileSource,
+) -> Option<Arc<TileElevation>> {
+    if let Some(entry) = peek_cache.get(&key) {
+        return entry.clone();
+    }
+    let found = source
+        .peek_cached_elevation(key)
+        .map(Arc::new)
+        .or_else(|| cached_arcs.get(&key).map(|(_, a)| Arc::clone(a)));
+    peek_cache.insert(key, found.clone());
+    found
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_child_hierarchy_uv(
+    parent: TileKey,
+    u: f32,
+    v: f32,
+    depth: u8,
+    min_level: u8,
+    allow_synthesized: bool,
+    working: &HashMap<TileKey, ResolvedLeafElev>,
+    peek_cache: &mut HashMap<TileKey, Option<Arc<TileElevation>>>,
+    cached_arcs: &HashMap<TileKey, (u64, Arc<TileElevation>)>,
+    source: &dyn TileSource,
+) -> Option<f32> {
+    let qx0: u8 = if u >= 0.5 { 1 } else { 0 };
+    let qy0: u8 = if v >= 0.5 { 1 } else { 0 };
+    let mut candidates = [(qx0, qy0); 4];
+    let mut count = 1usize;
+    let on_x_mid = (u - 0.5).abs() < 1e-4;
+    let on_y_mid = (v - 0.5).abs() < 1e-4;
+    if on_x_mid {
+        candidates[count] = (1 - qx0, qy0);
+        count += 1;
+    }
+    if on_y_mid {
+        candidates[count] = (qx0, 1 - qy0);
+        count += 1;
+    }
+    if on_x_mid && on_y_mid {
+        candidates[count] = (1 - qx0, 1 - qy0);
+        count += 1;
+    }
+    for &(qx, qy) in &candidates[..count] {
+        let Some(child) = parent.child((qy << 1) | qx) else {
+            continue;
+        };
+        let cu = (u * 2.0 - qx as f32).clamp(0.0, 1.0);
+        let cv = (v * 2.0 - qy as f32).clamp(0.0, 1.0);
+        if child.level >= min_level {
+            if let Some(w) = working.get(&child) {
+                if w.elev_tile == child && (allow_synthesized || !w.is_synthesized) {
+                    if let Some(ref e) = w.elev {
+                        return Some(e.sample_bilinear(cu, cv));
+                    }
+                }
+            }
+            if let Some(e) = peek_source_or_cached_elev(child, peek_cache, cached_arcs, source) {
+                return Some(e.sample_bilinear(cu, cv));
+            }
+        }
+        if depth > 0 {
+            if let Some(h) = sample_child_hierarchy_uv(
+                child,
+                cu,
+                cv,
+                depth - 1,
+                min_level,
+                allow_synthesized,
+                working,
+                peek_cache,
+                cached_arcs,
+                source,
+            ) {
+                return Some(h);
+            }
+        }
+    }
+    None
+}
+
+/// Samples elevation for neighbor tile `nk` at normalized tile UV `(u, v)` from same-level,
+/// finer subdivided child (`z+1..z+2`), or coarser ancestor (`>= min_level`) elevation data.
+#[allow(clippy::too_many_arguments)]
+fn sample_tile_uv_from_hierarchy(
+    nk: TileKey,
+    u: f32,
+    v: f32,
+    min_level: u8,
+    allow_synthesized: bool,
+    working: &HashMap<TileKey, ResolvedLeafElev>,
+    peek_cache: &mut HashMap<TileKey, Option<Arc<TileElevation>>>,
+    cached_arcs: &HashMap<TileKey, (u64, Arc<TileElevation>)>,
+    source: &dyn TileSource,
+) -> Option<f32> {
+    // 1. Same-level tile (exact or working frame tile).
+    if nk.level >= min_level {
+        if let Some(w) = working.get(&nk) {
+            if w.elev_tile.level >= min_level && (allow_synthesized || !w.is_synthesized) {
+                if let Some(ref e) = w.elev {
+                    if w.elev_tile == nk {
+                        return Some(e.sample_bilinear(u, v));
+                    }
+                    let (u0, v0, u1, v1) = tile_sub_uv_in_ancestor(nk, w.elev_tile);
+                    return Some(e.sample_bilinear(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v));
+                }
+            }
+        }
+        if let Some(e) = peek_source_or_cached_elev(nk, peek_cache, cached_arcs, source) {
+            return Some(e.sample_bilinear(u, v));
+        }
+    }
+
+    // 2. Finer subdivided children (`z+1`, `z+2`) when adjacent LOD is deeper than `leaf`.
+    if nk.level < 15 {
+        if let Some(h) = sample_child_hierarchy_uv(
+            nk,
+            u,
+            v,
+            1,
+            min_level,
+            allow_synthesized,
+            working,
+            peek_cache,
+            cached_arcs,
+            source,
+        ) {
+            return Some(h);
+        }
+    }
+
+    // 3. Coarser ancestors (`z-1` down to `min_level`) when adjacent LOD is shallower.
+    let mut anc = nk.parent();
+    while let Some(a) = anc {
+        if a.level < min_level {
+            break;
+        }
+        if let Some(w) = working.get(&a) {
+            if w.elev_tile == a && (allow_synthesized || !w.is_synthesized) {
+                if let Some(ref e) = w.elev {
+                    let (u0, v0, u1, v1) = tile_sub_uv_in_ancestor(nk, a);
+                    return Some(e.sample_bilinear(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v));
+                }
+            }
+        }
+        if let Some(e) = peek_source_or_cached_elev(a, peek_cache, cached_arcs, source) {
+            let (u0, v0, u1, v1) = tile_sub_uv_in_ancestor(nk, a);
+            return Some(e.sample_bilinear(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v));
+        }
+        anc = a.parent();
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_neighbor_edges_for_leaf(
+    leaf: TileKey,
+    res: u32,
+    min_level: u8,
+    allow_synthesized: bool,
+    include_diagonals: bool,
+    base_for_partial: Option<(&TileElevation, (f32, f32, f32, f32))>,
+    working: &HashMap<TileKey, ResolvedLeafElev>,
+    peek_cache: &mut HashMap<TileKey, Option<Arc<TileElevation>>>,
+    cached_arcs: &HashMap<TileKey, (u64, Arc<TileElevation>)>,
+    source: &dyn TileSource,
+) -> NeighborElevationEdges {
+    if leaf.level == 0 {
+        return NeighborElevationEdges::default();
+    }
+    let n = res.clamp(2, 65) as usize;
+    let denom = (n - 1) as f32;
+    let per_axis = leaf.tiles_per_axis();
+    let x_w = if leaf.x == 0 { per_axis - 1 } else { leaf.x - 1 };
+    let x_e = if leaf.x + 1 >= per_axis { 0 } else { leaf.x + 1 };
+    let y_n = leaf.y.checked_sub(1);
+    let y_s = if leaf.y + 1 < per_axis {
+        Some(leaf.y + 1)
+    } else {
+        None
+    };
+
+    let sample_base_edge = |fixed_u: Option<f32>, fixed_v: Option<f32>| -> Option<Vec<f32>> {
+        let (base, (u0, v0, u1, v1)) = base_for_partial?;
+        Some(
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / denom;
+                    let u = fixed_u.unwrap_or(t);
+                    let v = fixed_v.unwrap_or(t);
+                    base.sample_bilinear(u0 + (u1 - u0) * u, v0 + (v1 - v0) * v)
+                })
+                .collect(),
+        )
+    };
+
+    let mut edges = NeighborElevationEdges::default();
+
+    // West edge: target (u=0, v=0..1) meets West neighbor (u=1, v=0..1).
+    let wk = TileKey::new(leaf.level, x_w, leaf.y);
+    let w_raw: Vec<Option<f32>> = (0..n)
+        .map(|i| {
+            sample_tile_uv_from_hierarchy(
+                wk,
+                1.0,
+                i as f32 / denom,
+                min_level,
+                allow_synthesized,
+                working,
+                peek_cache,
+                cached_arcs,
+                source,
+            )
+        })
+        .collect();
+    let w_fb = sample_base_edge(Some(0.0), None);
+    edges.west = fill_partial_edge_samples(&w_raw, w_fb.as_deref());
+
+    // East edge: target (u=1, v=0..1) meets East neighbor (u=0, v=0..1).
+    let ek = TileKey::new(leaf.level, x_e, leaf.y);
+    let e_raw: Vec<Option<f32>> = (0..n)
+        .map(|i| {
+            sample_tile_uv_from_hierarchy(
+                ek,
+                0.0,
+                i as f32 / denom,
+                min_level,
+                allow_synthesized,
+                working,
+                peek_cache,
+                cached_arcs,
+                source,
+            )
+        })
+        .collect();
+    let e_fb = sample_base_edge(Some(1.0), None);
+    edges.east = fill_partial_edge_samples(&e_raw, e_fb.as_deref());
+
+    // North edge: target (u=0..1, v=0) meets North neighbor (u=0..1, v=1).
+    if let Some(yn) = y_n {
+        let nk = TileKey::new(leaf.level, leaf.x, yn);
+        let n_raw: Vec<Option<f32>> = (0..n)
+            .map(|i| {
+                sample_tile_uv_from_hierarchy(
+                    nk,
+                    i as f32 / denom,
+                    1.0,
+                    min_level,
+                    allow_synthesized,
+                    working,
+                    peek_cache,
+                    cached_arcs,
+                    source,
+                )
+            })
+            .collect();
+        let n_fb = sample_base_edge(None, Some(0.0));
+        edges.north = fill_partial_edge_samples(&n_raw, n_fb.as_deref());
+    }
+
+    // South edge: target (u=0..1, v=1) meets South neighbor (u=0..1, v=0).
+    if let Some(ys) = y_s {
+        let sk = TileKey::new(leaf.level, leaf.x, ys);
+        let s_raw: Vec<Option<f32>> = (0..n)
+            .map(|i| {
+                sample_tile_uv_from_hierarchy(
+                    sk,
+                    i as f32 / denom,
+                    0.0,
+                    min_level,
+                    allow_synthesized,
+                    working,
+                    peek_cache,
+                    cached_arcs,
+                    source,
+                )
+            })
+            .collect();
+        let s_fb = sample_base_edge(None, Some(1.0));
+        edges.south = fill_partial_edge_samples(&s_raw, s_fb.as_deref());
+    }
+
+    if include_diagonals {
+        if edges.west.is_none() && edges.north.is_none() {
+            if let Some(yn) = y_n {
+                edges.nw = sample_tile_uv_from_hierarchy(
+                    TileKey::new(leaf.level, x_w, yn),
+                    1.0,
+                    1.0,
+                    min_level,
+                    allow_synthesized,
+                    working,
+                    peek_cache,
+                    cached_arcs,
+                    source,
+                );
+            }
+        }
+        if edges.east.is_none() && edges.north.is_none() {
+            if let Some(yn) = y_n {
+                edges.ne = sample_tile_uv_from_hierarchy(
+                    TileKey::new(leaf.level, x_e, yn),
+                    0.0,
+                    1.0,
+                    min_level,
+                    allow_synthesized,
+                    working,
+                    peek_cache,
+                    cached_arcs,
+                    source,
+                );
+            }
+        }
+        if edges.west.is_none() && edges.south.is_none() {
+            if let Some(ys) = y_s {
+                edges.sw = sample_tile_uv_from_hierarchy(
+                    TileKey::new(leaf.level, x_w, ys),
+                    1.0,
+                    0.0,
+                    min_level,
+                    allow_synthesized,
+                    working,
+                    peek_cache,
+                    cached_arcs,
+                    source,
+                );
+            }
+        }
+        if edges.east.is_none() && edges.south.is_none() {
+            if let Some(ys) = y_s {
+                edges.se = sample_tile_uv_from_hierarchy(
+                    TileKey::new(leaf.level, x_e, ys),
+                    0.0,
+                    0.0,
+                    min_level,
+                    allow_synthesized,
+                    working,
+                    peek_cache,
+                    cached_arcs,
+                    source,
+                );
+            }
+        }
+    }
+
+    edges
+}
+
+impl RetainedTerrainBuilder {
 
     fn resolve_environment_assets(
         &mut self,
@@ -901,7 +1587,7 @@ impl RetainedTerrainBuilder {
         let cel_active = self.plugins.is_active(crate::plugins::CelestialPlugin::ID);
 
         if weather_active
-            && flat_t < 0.85
+            && ll.map_2d_morph <= 0.05
             && input.weather.global_cloud_map
             && input.layers.clouds
             && std::env::var_os("STRATA_EARTH_OFFLINE").is_none()
@@ -917,7 +1603,8 @@ impl RetainedTerrainBuilder {
             self.satellite_store.ensure_fetched();
         }
         if cel_active
-            && flat_t < 0.85
+            && ll.map_2d_morph <= 0.05
+            && (flat_t < 0.85 || input.local_atmosphere.night_stars_sync)
             && input.space.stars_visible
             && std::env::var_os("STRATA_EARTH_OFFLINE").is_none()
         {
@@ -1039,25 +1726,60 @@ impl RetainedTerrainBuilder {
         geometry_revision: u64,
         allow_ancestor_mesh_fallback: bool,
     ) -> (Arc<RetainedTerrainFrame>, RetainedBuildStats) {
+        self.build_frame_with_idle(
+            input,
+            source,
+            geometry_revision,
+            allow_ancestor_mesh_fallback,
+            0.0,
+        )
+    }
+
+    /// Builds a [`RetainedTerrainFrame`] with an optional progressive idle high-res refinement
+    /// factor (`0.0` = normal moving LOD; `0.5..=1.0` = deeper gaze-centered idle refinement
+    /// when `input.idle_high_res.enabled` is `true`).
+    pub fn build_frame_with_idle(
+        &mut self,
+        input: &EarthInput,
+        source: &mut dyn TileSource,
+        geometry_revision: u64,
+        allow_ancestor_mesh_fallback: bool,
+        idle_factor: f32,
+    ) -> (Arc<RetainedTerrainFrame>, RetainedBuildStats) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
         self.last_plugin_rev = self.plugins.revision();
         self.last_ocean_waves = input.ocean_waves.clone();
         source.begin_frame(input.camera.focus, input.camera.altitude_m());
         let ll = input.low_level_state();
+        let ground_elev_focus = if input.elevation_enabled {
+            self.sample_ground_elevation_m(input.camera.focus.lat_deg, input.camera.focus.lon_deg)
+        } else {
+            0.0
+        };
+        let weather_snapshot = evaluate_base_weather_snapshot(
+            input,
+            ground_elev_focus,
+            self.weather_provider.as_ref(),
+            Some(&self.live_weather),
+        );
         let frame_ctx = EarthPluginFrameContext {
             input,
             low_level: ll,
             altitude_m: input.camera.altitude_m(),
+            ground_elevation_m: ground_elev_focus,
             time_s: input.weather.weather_time_s,
             overlay_rev: self.weather_rev.wrapping_add(1),
             is_dragging: false,
+            weather_snapshot,
         };
-        let camera = Self::camera_from_input_with_plugins(
+        let camera = Self::camera_from_input_with_plugins_weather_and_ground(
             input,
             &self.plugins,
             input.weather.weather_time_s,
             self.weather_rev.wrapping_add(1),
             false,
+            weather_snapshot,
+            ground_elev_focus,
         );
         let (environment, sat_elements) = self.resolve_environment_assets(input, &frame_ctx);
         let mut stats = RetainedBuildStats::default();
@@ -1100,20 +1822,37 @@ impl RetainedTerrainBuilder {
                 } else {
                     input.camera_up_ecef.map(|u| DVec3::new(u[0], u[1], u[2]))
                 };
-                let is_flat_2d = ll.map_2d_morph >= 0.99;
+                let is_flat_2d = is_canonical_2d_morph(ll.map_2d_morph as f64)
+                    && (ll.local_25d_blend.max(ll.map_2d_morph) as f64)
+                        >= CANONICAL_2D_MORPH_THRESHOLD;
+                let eff_elev_enabled =
+                    input.elevation_enabled && !is_flat_2d && input.camera.altitude_m() <= 350_000.0;
+                let idle_lod = input.idle_high_res.to_lod_params(idle_factor);
                 let leaf_items: Vec<(TileKey, i32)> = if is_flat_2d {
+                    let eff_sse = if idle_lod.is_active() {
+                        (input.sse_threshold * idle_lod.sse_scale).max(0.5)
+                    } else {
+                        input.sse_threshold
+                    };
+                    let leaf_cap = MAX_QUADTREE_LEAVES
+                        + if idle_lod.is_active() {
+                            idle_lod.extra_leaves
+                        } else {
+                            0
+                        };
                     traverse_quadtree_lod_2d_flat(
                         &input.camera,
                         input.viewport.width.max(1.0) as f64,
                         input.viewport.height.max(1.0) as f64,
-                        input.sse_threshold,
+                        eff_sse,
                         input.max_tile_level,
                         grid,
-                        MAX_QUADTREE_LEAVES,
+                        leaf_cap,
                         input.tile_projection,
                     )
                 } else {
-                    traverse_quadtree_lod_frustum6_projected_with_up(
+                    let src_ro: &dyn TileSource = &*source;
+                    traverse_quadtree_lod_frustum6_with_elevation(
                         &input.camera,
                         up_override,
                         input.viewport.width.max(1.0) as f64,
@@ -1124,6 +1863,13 @@ impl RetainedTerrainBuilder {
                         horizon_cull,
                         MAX_QUADTREE_LEAVES,
                         input.tile_projection,
+                        idle_lod,
+                        if eff_elev_enabled {
+                            ground_elev_focus
+                        } else {
+                            0.0
+                        },
+                        |k| self.tile_average_altitude_m(k, eff_elev_enabled, src_ro),
                     )
                     .into_iter()
                     .map(|k| (k, 0))
@@ -1131,8 +1877,6 @@ impl RetainedTerrainBuilder {
                 };
                 let focus_east = LocalFrame::at(morph.focus.lat_deg, morph.focus.lon_deg).east;
                 let world_circ = 2.0 * std::f64::consts::PI * wgs84::A;
-                let eff_elev_enabled =
-                    input.elevation_enabled && !is_flat_2d && input.camera.altitude_m() <= 350_000.0;
                 let mut leaf_flags: Vec<(bool, bool)> = vec![(false, eff_elev_enabled); leaf_items.len()];
                 if tile_hooks_active && !leaf_items.is_empty() {
                     let mut ctxs: Vec<EarthTileBuildContext<'_>> = leaf_items
@@ -1157,29 +1901,273 @@ impl RetainedTerrainBuilder {
                         *dst = (c.want_night_tiles, c.elevation_enabled);
                     }
                 }
+                // Pass 1: resolve native/child/ancestor elevations for every unique visible leaf.
+                let mut working_elevs: HashMap<TileKey, ResolvedLeafElev> =
+                    HashMap::with_capacity(leaf_items.len());
+                let mut any_missing_elev = false;
+                let mut any_coarse_elev = false;
+                for (&(leaf, _), &(_, leaf_elev_enabled)) in
+                    leaf_items.iter().zip(leaf_flags.iter())
+                {
+                    if working_elevs.contains_key(&leaf) {
+                        continue;
+                    }
+                    if !leaf_elev_enabled {
+                        working_elevs.insert(
+                            leaf,
+                            ResolvedLeafElev {
+                                elev_tile: leaf,
+                                is_exact: true,
+                                is_synthesized: false,
+                                elev_err: false,
+                                elev: None,
+                                elev_hash: 0,
+                            },
+                        );
+                        continue;
+                    }
+                    let elev_lookup = self.resolve_elevation_or_ancestor(leaf, true, source);
+                    let elev_err = elev_lookup.is_err();
+                    let (mut elev_opt, mut elev_tile) = elev_lookup.unwrap_or((None, leaf));
+                    let exact_level = leaf.level.min(15);
+                    let mut is_exact = elev_opt.is_some() && elev_tile.level >= exact_level;
+                    let mut is_synthesized = false;
+
+                    // Zoom-out fast path: if exact DEM isn't loaded yet but all 4 child DEMs are
+                    // already cached, downsample them directly instead of dropping to coarse/flat.
+                    if !is_exact && !is_flat_2d {
+                        if let Some(down) = Self::downsample_cached_children(leaf, grid, source) {
+                            elev_opt = Some(down);
+                            elev_tile = leaf;
+                            is_exact = true;
+                            is_synthesized = true;
+                        }
+                    }
+
+                    let elev_hash = hash_elevation_64(elev_opt.as_ref());
+                    let elev_arc = if let Some(ref e) = elev_opt {
+                        if !is_synthesized {
+                            record_frame_elevation(
+                                &mut self.cached_elev_arcs,
+                                &mut frame_elevs,
+                                elev_tile,
+                                elev_hash,
+                                Some(e),
+                            );
+                            frame_elevs
+                                .get(&elev_tile)
+                                .cloned()
+                                .or_else(|| Some(Arc::new(e.clone())))
+                        } else {
+                            let arc = Arc::new(e.clone());
+                            frame_elevs.entry(leaf).or_insert_with(|| Arc::clone(&arc));
+                            Some(arc)
+                        }
+                    } else {
+                        None
+                    };
+
+                    if elev_arc.is_none() {
+                        any_missing_elev = true;
+                    } else if !is_exact && elev_tile.level < leaf.level {
+                        any_coarse_elev = true;
+                    }
+
+                    working_elevs.insert(
+                        leaf,
+                        ResolvedLeafElev {
+                            elev_tile,
+                            is_exact,
+                            is_synthesized,
+                            elev_err,
+                            elev: elev_arc,
+                            elev_hash,
+                        },
+                    );
+                }
+
+                // Pass 2: seamlessly adapt unloaded tiles (and coarse-ancestor edges bordering
+                // finer neighbors) to surrounding loaded heightmaps via Coons-patch interpolation,
+                // making exposed cliff gaps / undermap holes impossible while DEMs stream in.
+                if !is_flat_2d && (any_missing_elev || any_coarse_elev) {
+                    let src_ro: &dyn TileSource = &*source;
+                    let mut peek_cache: HashMap<TileKey, Option<Arc<TileElevation>>> =
+                        HashMap::new();
+                    let unique_leaves: Vec<TileKey> = working_elevs.keys().copied().collect();
+
+                    // Pass 2A: up to 2 wave passes synthesize completely unloaded tiles from loaded
+                    // cardinal edges & diagonal corners (wave 1 bridges multi-tile missing clusters).
+                    if any_missing_elev {
+                        for wave in 0..2u8 {
+                            let allow_synth = wave > 0;
+                            let mut updates: Vec<(TileKey, Arc<TileElevation>, u64)> = Vec::new();
+                            for &leaf in &unique_leaves {
+                                if leaf.level == 0 {
+                                    continue;
+                                }
+                                let needs_synth = working_elevs
+                                    .get(&leaf)
+                                    .is_some_and(|w| !w.is_exact && w.elev.is_none());
+                                if !needs_synth {
+                                    continue;
+                                }
+                                let edges = sample_neighbor_edges_for_leaf(
+                                    leaf,
+                                    grid,
+                                    0,
+                                    allow_synth,
+                                    true,
+                                    None,
+                                    &working_elevs,
+                                    &mut peek_cache,
+                                    &self.cached_elev_arcs,
+                                    src_ro,
+                                );
+                                if let Some(synth) = synthesize_elevation_from_neighbors(grid, &edges)
+                                {
+                                    let h = hash_elevation_64(Some(&synth));
+                                    updates.push((leaf, Arc::new(synth), h));
+                                }
+                            }
+                            if updates.is_empty() {
+                                break;
+                            }
+                            for (leaf, arc, h) in updates {
+                                frame_elevs.entry(leaf).or_insert_with(|| Arc::clone(&arc));
+                                if let Some(entry) = working_elevs.get_mut(&leaf) {
+                                    entry.elev_tile = leaf;
+                                    entry.is_synthesized = true;
+                                    entry.elev = Some(arc);
+                                    entry.elev_hash = h;
+                                }
+                            }
+                        }
+
+                        // Pass 2C safety net: if an isolated tile still has zero touching neighbors
+                        // while other tiles in the same frame have elevation loaded (or focus ground
+                        // height is known), lift it smoothly to the regional mean instead of 0.0 m.
+                        let still_missing: Vec<TileKey> = unique_leaves
+                            .iter()
+                            .copied()
+                            .filter(|k| {
+                                working_elevs
+                                    .get(k)
+                                    .is_some_and(|w| !w.is_exact && w.elev.is_none())
+                            })
+                            .collect();
+                        if !still_missing.is_empty() {
+                            let mut sum_m = 0.0f64;
+                            let mut cnt = 0u64;
+                            for entry in working_elevs.values() {
+                                if let Some(ref e) = entry.elev {
+                                    let avg = e.average_elevation_m();
+                                    if avg.is_finite() {
+                                        sum_m += avg;
+                                        cnt += 1;
+                                    }
+                                }
+                            }
+                            let fallback_h = if cnt > 0 {
+                                Some((sum_m / cnt as f64) as f32)
+                            } else if ground_elev_focus.is_finite() && ground_elev_focus.abs() > 1.0
+                            {
+                                Some(ground_elev_focus as f32)
+                            } else {
+                                None
+                            };
+                            if let Some(fh) = fallback_h {
+                                let flat_elev = TileElevation {
+                                    width: 2,
+                                    height: 2,
+                                    heights_m: vec![fh; 4],
+                                };
+                                let h = hash_elevation_64(Some(&flat_elev));
+                                let arc = Arc::new(flat_elev);
+                                for leaf in still_missing {
+                                    frame_elevs.entry(leaf).or_insert_with(|| Arc::clone(&arc));
+                                    if let Some(entry) = working_elevs.get_mut(&leaf) {
+                                        entry.elev_tile = leaf;
+                                        entry.is_synthesized = true;
+                                        entry.elev = Some(Arc::clone(&arc));
+                                        entry.elev_hash = h;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Pass 2B: stitch coarse-ancestor tiles along any edge shared with a strictly
+                    // finer loaded neighbor so LOD/download borders stay 0.0 m watertight while
+                    // keeping 100% of the ancestor's interior terrain relief.
+                    if any_coarse_elev {
+                        let mut stitched_updates: Vec<(TileKey, Arc<TileElevation>, u64)> =
+                            Vec::new();
+                        for &leaf in &unique_leaves {
+                            if leaf.level == 0 {
+                                continue;
+                            }
+                            let Some(entry) = working_elevs.get(&leaf) else {
+                                continue;
+                            };
+                            if entry.is_exact || entry.elev_tile.level >= leaf.level {
+                                continue;
+                            }
+                            let Some(ref base_arc) = entry.elev else {
+                                continue;
+                            };
+                            let uv_rect = tile_sub_uv_in_ancestor(leaf, entry.elev_tile);
+                            let min_finer = entry.elev_tile.level.saturating_add(1);
+                            let edges = sample_neighbor_edges_for_leaf(
+                                leaf,
+                                grid,
+                                min_finer,
+                                false,
+                                false,
+                                Some((base_arc.as_ref(), uv_rect)),
+                                &working_elevs,
+                                &mut peek_cache,
+                                &self.cached_elev_arcs,
+                                src_ro,
+                            );
+                            if edges.has_any_edge() {
+                                let stitched = stitch_elevation_with_neighbors(
+                                    base_arc.as_ref(),
+                                    uv_rect,
+                                    grid,
+                                    &edges,
+                                );
+                                let h = hash_elevation_64(Some(&stitched));
+                                stitched_updates.push((leaf, Arc::new(stitched), h));
+                            }
+                        }
+                        for (leaf, arc, h) in stitched_updates {
+                            frame_elevs.insert(leaf, Arc::clone(&arc));
+                            if let Some(entry) = working_elevs.get_mut(&leaf) {
+                                entry.elev_tile = leaf;
+                                entry.is_synthesized = true;
+                                entry.elev = Some(arc);
+                                entry.elev_hash = h;
+                            }
+                        }
+                    }
+                }
+
                 let mut emitted_ancestors = HashSet::new();
                 for ((leaf, wrap_x), (leaf_want_night, leaf_elev_enabled)) in
                     leaf_items.into_iter().zip(leaf_flags.into_iter())
                 {
                     visible_leaves.push(leaf);
-                    let elev_lookup =
-                        self.resolve_elevation_or_ancestor(leaf, leaf_elev_enabled, source);
-                    let elev_err = elev_lookup.is_err();
-                    let (elev_opt, elev_tile) = elev_lookup.unwrap_or((None, leaf));
-                    let elev = elev_opt.as_ref();
-                    let elev_hash = hash_elevation_64(elev);
-                    record_frame_elevation(
-                        &mut self.cached_elev_arcs,
-                        &mut frame_elevs,
-                        elev_tile,
-                        elev_hash,
-                        elev,
-                    );
+                    let resolved = working_elevs.get(&leaf);
+                    let elev_err = resolved.is_some_and(|r| r.elev_err);
+                    let elev_tile = resolved.map(|r| r.elev_tile).unwrap_or(leaf);
+                    let elev = resolved.and_then(|r| r.elev.as_deref());
+                    let elev_hash = resolved.map(|r| r.elev_hash).unwrap_or(0);
                     let key_id = TileKeyId::quadtree(leaf.level, leaf.x, leaf.y);
 
                     let use_ancestor_mesh = !is_flat_2d
                         && allow_ancestor_mesh_fallback
                         && elev_err
+                        && elev.is_none()
                         && !self
                             .meshes
                             .get(&(key_id, grid, with_skirts))
@@ -1522,11 +2510,26 @@ impl RetainedTerrainBuilder {
                 input,
                 low_level: ll,
                 time_s: input.weather.weather_time_s,
+                weather_snapshot,
                 ground_snapshot: self.ground_snapshot.as_deref(),
             };
             self.plugins
                 .run_particle_layers(&mut p_ctx, &mut particle_layers, &mut particle_textures);
         }
+
+        let ocean = if self.include_ocean && hooks.intersects(EarthPluginHooks::OCEAN) {
+            let mut o_ctx = EarthOceanContext {
+                input,
+                low_level: ll,
+                time_s: input.weather.weather_time_s,
+                overlay_rev: self.weather_rev,
+                weather_snapshot,
+                ground_snapshot: self.ground_snapshot.as_deref(),
+            };
+            self.plugins.run_ocean_surface(&mut o_ctx).map(Arc::new)
+        } else {
+            None
+        };
 
         let morph = stabilized_morph_params(
             input.camera.focus,
@@ -1535,11 +2538,49 @@ impl RetainedTerrainBuilder {
             input.tile_projection,
         );
         let eye_dvec = DVec3::new(camera.eye_ecef[0], camera.eye_ecef[1], camera.eye_ecef[2]);
-        let (geo_mesh_assets, geo_instances) = if let Ok(mut w) = self.world.write() {
-            if w.is_empty() {
-                (Arc::default(), Arc::default())
+        if input.layers.buildings {
+            let built_buildings = if let Some(ref mut bsrc) = self.building_source {
+                build_buildings_dynamic_mesh(
+                    self.dynamic_mesh_id_base + 1,
+                    self.frame_counter,
+                    input,
+                    morph,
+                    &emitted_meta,
+                    &ground_snap_val,
+                    bsrc.as_mut(),
+                )
             } else {
-                w.compile_retained(
+                None
+            };
+            if let Some(ref slot) = self.last_buildings_mesh {
+                if let Ok(mut guard) = slot.write() {
+                    *guard = built_buildings.clone();
+                }
+            }
+            if let Some(m) = built_buildings {
+                dynamic_meshes.push(m);
+            }
+        } else if let Some(ref slot) = self.last_buildings_mesh {
+            if let Ok(mut guard) = slot.write() {
+                *guard = None;
+            }
+        }
+        if input.layers.graticule && !self.plugins.list_ids().is_empty() {
+            if let Some(grat) = build_graticule_dynamic_mesh(
+                self.dynamic_mesh_id_base + 2,
+                self.frame_counter,
+                input,
+                morph,
+                eye_dvec,
+            ) {
+                dynamic_meshes.push(grat);
+            }
+        }
+        let (geo_mesh_assets, geo_instances, geo_revision) = if let Ok(mut w) = self.world.write() {
+            if w.is_empty() {
+                (Arc::default(), Arc::default(), w.revision())
+            } else {
+                let (assets, insts) = w.compile_retained(
                     eye_dvec,
                     input.viewport.height.max(1.0) as f64,
                     input.camera.fov_y_deg,
@@ -1552,10 +2593,11 @@ impl RetainedTerrainBuilder {
                             0.0
                         }
                     },
-                )
+                );
+                (assets, insts, w.revision())
             }
         } else {
-            (Arc::default(), Arc::default())
+            (Arc::default(), Arc::default(), 0)
         };
 
         stats.visible_tiles = instances_out.len();
@@ -1563,6 +2605,7 @@ impl RetainedTerrainBuilder {
             Arc::new(RetainedTerrainFrame {
                 camera,
                 geometry_revision,
+                geo_revision,
                 meshes: meshes_out,
                 instances: instances_out,
                 textures: textures_out,
@@ -1571,6 +2614,7 @@ impl RetainedTerrainBuilder {
                 geo_instances,
                 particle_layers: Arc::new(particle_layers),
                 particle_textures: Arc::new(particle_textures),
+                ocean,
                 environment,
             }),
             stats,
@@ -1606,7 +2650,13 @@ impl RetainedTerrainBuilder {
         stats.mesh_cache_misses += 1;
         let rev = self.next_revision;
         self.next_revision += 1;
-        let min_skirt = if morph.flat_blend > 0.05 { 600.0 } else { 0.0 };
+        let min_skirt = if morph.flat_blend > 0.05 {
+            600.0
+        } else if elev.is_some() {
+            350.0
+        } else {
+            0.0
+        };
         let skirt_depth = compute_adaptive_skirt_depth(bounds, elevation_range(elev)).max(min_skirt);
         let mut built = build_tile_local_rtc_mesh_morphed(
             tile,
@@ -1688,12 +2738,234 @@ fn find_resident_ancestor(
     None
 }
 
+fn push_dyn_quad(
+    verts: &mut Vec<strata_render::scene3d::RteTileVertex>,
+    inds: &mut Vec<u32>,
+    a: DVec3,
+    b: DVec3,
+    c: DVec3,
+    d: DVec3,
+    normal: DVec3,
+) {
+    let base = verts.len() as u32;
+    let n = [normal.x as f32, normal.y as f32, normal.z as f32];
+    verts.push(strata_render::scene3d::RteTileVertex::new(
+        [a.x as f32, a.y as f32, a.z as f32],
+        n,
+        [0.0, 0.0],
+    ));
+    verts.push(strata_render::scene3d::RteTileVertex::new(
+        [b.x as f32, b.y as f32, b.z as f32],
+        n,
+        [1.0, 0.0],
+    ));
+    verts.push(strata_render::scene3d::RteTileVertex::new(
+        [c.x as f32, c.y as f32, c.z as f32],
+        n,
+        [1.0, 1.0],
+    ));
+    verts.push(strata_render::scene3d::RteTileVertex::new(
+        [d.x as f32, d.y as f32, d.z as f32],
+        n,
+        [0.0, 1.0],
+    ));
+    inds.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_buildings_dynamic_mesh(
+    id: u64,
+    revision: u64,
+    input: &EarthInput,
+    morph: SurfaceMorphParams,
+    emitted_meta: &[(TileKey, TileKeyId, PatchBounds, bool, bool)],
+    ground_snap: &GroundElevSnapshot,
+    source: &mut dyn crate::scene::BuildingSource,
+) -> Option<RetainedDynamicMesh> {
+    let (anchor_dvec, _) = crate::project_morphed_point_and_frame(
+        input.camera.focus.lat_deg,
+        input.camera.focus.lon_deg,
+        0.0,
+        morph,
+    );
+    let mut verts = Vec::new();
+    let mut inds = Vec::new();
+    let mut total_buildings = 0usize;
+    'tiles: for &(tile, _, bounds, _, _) in emitted_meta {
+        for fp in source.buildings(tile, bounds) {
+            if total_buildings >= 4096 {
+                break 'tiles;
+            }
+            total_buildings += 1;
+            let ground_m = if input.elevation_enabled {
+                ground_snap.sample_elevation_m(fp.lat, fp.lon)
+            } else {
+                0.0
+            };
+            let (base_pos, frame) =
+                crate::project_morphed_point_and_frame(fp.lat, fp.lon, ground_m, morph);
+            let (east, north, up) = (frame.east, frame.north, frame.up);
+            let rel = base_pos.sub(anchor_dvec);
+            let he = east.scale((fp.size_m.0 as f64).max(1.0) * 0.5);
+            let hn = north.scale((fp.size_m.1 as f64).max(1.0) * 0.5);
+            let h_vec = up.scale((fp.height_m as f64).max(1.0));
+            let b00 = rel.sub(he).sub(hn);
+            let b10 = rel.add(he).sub(hn);
+            let b11 = rel.add(he).add(hn);
+            let b01 = rel.sub(he).add(hn);
+            let t00 = b00.add(h_vec);
+            let t10 = b10.add(h_vec);
+            let t11 = b11.add(h_vec);
+            let t01 = b01.add(h_vec);
+            push_dyn_quad(&mut verts, &mut inds, t00, t10, t11, t01, up);
+            push_dyn_quad(&mut verts, &mut inds, b00, b10, t10, t00, north.scale(-1.0));
+            push_dyn_quad(&mut verts, &mut inds, b10, b11, t11, t10, east);
+            push_dyn_quad(&mut verts, &mut inds, b11, b01, t01, t11, north);
+            push_dyn_quad(&mut verts, &mut inds, b01, b00, t00, t01, east.scale(-1.0));
+        }
+    }
+    if verts.is_empty() {
+        return None;
+    }
+    Some(RetainedDynamicMesh {
+        id,
+        revision,
+        anchor_ecef: [anchor_dvec.x, anchor_dvec.y, anchor_dvec.z],
+        vertices: Arc::new(verts),
+        indices: Arc::new(inds),
+        color: [0.82, 0.85, 0.90, 0.96],
+        unlit: false,
+    })
+}
+
+fn build_graticule_dynamic_mesh(
+    id: u64,
+    revision: u64,
+    input: &EarthInput,
+    morph: SurfaceMorphParams,
+    eye_dvec: DVec3,
+) -> Option<RetainedDynamicMesh> {
+    let step_deg = input.graticule_step_deg;
+    if !(step_deg > 0.0 && step_deg <= 90.0) {
+        return None;
+    }
+    if morph.flat_blend >= 0.85 && morph.map_2d_morph < 0.5 {
+        return None;
+    }
+    let (anchor_dvec, _) = crate::project_morphed_point_and_frame(
+        input.camera.focus.lat_deg,
+        input.camera.focus.lon_deg,
+        0.0,
+        morph,
+    );
+    let cam_dist = input.camera.eye_distance_m().max(200.0);
+    let ribbon_half = (cam_dist * 0.0012).clamp(1.5, 18_000.0);
+    let alt_lift = (cam_dist * 0.0005).clamp(2.0, 2_500.0);
+    let cull_back = morph.flat_blend < 0.85;
+
+    let mut verts = Vec::new();
+    let mut inds = Vec::new();
+    let mut emit_strip = |samples: &[(f64, f64)]| {
+        let mut prev: Option<(DVec3, DVec3)> = None;
+        for &(lat, lon) in samples {
+            let (p_world, frame) =
+                crate::project_morphed_point_and_frame(lat, lon, alt_lift, morph);
+            let up = frame.up;
+            if cull_back {
+                let to_eye = eye_dvec.sub(p_world);
+                if up.dot(to_eye) <= 0.0 {
+                    prev = None;
+                    continue;
+                }
+            }
+            if let Some((p0, up0)) = prev {
+                let seg = p_world.sub(p0);
+                let seg_len = seg.length();
+                if seg_len > 1.0 && seg_len < 3_500_000.0 {
+                    let dir = seg.scale(1.0 / seg_len);
+                    let side_raw = dir.cross(up0);
+                    let side_len = side_raw.length();
+                    if side_len > 1e-6 {
+                        let side = side_raw.scale(ribbon_half / side_len);
+                        let r0 = p0.sub(anchor_dvec);
+                        let r1 = p_world.sub(anchor_dvec);
+                        push_dyn_quad(
+                            &mut verts,
+                            &mut inds,
+                            r0.sub(side),
+                            r0.add(side),
+                            r1.add(side),
+                            r1.sub(side),
+                            up,
+                        );
+                    }
+                }
+            }
+            prev = Some((p_world, up));
+        }
+    };
+
+    const MERIDIAN_SAMPLES: usize = 72;
+    const PARALLEL_SAMPLES: usize = 96;
+    let mut buf = Vec::with_capacity(PARALLEL_SAMPLES + 1);
+    let mut emit_meridian = |lon: f64| {
+        buf.clear();
+        for i in 0..=MERIDIAN_SAMPLES {
+            let t = i as f64 / MERIDIAN_SAMPLES as f64;
+            let lat = -85.0 + t * 170.0;
+            buf.push((lat, lon));
+        }
+        emit_strip(&buf);
+    };
+    emit_meridian(0.0);
+    emit_meridian(180.0);
+    let mut lon = step_deg;
+    while lon < 180.0 - 1e-6 {
+        emit_meridian(lon);
+        emit_meridian(-lon);
+        lon += step_deg;
+    }
+
+    let mut emit_parallel = |lat: f64| {
+        buf.clear();
+        for i in 0..=PARALLEL_SAMPLES {
+            let t = i as f64 / PARALLEL_SAMPLES as f64;
+            let lon = -180.0 + t * 360.0;
+            buf.push((lat, lon));
+        }
+        emit_strip(&buf);
+    };
+    emit_parallel(0.0);
+    let mut lat = step_deg;
+    while lat < 90.0 {
+        emit_parallel(lat);
+        emit_parallel(-lat);
+        lat += step_deg;
+    }
+
+    if verts.is_empty() {
+        return None;
+    }
+    Some(RetainedDynamicMesh {
+        id,
+        revision,
+        anchor_ecef: [anchor_dvec.x, anchor_dvec.y, anchor_dvec.z],
+        vertices: Arc::new(verts),
+        indices: Arc::new(inds),
+        color: [0.58, 0.64, 0.72, 0.35],
+        unlit: true,
+    })
+}
+
 struct WorkerShared {
-    latest_input: Option<(u64, EarthInput)>,
-    last_dispatched: Option<(u64, EarthInput)>,
+    latest_input: Option<(u64, EarthInput, f32)>,
+    last_dispatched: Option<(u64, EarthInput, f32)>,
     pending_provider: Option<(TileProviderConfig, bool)>,
     pending_source: Option<Box<dyn TileSource + Send>>,
+    pending_weather_provider: Option<Option<Arc<dyn WeatherProvider>>>,
+    pending_building_source: Option<Option<Box<dyn crate::scene::BuildingSource + Send>>>,
     provider_gen: u64,
+    aux_gen: u64,
     shutdown: bool,
     stats: EarthViewportStats,
 }
@@ -1715,6 +2987,8 @@ pub struct EarthTileWorker {
     completed_seq: Arc<AtomicU64>,
     satellite_store: Arc<SatelliteCatalogStore>,
     ground_snapshot: Arc<RwLock<GroundElevSnapshot>>,
+    last_buildings_mesh: Arc<RwLock<Option<RetainedDynamicMesh>>>,
+    dynamic_mesh_id_base: u64,
     thread: Option<JoinHandle<()>>,
     next_seq: u64,
 }
@@ -1756,7 +3030,10 @@ impl EarthTileWorker {
                 last_dispatched: None,
                 pending_provider: None,
                 pending_source: None,
+                pending_weather_provider: None,
+                pending_building_source: None,
                 provider_gen: 0,
+                aux_gen: 0,
                 shutdown: false,
                 stats: EarthViewportStats::default(),
             }),
@@ -1764,10 +3041,14 @@ impl EarthTileWorker {
         ));
         let completed_seq = Arc::new(AtomicU64::new(0));
         let ground_snapshot = Arc::new(RwLock::new(GroundElevSnapshot::default()));
+        let last_buildings_mesh = Arc::new(RwLock::new(None));
+        let dynamic_mesh_id_base =
+            NEXT_BUILDER_DYN_MESH_ID_BLOCK.fetch_add(16, Ordering::Relaxed);
         let shared_bg = Arc::clone(&shared);
         let shared_env = Arc::clone(&shared);
         let completed_bg = Arc::clone(&completed_seq);
         let ground_snapshot_bg = Arc::clone(&ground_snapshot);
+        let last_buildings_bg = Arc::clone(&last_buildings_mesh);
         let world_bg = Arc::clone(&world);
         let env_wakeup_outer = wakeup.clone();
         let env_wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -1775,8 +3056,8 @@ impl EarthTileWorker {
                 let (lock, cv) = &*shared_env;
                 if let Ok(mut guard) = lock.lock() {
                     if guard.latest_input.is_none() {
-                        if let Some((seq, ref inp)) = guard.last_dispatched {
-                            guard.latest_input = Some((seq, inp.clone()));
+                        if let Some((seq, ref inp, idle_f)) = guard.last_dispatched {
+                            guard.latest_input = Some((seq, inp.clone(), idle_f));
                             cv.notify_one();
                         }
                     }
@@ -1802,14 +3083,27 @@ impl EarthTileWorker {
                     skybox_store,
                 );
                 builder.set_plugins(plugins);
-                // Main-thread EarthViewport emits camera-locked 144 Hz particle layers synchronously.
+                // Main-thread EarthViewport emits camera-locked 144 Hz particle layers & GPU ocean uniforms synchronously.
                 builder.set_include_particles(false);
+                builder.set_include_ocean(false);
                 builder.set_ground_snapshot(ground_snapshot_bg);
+                builder.set_last_buildings_mesh(last_buildings_bg);
+                builder.set_dynamic_mesh_id_base(dynamic_mesh_id_base);
                 builder.set_world(world_bg);
                 let mut geom_rev = 0u64;
                 let mut seen_provider_gen = 0u64;
+                let mut seen_aux_gen = 0u64;
+                let mut last_canonical_2d: Option<bool> = None;
                 loop {
-                    let (seq, input, provider_update, source_update) = {
+                    let (
+                        seq,
+                        input,
+                        idle_factor,
+                        provider_update,
+                        source_update,
+                        weather_provider_update,
+                        building_source_update,
+                    ) = {
                         let (lock, cv) = &*shared_bg;
                         let mut guard = lock.lock().unwrap();
                         while guard.latest_input.is_none() && !guard.shutdown {
@@ -1824,8 +3118,17 @@ impl EarthTileWorker {
                         } else {
                             (None, None)
                         };
-                        let pair = guard.latest_input.take().unwrap();
-                        (pair.0, pair.1, prov_up, src_up)
+                        let (wp_up, bs_up) = if guard.aux_gen != seen_aux_gen {
+                            seen_aux_gen = guard.aux_gen;
+                            (
+                                guard.pending_weather_provider.take(),
+                                guard.pending_building_source.take(),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        let triple = guard.latest_input.take().unwrap();
+                        (triple.0, triple.1, triple.2, prov_up, src_up, wp_up, bs_up)
                     };
 
                     if let Some(mut new_src) = source_update {
@@ -1836,11 +3139,33 @@ impl EarthTileWorker {
                         let _ = source.set_provider(&cfg);
                         builder.clear_provider_caches(clear_elev);
                     }
+                    if let Some(wp) = weather_provider_update {
+                        builder.set_weather_provider(wp);
+                    }
+                    if let Some(bs) = building_source_update {
+                        builder.set_building_source(bs);
+                    }
 
                     geom_rev += 1;
-                    let (frame, build_stats) =
-                        builder.build_frame(&input, source.as_mut(), geom_rev, true);
-                    retained.update_terrain_preserving_camera(frame);
+                    let start_geo_rev = retained.geo_revision();
+                    let ll_now = input.low_level_state();
+                    let is_canon_2d = is_canonical_2d_morph(ll_now.map_2d_morph as f64)
+                        && (ll_now.local_25d_blend.max(ll_now.map_2d_morph) as f64)
+                            >= CANONICAL_2D_MORPH_THRESHOLD;
+                    let (mut frame, build_stats) = builder.build_frame_with_idle(
+                        &input,
+                        source.as_mut(),
+                        geom_rev,
+                        true,
+                        idle_factor,
+                    );
+                    Arc::make_mut(&mut frame).geo_revision = start_geo_rev;
+                    if last_canonical_2d.is_some_and(|prev| prev != is_canon_2d) {
+                        retained.update_terrain_with_camera_preserving_overlays(frame);
+                    } else {
+                        retained.update_terrain_preserving_camera(frame);
+                    }
+                    last_canonical_2d = Some(is_canon_2d);
 
                     {
                         let (lock, cv) = &*shared_bg;
@@ -1865,8 +3190,55 @@ impl EarthTileWorker {
             completed_seq,
             satellite_store,
             ground_snapshot,
+            last_buildings_mesh,
+            dynamic_mesh_id_base,
             thread: Some(handle),
             next_seq: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn dynamic_mesh_id_base(&self) -> u64 {
+        self.dynamic_mesh_id_base
+    }
+
+    pub(crate) fn last_buildings_mesh(&self) -> Option<RetainedDynamicMesh> {
+        self.last_buildings_mesh
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Propagates a [`WeatherProvider`] update to the background tile worker's [`RetainedTerrainBuilder`].
+    pub fn set_weather_provider(&mut self, provider: Option<Arc<dyn WeatherProvider>>) {
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut guard) = lock.lock() {
+            guard.pending_weather_provider = Some(provider);
+            guard.aux_gen = guard.aux_gen.wrapping_add(1);
+            if guard.latest_input.is_none() {
+                if let Some((seq, ref inp, idle_f)) = guard.last_dispatched {
+                    guard.latest_input = Some((seq, inp.clone(), idle_f));
+                }
+            }
+            cv.notify_one();
+        }
+    }
+
+    /// Propagates a [`crate::scene::BuildingSource`] update to the background tile worker's [`RetainedTerrainBuilder`].
+    pub fn set_building_source(
+        &mut self,
+        source: Option<Box<dyn crate::scene::BuildingSource + Send>>,
+    ) {
+        let (lock, cv) = &*self.shared;
+        if let Ok(mut guard) = lock.lock() {
+            guard.pending_building_source = Some(source);
+            guard.aux_gen = guard.aux_gen.wrapping_add(1);
+            if guard.latest_input.is_none() {
+                if let Some((seq, ref inp, idle_f)) = guard.last_dispatched {
+                    guard.latest_input = Some((seq, inp.clone(), idle_f));
+                }
+            }
+            cv.notify_one();
         }
     }
 
@@ -1886,8 +3258,8 @@ impl EarthTileWorker {
             guard.pending_source = None;
             guard.provider_gen = guard.provider_gen.wrapping_add(1);
             if guard.latest_input.is_none() {
-                if let Some((seq, ref inp)) = guard.last_dispatched {
-                    guard.latest_input = Some((seq, inp.clone()));
+                if let Some((seq, ref inp, idle_f)) = guard.last_dispatched {
+                    guard.latest_input = Some((seq, inp.clone(), idle_f));
                 }
             }
             cv.notify_one();
@@ -1902,26 +3274,32 @@ impl EarthTileWorker {
             guard.pending_provider = None;
             guard.provider_gen = guard.provider_gen.wrapping_add(1);
             if guard.latest_input.is_none() {
-                if let Some((seq, ref inp)) = guard.last_dispatched {
-                    guard.latest_input = Some((seq, inp.clone()));
+                if let Some((seq, ref inp, idle_f)) = guard.last_dispatched {
+                    guard.latest_input = Some((seq, inp.clone(), idle_f));
                 }
             }
             cv.notify_one();
         }
     }
 
-    /// Queues `input` for background LOD traversal + tile assembly, coalescing any unstarted request.
-    pub fn request_update(&mut self, input: EarthInput) -> u64 {
+    /// Queues `input` for background LOD traversal + tile assembly with explicit `idle_factor` (`0.0..=1.0`).
+    pub fn request_update_with_idle(&mut self, input: EarthInput, idle_factor: f32) -> u64 {
         self.next_seq += 1;
         let seq = self.next_seq;
+        let clamped_idle = idle_factor.clamp(0.0, 1.0);
         let (lock, cv) = &*self.shared;
         if let Ok(mut guard) = lock.lock() {
-            guard.last_dispatched = Some((seq, input.clone()));
-            guard.latest_input = Some((seq, input));
+            guard.last_dispatched = Some((seq, input.clone(), clamped_idle));
+            guard.latest_input = Some((seq, input, clamped_idle));
             guard.stats.camera_updates += 1;
             cv.notify_one();
         }
         seq
+    }
+
+    /// Queues `input` for background LOD traversal + tile assembly, coalescing any unstarted request.
+    pub fn request_update(&mut self, input: EarthInput) -> u64 {
+        self.request_update_with_idle(input, 0.0)
     }
 
     pub fn flush(&self) {
@@ -1962,19 +3340,67 @@ pub struct EarthViewport {
     input: EarthInput,
     plugins: EarthPluginRegistry,
     active_provider: TileProviderConfig,
+    weather_provider: Option<Arc<dyn WeatherProvider>>,
+    live_weather: OpenMeteoWeatherProvider,
+    last_weather_snapshot: Option<WeatherSnapshot>,
     target_morph: f32,
     linear_morph: f32,
     transition_duration_s: f64,
     had_active_particles: bool,
+    had_active_ocean: bool,
     weather_ids: HashMap<u64, u64>,
     overlay_rev: u64,
     last_overlay_flat_t: f32,
     last_geo_morph_sig: u64,
     last_geo_eye_dist_m: f64,
+    last_geo_lon_sector: i32,
+    idle_elapsed_s: f64,
+    idle_stage: u8,
+    last_camera_pose_sig: u64,
     stopped: Arc<AtomicBool>,
 }
 
 impl EarthViewport {
+    #[inline]
+    fn is_input_canonical_2d(input: &EarthInput) -> bool {
+        let ll = input.low_level_state();
+        is_canonical_2d_morph(ll.map_2d_morph as f64)
+            && (ll.local_25d_blend.max(ll.map_2d_morph) as f64) >= CANONICAL_2D_MORPH_THRESHOLD
+    }
+
+    #[inline]
+    fn camera_pose_signature(input: &EarthInput) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        };
+        let c = &input.camera;
+        mix((c.focus.lat_deg * 1e6).round() as i64 as u64);
+        mix((c.focus.lon_deg * 1e6).round() as i64 as u64);
+        mix((c.focus.height_m * 100.0).round() as i64 as u64);
+        for v in c.eye_offset_m {
+            mix((v * 100.0).round() as i64 as u64);
+        }
+        for v in c.aim_offset_m {
+            mix((v * 100.0).round() as i64 as u64);
+        }
+        mix((c.fov_y_deg * 1_000.0).round() as i64 as u64);
+        mix((input.viewport.width as f64 * 10.0).round() as u64);
+        mix((input.viewport.height as f64 * 10.0).round() as u64);
+        mix((input.view_morph as f64 * 1_000.0).round() as u64);
+        mix(match input.view_mode {
+            EarthViewMode::Mode3D => 3,
+            EarthViewMode::Mode2D => 2,
+        });
+        if let Some(up) = input.camera_up_ecef {
+            for v in up {
+                mix((v * 1e4).round() as i64 as u64);
+            }
+        }
+        h
+    }
+
     /// Creates an [`EarthViewport`] and immediately schedules the initial retained tile frame.
     pub fn new(input: &EarthInput, source: Box<dyn TileSource + Send>) -> Self {
         Self::with_wakeup(input, source, None)
@@ -2015,6 +3441,7 @@ impl EarthViewport {
             Arc::clone(&world),
         );
         worker.request_update(input.clone());
+        let initial_pose_sig = Self::camera_pose_signature(input);
         let mut vp = Self {
             retained,
             worker,
@@ -2022,19 +3449,28 @@ impl EarthViewport {
             input: input.clone(),
             plugins,
             active_provider: TileProviderConfig::default(),
+            weather_provider: None,
+            live_weather: OpenMeteoWeatherProvider::new(),
+            last_weather_snapshot: None,
             target_morph: initial_morph,
             linear_morph: initial_morph,
             transition_duration_s: 0.45,
             had_active_particles: false,
+            had_active_ocean: false,
             weather_ids: HashMap::new(),
             overlay_rev: 1,
             last_overlay_flat_t: initial_flat_t,
             last_geo_morph_sig: 0,
             last_geo_eye_dist_m: input.camera.eye_distance_m(),
+            last_geo_lon_sector: (crate::geodesy::wrap_longitude(input.camera.focus.lon_deg) / 30.0)
+                .round() as i32,
+            idle_elapsed_s: 0.0,
+            idle_stage: 0,
+            last_camera_pose_sig: initial_pose_sig,
             stopped: Arc::new(AtomicBool::new(false)),
         };
-        if input.precipitation.enabled {
-            vp.publish_camera_and_particles();
+        if input.precipitation.enabled || input.ocean_waves.enabled || input.base_weather.enabled {
+            vp.publish_camera_and_particles_and_ocean();
         }
         vp
     }
@@ -2135,7 +3571,12 @@ impl EarthViewport {
         let morph = self.current_surface_morph();
         self.last_geo_morph_sig = mesh_morph_signature(morph);
         self.last_geo_eye_dist_m = self.input.camera.eye_distance_m();
-        let placement = self.input.camera.placement_with_up(self.camera_up_dvec());
+        self.last_geo_lon_sector =
+            (crate::geodesy::wrap_longitude(self.input.camera.focus.lon_deg) / 30.0).round() as i32;
+        let placement = self
+            .input
+            .camera
+            .placement_for_morph(morph, self.camera_up_dvec());
         let vp_h = self.input.viewport.height.max(1.0) as f64;
         let fov_y = self.input.camera.fov_y_deg;
         let elev_on = self.input.elevation_enabled;
@@ -2187,11 +3628,52 @@ impl EarthViewport {
             };
             self.plugins.run_dynamic_overlays(&mut ctx, &mut out);
         }
+        if self.input.layers.buildings {
+            if let Some(bldg) = self.worker.last_buildings_mesh() {
+                out.push(bldg);
+            }
+        }
+        if self.input.layers.graticule {
+            let morph = self.current_surface_morph();
+            let placement = self
+                .input
+                .camera
+                .placement_for_morph(morph, self.camera_up_dvec());
+            if let Some(grat) = build_graticule_dynamic_mesh(
+                self.worker.dynamic_mesh_id_base() + 2,
+                self.overlay_rev,
+                &self.input,
+                morph,
+                placement.eye,
+            ) {
+                out.push(grat);
+            }
+        }
         out
+    }
+
+    fn resolve_weather_snapshot(&mut self) -> Option<WeatherSnapshot> {
+        let ground_elev = if self.input.elevation_enabled {
+            self.worker.sample_ground_elevation_m(
+                self.input.camera.focus.lat_deg,
+                self.input.camera.focus.lon_deg,
+            )
+        } else {
+            0.0
+        };
+        let snap = evaluate_base_weather_snapshot(
+            &self.input,
+            ground_elev,
+            self.weather_provider.as_ref(),
+            Some(&self.live_weather),
+        );
+        self.last_weather_snapshot = snap;
+        snap
     }
 
     fn build_particle_layers(
         &mut self,
+        weather_snapshot: Option<WeatherSnapshot>,
     ) -> (
         Arc<Vec<RetainedParticleLayer>>,
         Arc<Vec<Arc<RetainedTileTexture>>>,
@@ -2208,6 +3690,7 @@ impl EarthViewport {
                 input: &self.input,
                 low_level: ll,
                 time_s: self.input.weather.weather_time_s,
+                weather_snapshot,
                 ground_snapshot: Some(self.worker.ground_snapshot.as_ref()),
             };
             self.plugins
@@ -2217,44 +3700,99 @@ impl EarthViewport {
         (Arc::new(layers), Arc::new(textures))
     }
 
-    fn publish_camera_and_particles(&mut self) {
-        let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
+    fn build_ocean_surface(
+        &mut self,
+        weather_snapshot: Option<WeatherSnapshot>,
+    ) -> Option<Arc<RetainedOceanSurface>> {
+        let surf = if self
+            .plugins
+            .active_hooks()
+            .intersects(EarthPluginHooks::OCEAN)
+        {
+            let ll = self.input.low_level_state();
+            let mut ctx = EarthOceanContext {
+                input: &self.input,
+                low_level: ll,
+                time_s: self.input.weather.weather_time_s,
+                overlay_rev: self.overlay_rev,
+                weather_snapshot,
+                ground_snapshot: Some(self.worker.ground_snapshot.as_ref()),
+            };
+            self.plugins.run_ocean_surface(&mut ctx).map(Arc::new)
+        } else {
+            None
+        };
+        self.had_active_ocean = surf.is_some();
+        surf
+    }
+
+    fn camera_uniforms_with_weather(
+        &self,
+        weather_snapshot: Option<WeatherSnapshot>,
+    ) -> RetainedCameraUniforms {
+        let ground_elev = self.sample_ground_elevation_m(
+            self.input.camera.focus.lat_deg,
+            self.input.camera.focus.lon_deg,
+        );
+        RetainedTerrainBuilder::camera_from_input_with_plugins_weather_and_ground(
             &self.input,
             &self.plugins,
             self.input.weather.weather_time_s,
             self.overlay_rev,
             false,
-        );
-        let (p_layers, p_textures) = self.build_particle_layers();
+            weather_snapshot,
+            ground_elev,
+        )
+    }
+
+    fn publish_camera_and_particles(&mut self) {
+        let ws = self.resolve_weather_snapshot();
+        let cam_u = self.camera_uniforms_with_weather(ws);
+        let (p_layers, p_textures) = self.build_particle_layers(ws);
         self.retained
             .update_camera_and_particles(cam_u, p_layers, p_textures);
     }
 
+    fn publish_camera_and_ocean(&mut self) {
+        let ws = self.resolve_weather_snapshot();
+        let cam_u = self.camera_uniforms_with_weather(ws);
+        let ocean = self.build_ocean_surface(ws);
+        self.retained.update_camera_and_ocean(cam_u, ocean);
+    }
+
+    fn publish_camera_and_particles_and_ocean(&mut self) {
+        let ws = self.resolve_weather_snapshot();
+        let cam_u = self.camera_uniforms_with_weather(ws);
+        let (p_layers, p_textures) = self.build_particle_layers(ws);
+        let ocean = self.build_ocean_surface(ws);
+        self.retained
+            .update_camera_and_particles_and_ocean(cam_u, p_layers, p_textures, ocean);
+    }
+
     fn publish_camera_and_overlays(&mut self) {
-        let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
-            &self.input,
-            &self.plugins,
-            self.input.weather.weather_time_s,
-            self.overlay_rev,
-            false,
-        );
+        let ws = self.resolve_weather_snapshot();
+        let cam_u = self.camera_uniforms_with_weather(ws);
         let dyn_meshes = self.build_dynamic_overlays();
-        let (p_layers, p_textures) = self.build_particle_layers();
+        let (p_layers, p_textures) = self.build_particle_layers(ws);
+        let ocean = self.build_ocean_surface(ws);
         let has_world = self.world.read().map(|w| !w.is_empty()).unwrap_or(false);
         if has_world {
             let (assets, instances) = self.compile_world_retained();
-            self.retained.update_camera_and_world_and_particles(
-                cam_u, dyn_meshes, assets, instances, p_layers, p_textures,
-            );
+            self.retained
+                .update_camera_and_world_and_particles_and_ocean(
+                    cam_u, dyn_meshes, assets, instances, p_layers, p_textures, ocean,
+                );
         } else {
-            self.retained.update_camera_and_world_and_particles(
-                cam_u,
-                dyn_meshes,
-                Arc::default(),
-                Arc::default(),
-                p_layers,
-                p_textures,
-            );
+            self.retained
+                .update_camera_and_world_and_particles_and_ocean(
+                    cam_u,
+                    dyn_meshes,
+                    Arc::default(),
+                    Arc::default(),
+                    p_layers,
+                    p_textures,
+                    ocean,
+                );
         }
     }
 
@@ -2283,6 +3821,57 @@ impl EarthViewport {
         self.input.layers.labels = enabled;
     }
 
+    #[inline]
+    pub fn buildings_enabled(&self) -> bool {
+        self.input.layers.buildings
+    }
+
+    /// Toggles extruded 3D building rendering from the configured [`crate::scene::BuildingSource`].
+    pub fn set_buildings_enabled(&mut self, enabled: bool) {
+        if self.input.layers.buildings == enabled {
+            return;
+        }
+        self.input.layers.buildings = enabled;
+        self.publish_camera_and_overlays();
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Installs or clears a [`crate::scene::BuildingSource`] on the background worker and refreshes the view.
+    pub fn set_building_source(
+        &mut self,
+        source: Option<Box<dyn crate::scene::BuildingSource + Send>>,
+    ) {
+        self.worker.set_building_source(source);
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    #[inline]
+    pub fn graticule_enabled(&self) -> bool {
+        self.input.layers.graticule
+    }
+
+    /// Toggles the geodetic meridian/parallel graticule overlay in O(1).
+    pub fn set_graticule_enabled(&mut self, enabled: bool) {
+        if self.input.layers.graticule == enabled {
+            return;
+        }
+        self.input.layers.graticule = enabled;
+        self.publish_camera_and_overlays();
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
     /// Toggles live heightmap (DEM) fetching and terrain relief displacement cleanly.
     ///
     /// Immediately re-evaluates all [`crate::geodesy::AltitudeMode::Terrain`] objects in
@@ -2293,8 +3882,12 @@ impl EarthViewport {
         }
         self.input.elevation_enabled = enabled;
         self.refresh_world_objects();
-        if self.input.precipitation.enabled || self.had_active_particles {
-            self.publish_camera_and_particles();
+        if self.input.precipitation.enabled
+            || self.had_active_particles
+            || self.input.ocean_waves.enabled
+            || self.had_active_ocean
+        {
+            self.publish_camera_and_particles_and_ocean();
         }
         if !self.stopped.load(Ordering::Relaxed) {
             self.worker.request_update(self.input.clone());
@@ -2318,6 +3911,54 @@ impl EarthViewport {
         if need_worker && !self.stopped.load(Ordering::Relaxed) {
             self.worker.request_update(self.input.clone());
         }
+    }
+
+    #[inline]
+    pub fn local_atmosphere_config(&self) -> &LocalAtmosphereConfig {
+        &self.input.local_atmosphere
+    }
+
+    /// Updates optional realistic 2.5D sky, Sun, night stars, terrain lighting, and mountain shadow config in O(1).
+    pub fn set_local_atmosphere_config(&mut self, config: LocalAtmosphereConfig) {
+        let need_night_tiles = (self.input.local_atmosphere.night_stars_sync
+            && self.input.local_atmosphere.terrain_lighting)
+            != (config.night_stars_sync && config.terrain_lighting);
+        self.input.local_atmosphere = config;
+        self.publish_camera_and_particles_and_ocean();
+        if need_night_tiles && !self.stopped.load(Ordering::Relaxed) {
+            self.worker.request_update(self.input.clone());
+        }
+    }
+
+    #[inline]
+    pub fn base_weather_config(&self) -> &BaseWeatherConfig {
+        &self.input.base_weather
+    }
+
+    /// Updates the unified Base Weather API configuration in O(1), propagating coherently to
+    /// 2.5D sky/haze, 2.5D/3D cloud darkening, precipitation, and GPU ocean wave trains.
+    pub fn set_base_weather_config(&mut self, config: BaseWeatherConfig) {
+        self.input.base_weather = config;
+        self.publish_camera_and_particles_and_ocean();
+    }
+
+    /// Installs or clears a custom unified [`WeatherProvider`] driving precipitation, clouds,
+    /// sky darkening, and ocean wind transitions coherently.
+    pub fn set_weather_provider(&mut self, provider: Option<Arc<dyn WeatherProvider>>) {
+        self.weather_provider = provider.clone();
+        self.worker.set_weather_provider(provider);
+        self.publish_camera_and_particles_and_ocean();
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Returns the most recently evaluated unified [`WeatherSnapshot`], if `base_weather.enabled` is active.
+    #[inline]
+    pub fn last_weather_snapshot(&self) -> Option<WeatherSnapshot> {
+        self.last_weather_snapshot
     }
 
     #[inline]
@@ -2402,10 +4043,12 @@ impl EarthViewport {
         &self.input.ocean_waves
     }
 
-    /// Updates optional animated wavy ocean rendering configuration on non-land water surfaces.
+    /// Updates optional GPU-native physical ocean waves & coastal surf configuration in O(1).
     pub fn set_ocean_waves_config(&mut self, ocean_waves: OceanWavesConfig) {
+        let was_enabled = self.input.ocean_waves.enabled;
         let enabled = ocean_waves.enabled;
-        let changed = self.input.ocean_waves != ocean_waves;
+        let coastal_turned_on =
+            !self.input.ocean_waves.coastal_shoaling && ocean_waves.coastal_shoaling;
         self.input.ocean_waves = ocean_waves;
         if enabled {
             if self.plugins.contains(OceanWavesPlugin::ID) {
@@ -2414,8 +4057,9 @@ impl EarthViewport {
                 self.plugins.register(OceanWavesPlugin::new());
             }
         }
-        self.publish_camera_and_overlays();
-        if changed && !self.stopped.load(Ordering::Relaxed) {
+        self.publish_camera_and_ocean();
+        if ((!was_enabled && enabled) || coastal_turned_on) && !self.stopped.load(Ordering::Relaxed)
+        {
             self.worker.request_update(self.input.clone());
         }
     }
@@ -2433,7 +4077,7 @@ impl EarthViewport {
         self.publish_camera_and_overlays();
     }
 
-    /// Returns `true` when global cloud spin or active precipitation need continuous animation ticks.
+    /// Returns `true` when global cloud spin, active precipitation, or unified weather precipitation need ticks.
     pub fn has_active_weather_animation(&self) -> bool {
         let ll = self.input.low_level_state();
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
@@ -2444,8 +4088,9 @@ impl EarthViewport {
             && flat_t < 0.85
             && w.global_cloud_spin_rad_s.abs() > 1e-9;
         let precip = self.plugins.is_active(PrecipitationPlugin::ID)
-            && self.input.precipitation.enabled
-            && self.input.precipitation.intensity > 0.002;
+            && ((self.input.precipitation.enabled && self.input.precipitation.intensity > 0.002)
+                || (self.input.base_weather.enabled
+                    && self.input.precipitation.sync_with_base_weather));
         spin_3d || precip
     }
 
@@ -2454,46 +4099,74 @@ impl EarthViewport {
         if !self.has_active_weather_animation() {
             return false;
         }
+        let ws = self.resolve_weather_snapshot();
+        let ground_elevation_m = self.sample_ground_elevation_m(
+            self.input.camera.focus.lat_deg,
+            self.input.camera.focus.lon_deg,
+        );
         let ctx = EarthPluginFrameContext {
             input: &self.input,
             low_level: self.input.low_level_state(),
             altitude_m: self.input.camera.altitude_m(),
+            ground_elevation_m,
             time_s: self.input.weather.weather_time_s,
             overlay_rev: self.overlay_rev,
             is_dragging: false,
+            weather_snapshot: ws,
         };
-        let (other_dirty, particle_dirty) = self.plugins.run_tick_detailed(dt_s, &ctx);
+        let (other_dirty, particle_dirty, ocean_dirty) =
+            self.plugins.run_tick_detailed(dt_s, &ctx);
         if other_dirty {
             self.publish_camera_and_overlays();
             true
+        } else if particle_dirty && ocean_dirty {
+            self.publish_camera_and_particles_and_ocean();
+            true
         } else if particle_dirty {
             self.publish_camera_and_particles();
+            true
+        } else if ocean_dirty {
+            self.publish_camera_and_ocean();
             true
         } else {
             false
         }
     }
 
-    /// Advances all animated plugins (precipitation, ocean waves, cloud spin, satellites, custom plugins) in O(1).
+    /// Advances all animated plugins (precipitation, GPU ocean waves, cloud spin, satellites, custom plugins) in O(1).
     pub fn step_dynamic_overlays(&mut self, dt_s: f64, tick_satellites: bool) -> bool {
         let ll = self.input.low_level_state();
+        let ws = self.resolve_weather_snapshot();
+        let ground_elevation_m = self.sample_ground_elevation_m(
+            self.input.camera.focus.lat_deg,
+            self.input.camera.focus.lon_deg,
+        );
         let ctx = EarthPluginFrameContext {
             input: &self.input,
             low_level: ll,
             altitude_m: self.input.camera.altitude_m(),
+            ground_elevation_m,
             time_s: self.input.weather.weather_time_s,
             overlay_rev: self.overlay_rev,
             is_dragging: !tick_satellites,
+            weather_snapshot: ws,
         };
         if !self.plugins.any_wants_animation_tick(&ctx) {
             return false;
         }
-        let (other_dirty, particle_dirty) = self.plugins.run_tick_detailed(dt_s, &ctx);
+        let (other_dirty, particle_dirty, ocean_dirty) =
+            self.plugins.run_tick_detailed(dt_s, &ctx);
         if other_dirty {
             self.publish_camera_and_overlays();
             true
+        } else if particle_dirty && ocean_dirty {
+            self.publish_camera_and_particles_and_ocean();
+            true
         } else if particle_dirty {
             self.publish_camera_and_particles();
+            true
+        } else if ocean_dirty {
+            self.publish_camera_and_ocean();
             true
         } else {
             false
@@ -2520,10 +4193,19 @@ impl EarthViewport {
             EarthViewMode::Mode3D => 0.0,
             EarthViewMode::Mode2D => 1.0,
         };
+        // Avoid a 1-frame jump to map_2d_morph=1.0 when initiating 3D -> 2D animation
+        // (since `low_level_state` falls back to view_mode when `view_morph == 0.0`).
+        if mode == EarthViewMode::Mode2D
+            && self.linear_morph < 1e-4
+            && self.input.view_morph <= 0.0
+        {
+            self.input.view_morph = 1e-5;
+        }
     }
 
     /// Programmatically switches between `Mode3D` and `Mode2D` immediately without animation.
     pub fn set_view_mode_immediate(&mut self, mode: EarthViewMode) {
+        let prev_canon = Self::is_input_canonical_2d(&self.input);
         self.input.view_mode = mode;
         let val = match mode {
             EarthViewMode::Mode3D => 0.0,
@@ -2532,9 +4214,18 @@ impl EarthViewport {
         self.target_morph = val;
         self.linear_morph = val;
         self.input.view_morph = val;
-        self.publish_camera_and_overlays();
-        if !self.stopped.load(Ordering::Relaxed) {
-            self.worker.request_update(self.input.clone());
+        let next_canon = Self::is_input_canonical_2d(&self.input);
+        if prev_canon != next_canon {
+            if !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update(self.input.clone());
+                self.worker.flush();
+            }
+            self.publish_camera_and_overlays();
+        } else {
+            self.publish_camera_and_overlays();
+            if !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update(self.input.clone());
+            }
         }
     }
 
@@ -2548,14 +4239,24 @@ impl EarthViewport {
     ///
     /// Returns `true` if a frame update was produced.
     pub fn step_transition(&mut self, dt_s: f64) -> bool {
+        let prev_canon = Self::is_input_canonical_2d(&self.input);
         let diff = self.target_morph - self.linear_morph;
         if diff.abs() <= 1e-4 {
             if (self.input.view_morph - self.target_morph).abs() > 1e-4 {
                 self.linear_morph = self.target_morph;
                 self.input.view_morph = self.target_morph;
-                self.publish_camera_and_overlays();
-                if !self.stopped.load(Ordering::Relaxed) {
-                    self.worker.request_update(self.input.clone());
+                let next_canon = Self::is_input_canonical_2d(&self.input);
+                if prev_canon != next_canon {
+                    if !self.stopped.load(Ordering::Relaxed) {
+                        self.worker.request_update(self.input.clone());
+                        self.worker.flush();
+                    }
+                    self.publish_camera_and_overlays();
+                } else {
+                    self.publish_camera_and_overlays();
+                    if !self.stopped.load(Ordering::Relaxed) {
+                        self.worker.request_update(self.input.clone());
+                    }
                 }
                 return true;
             }
@@ -2570,9 +4271,18 @@ impl EarthViewport {
         let t = self.linear_morph.clamp(0.0, 1.0);
         // Cubic Hermite ease-in-out
         self.input.view_morph = t * t * (3.0 - 2.0 * t);
-        self.publish_camera_and_overlays();
-        if !self.stopped.load(Ordering::Relaxed) {
-            self.worker.request_update(self.input.clone());
+        let next_canon = Self::is_input_canonical_2d(&self.input);
+        if prev_canon != next_canon {
+            if !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update(self.input.clone());
+                self.worker.flush();
+            }
+            self.publish_camera_and_overlays();
+        } else {
+            self.publish_camera_and_overlays();
+            if !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update(self.input.clone());
+            }
         }
         true
     }
@@ -2584,13 +4294,8 @@ impl EarthViewport {
     }
 
     fn publish_camera_and_world(&mut self) {
-        let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
-            &self.input,
-            &self.plugins,
-            self.input.weather.weather_time_s,
-            self.overlay_rev,
-            false,
-        );
+        let ws = self.resolve_weather_snapshot();
+        let cam_u = self.camera_uniforms_with_weather(ws);
         let (assets, instances) = self.compile_world_retained();
         self.retained
             .update_camera_and_geo_objects(cam_u, assets, instances);
@@ -2610,15 +4315,21 @@ impl EarthViewport {
         self.input.viewport.height = viewport_h.max(1.0) as f32;
         let ll = self.input.low_level_state();
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
-        let ocean_active = self.input.ocean_waves.enabled
-            && self.plugins.is_active(OceanWavesPlugin::ID)
-            && camera.altitude_m() < 520_000.0;
+        let ocean_hooked = self
+            .plugins
+            .active_hooks()
+            .intersects(EarthPluginHooks::OCEAN);
+        let need_ocean =
+            ocean_hooked && (self.input.ocean_waves.enabled || self.had_active_ocean);
         let particles_hooked = self
             .plugins
             .active_hooks()
             .intersects(EarthPluginHooks::PARTICLES);
-        let need_particles =
-            particles_hooked && (self.input.precipitation.enabled || self.had_active_particles);
+        let need_particles = particles_hooked
+            && (self.input.precipitation.enabled
+                || self.had_active_particles
+                || (self.input.base_weather.enabled
+                    && self.input.precipitation.sync_with_base_weather));
 
         let (has_world, has_px_sized) = self
             .world
@@ -2628,7 +4339,12 @@ impl EarthViewport {
         let need_geo_refresh = if has_world {
             let cur_sig = mesh_morph_signature(self.current_surface_morph());
             let cur_dist = camera.eye_distance_m();
+            let cur_lon_sector =
+                (crate::geodesy::wrap_longitude(camera.focus.lon_deg) / 30.0).round() as i32;
+            let wrap_sector_changed =
+                Self::is_input_canonical_2d(&self.input) && cur_lon_sector != self.last_geo_lon_sector;
             cur_sig != self.last_geo_morph_sig
+                || wrap_sector_changed
                 || (has_px_sized
                     && (cur_dist - self.last_geo_eye_dist_m).abs()
                         > self.last_geo_eye_dist_m.max(1.0) * 0.025)
@@ -2636,49 +4352,172 @@ impl EarthViewport {
             false
         };
 
-        if (flat_t - self.last_overlay_flat_t).abs() > 0.015 || ocean_active {
+        if (flat_t - self.last_overlay_flat_t).abs() > 0.015 {
             self.publish_camera_and_overlays();
-        } else if need_geo_refresh && need_particles {
-            let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
-                &self.input,
-                &self.plugins,
-                self.input.weather.weather_time_s,
-                self.overlay_rev,
-                false,
-            );
+        } else if need_geo_refresh && (need_particles || need_ocean) {
+            let ws = self.resolve_weather_snapshot();
+            let cam_u = self.camera_uniforms_with_weather(ws);
+            let dyn_meshes = self.build_dynamic_overlays();
             let (assets, instances) = self.compile_world_retained();
-            let (p_layers, p_textures) = self.build_particle_layers();
-            self.retained.update_camera_and_geo_and_particles(
-                cam_u, assets, instances, p_layers, p_textures,
-            );
+            let (p_layers, p_textures) = self.build_particle_layers(ws);
+            let ocean = self.build_ocean_surface(ws);
+            self.retained
+                .update_camera_and_world_and_particles_and_ocean(
+                    cam_u, dyn_meshes, assets, instances, p_layers, p_textures, ocean,
+                );
         } else if need_geo_refresh {
             self.publish_camera_and_world();
+        } else if need_particles && need_ocean {
+            self.publish_camera_and_particles_and_ocean();
         } else if need_particles {
             self.publish_camera_and_particles();
+        } else if need_ocean {
+            self.publish_camera_and_ocean();
         } else {
-            let cam_u = RetainedTerrainBuilder::camera_from_input_with_plugins(
-                &self.input,
-                &self.plugins,
-                self.input.weather.weather_time_s,
-                self.overlay_rev,
-                false,
-            );
+            let ws = self.resolve_weather_snapshot();
+            let cam_u = self.camera_uniforms_with_weather(ws);
             self.retained.update_camera(cam_u);
         }
-        if !self.stopped.load(Ordering::Relaxed) {
-            self.worker.request_update(self.input.clone());
+        let pose_sig = Self::camera_pose_signature(&self.input);
+        if pose_sig != self.last_camera_pose_sig {
+            self.last_camera_pose_sig = pose_sig;
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
         }
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Returns the active [`IdleHighResConfig`] (`enabled: false` by default).
+    #[inline]
+    pub fn idle_high_res_config(&self) -> IdleHighResConfig {
+        self.input.idle_high_res
+    }
+
+    /// Updates opt-in idle high-resolution view refinement settings.
+    pub fn set_idle_high_res_config(&mut self, config: IdleHighResConfig) {
+        let changed = self.input.idle_high_res != config;
+        self.input.idle_high_res = config;
+        if !config.enabled {
+            let was_refined = self.idle_stage != 0;
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
+            if was_refined && !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update_with_idle(self.input.clone(), 0.0);
+            }
+        } else if changed {
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
+        }
+    }
+
+    /// Convenience toggle enabling or disabling optional idle high-resolution refinement.
+    pub fn set_idle_high_res_enabled(&mut self, enabled: bool) {
+        let mut cfg = self.input.idle_high_res;
+        cfg.enabled = enabled;
+        self.set_idle_high_res_config(cfg);
+    }
+
+    /// Returns the current progressive idle refinement weight (`0.0` moving/off, `0.5` stage 1, `1.0` stage 2).
+    #[inline]
+    pub fn idle_refinement_factor(&self) -> f32 {
+        if !self.input.idle_high_res.enabled {
+            0.0
+        } else {
+            match self.idle_stage {
+                0 => 0.0,
+                1 => 0.5,
+                _ => 1.0,
+            }
+        }
+    }
+
+    /// Returns `true` when idle high-res refinement is enabled and currently refining the stationary view.
+    #[inline]
+    pub fn is_idle_high_res_active(&self) -> bool {
+        self.input.idle_high_res.enabled && self.idle_stage > 0
+    }
+
+    /// Advances stationary-camera idle high-resolution refinement by `dt_s` seconds.
+    ///
+    /// Does zero work when [`IdleHighResConfig::enabled`] is `false`. When enabled and
+    /// `is_interacting == false`, promotes refinement in two smooth stages (`0.5` after
+    /// `idle_delay_s`, `1.0` after `idle_delay_s * 2.2`), queueing a single background LOD
+    /// pass per promotion so viewed tiles progressively sharpen without flooding the queue.
+    pub fn step_idle_refinement(&mut self, dt_s: f64, is_interacting: bool) -> bool {
+        if !self.input.idle_high_res.enabled {
+            let was_refined = self.idle_stage != 0;
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
+            if was_refined && !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update_with_idle(self.input.clone(), 0.0);
+            }
+            return was_refined;
+        }
+        if is_interacting {
+            let was_refined = self.idle_stage != 0;
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
+            if was_refined && !self.stopped.load(Ordering::Relaxed) {
+                self.worker.request_update_with_idle(self.input.clone(), 0.0);
+            }
+            return was_refined;
+        }
+        let dt = dt_s.clamp(0.0, 0.25);
+        self.idle_elapsed_s += dt;
+        let delay1 = self.input.idle_high_res.idle_delay_s.clamp(0.05, 10.0);
+        let delay2 = delay1 * 2.2;
+        let next_stage = if self.idle_elapsed_s >= delay2 {
+            2
+        } else if self.idle_elapsed_s >= delay1 {
+            1
+        } else {
+            0
+        };
+        if next_stage != self.idle_stage {
+            self.idle_stage = next_stage;
+            if !self.stopped.load(Ordering::Relaxed) {
+                let idle_f = self.idle_refinement_factor();
+                self.worker
+                    .request_update_with_idle(self.input.clone(), idle_f);
+            }
+            return true;
+        }
+        false
     }
 
     /// Updates full [`EarthInput`] configuration (`layers`, `surface_mode`, `camera`, `viewport`, etc.).
     pub fn update_input(&mut self, input: &EarthInput) {
+        let prev_canon = Self::is_input_canonical_2d(&self.input);
         self.input = input.clone();
         let target = self.input.low_level_state().map_2d_morph;
         self.target_morph = target;
         self.linear_morph = target;
-        self.publish_camera_and_overlays();
-        if !self.stopped.load(Ordering::Relaxed) {
-            self.worker.request_update(self.input.clone());
+        let pose_sig = Self::camera_pose_signature(&self.input);
+        if pose_sig != self.last_camera_pose_sig || !self.input.idle_high_res.enabled {
+            self.last_camera_pose_sig = pose_sig;
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
+        }
+        let next_canon = Self::is_input_canonical_2d(&self.input);
+        if prev_canon != next_canon {
+            if !self.stopped.load(Ordering::Relaxed) {
+                let idle_f = self.idle_refinement_factor();
+                self.worker
+                    .request_update_with_idle(self.input.clone(), idle_f);
+                self.worker.flush();
+            }
+            self.publish_camera_and_overlays();
+        } else {
+            self.publish_camera_and_overlays();
+            if !self.stopped.load(Ordering::Relaxed) {
+                let idle_f = self.idle_refinement_factor();
+                self.worker
+                    .request_update_with_idle(self.input.clone(), idle_f);
+            }
         }
     }
 
@@ -2695,9 +4534,11 @@ impl EarthViewport {
             || self.active_provider.headers != config.headers;
         self.active_provider = config.clone();
         self.input.max_tile_level = config.max_imagery_level.clamp(4, 19);
+        self.idle_elapsed_s = 0.0;
+        self.idle_stage = 0;
         self.worker.set_tile_provider(config, elev_changed);
         if !self.stopped.load(Ordering::Relaxed) {
-            self.worker.request_update(self.input.clone());
+            self.worker.request_update_with_idle(self.input.clone(), 0.0);
         }
     }
 
@@ -2708,9 +4549,11 @@ impl EarthViewport {
 
     /// Replaces the underlying [`TileSource`] cleanly and rebuilds terrain textures & meshes.
     pub fn set_tile_source(&mut self, source: Box<dyn TileSource + Send>) {
+        self.idle_elapsed_s = 0.0;
+        self.idle_stage = 0;
         self.worker.set_tile_source(source);
         if !self.stopped.load(Ordering::Relaxed) {
-            self.worker.request_update(self.input.clone());
+            self.worker.request_update_with_idle(self.input.clone(), 0.0);
         }
     }
 
@@ -2754,6 +4597,40 @@ impl EarthViewport {
         self.world_mut(|w| w.spawn(object))
     }
 
+    /// Validated convenience wrapper spawning a glTF 2.0 binary (`.glb`) object and returning a `Result`.
+    pub fn spawn_glb(
+        &mut self,
+        position: crate::geodesy::GeoPosition,
+        bytes: &[u8],
+        unit_scale_m: f64,
+        anchor: crate::world::ObjectAnchor,
+    ) -> Result<EarthObjectId, String> {
+        self.world_mut(|w| w.spawn_glb(position, bytes, unit_scale_m, anchor))
+    }
+
+    /// Updates a [`crate::world::EarthGeometry::Polyline`] object's vertices in place without leaking CPU or GPU meshes.
+    pub fn set_polyline_points(
+        &mut self,
+        id: EarthObjectId,
+        points: Vec<crate::geodesy::GeoPosition>,
+    ) -> bool {
+        self.world_mut(|w| w.set_polyline_points(id, points))
+    }
+
+    /// Updates a [`crate::world::EarthGeometry::Polyline`] object's tube radius in place without leaking CPU or GPU meshes.
+    pub fn set_polyline_radius(&mut self, id: EarthObjectId, radius_m: f64) -> bool {
+        self.world_mut(|w| w.set_polyline_radius(id, radius_m))
+    }
+
+    /// Replaces `id`'s [`crate::world::EarthGeometry`] in place and evicts any unreferenced mesh buffers.
+    pub fn replace_geometry(
+        &mut self,
+        id: EarthObjectId,
+        geometry: crate::world::EarthGeometry,
+    ) -> bool {
+        self.world_mut(|w| w.replace_geometry(id, geometry))
+    }
+
     /// Removes a geodetic [`EarthObject`] by ID, returning `true` if it existed.
     pub fn remove_object(&mut self, id: EarthObjectId) -> bool {
         self.world_mut(|w| w.remove(id))
@@ -2764,11 +4641,117 @@ impl EarthViewport {
         self.world_mut(|w| w.clear());
     }
 
+    /// Returns `true` if the world currently contains at least one visible object with a non-empty [`EarthObject::label`].
+    pub fn has_labeled_objects(&self) -> bool {
+        let Ok(guard) = self.world.read() else {
+            return false;
+        };
+        let has = guard.iter().any(|(_, obj)| {
+            obj.visible
+                && obj
+                    .label
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty())
+        });
+        has
+    }
+
+    /// Projects all visible [`EarthObject::label`] annotations into screen coordinates for HUD overlay rendering.
+    pub fn project_object_labels(&self) -> Vec<crate::labels::ProjectedEarthLabel> {
+        let Ok(guard) = self.world.read() else {
+            return Vec::new();
+        };
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        let morph = self.current_surface_morph();
+        let placement = self
+            .input
+            .camera
+            .placement_for_morph(morph, self.camera_up_dvec());
+        let vp_h = self.input.viewport.height.max(1.0) as f64;
+        let fov_y = self.input.camera.fov_y_deg;
+        let elev_on = self.input.elevation_enabled;
+        let worker_ref = &self.worker;
+        let projector = crate::labels::EarthScreenProjector::from_input(&self.input);
+        let vw = self.input.viewport.width.max(1.0);
+        let vh = self.input.viewport.height.max(1.0);
+        let mut out = Vec::new();
+        for (id, obj) in guard.iter() {
+            if !obj.visible {
+                continue;
+            }
+            let Some(ref raw_label) = obj.label else {
+                continue;
+            };
+            let text = raw_label.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let Some(tf) = guard.resolve_object_transform(
+                id,
+                placement.eye,
+                vp_h,
+                fov_y,
+                elev_on,
+                morph,
+                &|lat, lon| {
+                    if elev_on {
+                        worker_ref.sample_ground_elevation_m(lat, lon)
+                    } else {
+                        0.0
+                    }
+                },
+            ) else {
+                continue;
+            };
+            let z_col = tf.model_cols[2];
+            let z_scale = ((z_col[0] as f64).powi(2)
+                + (z_col[1] as f64).powi(2)
+                + (z_col[2] as f64).powi(2))
+            .sqrt();
+            let top_lift_m = (tf.local_aabb_max[2].max(0.0) as f64) * z_scale;
+            let label_alt_m = tf.resolved_altitude_m + top_lift_m;
+            let Some((raw_x, raw_y, ndc_x, ndc_y, horizon_fade)) = projector.project_raw(
+                obj.position.lat_deg,
+                obj.position.lon_deg,
+                label_alt_m,
+            ) else {
+                continue;
+            };
+            if horizon_fade <= 0.03 || ndc_x.abs() > 0.98 || ndc_y.abs() > 0.98 {
+                continue;
+            }
+            let c = obj.material.color;
+            let rgb = [
+                ((c.r().clamp(0.45, 1.0)) * 255.0).round() as u8,
+                ((c.g().clamp(0.45, 1.0)) * 255.0).round() as u8,
+                ((c.b().clamp(0.45, 1.0)) * 255.0).round() as u8,
+            ];
+            out.push(crate::labels::ProjectedEarthLabel {
+                id: 0xE0B7_0000_0000_0000u64 ^ id.0,
+                text: text.to_string(),
+                subtitle: None,
+                kind: crate::labels::EarthLabelKind::City,
+                icon: crate::labels::EarthLabelIcon::CityDot,
+                screen_x: raw_x.clamp(16.0, (vw - 16.0).max(16.0)),
+                screen_y: (raw_y - 10.0).clamp(14.0, (vh - 14.0).max(14.0)),
+                alpha: horizon_fade.clamp(0.0, 1.0),
+                rgb,
+                font_px: 12.5,
+            });
+        }
+        out
+    }
+
     /// Evaluates the live world transform (including resolved `Terrain` vs `SeaLevel` altitude)
     /// for `id` under the current heightmap and view-morph state.
     pub fn resolve_object_transform(&self, id: EarthObjectId) -> Option<ResolvedObjectTransform> {
         let morph = self.current_surface_morph();
-        let placement = self.input.camera.placement_with_up(self.camera_up_dvec());
+        let placement = self
+            .input
+            .camera
+            .placement_for_morph(morph, self.camera_up_dvec());
         let vp_h = self.input.viewport.height.max(1.0) as f64;
         let fov_y = self.input.camera.fov_y_deg;
         let elev_on = self.input.elevation_enabled;
@@ -2824,12 +4807,13 @@ impl EarthViewport {
         let morph = self.current_surface_morph();
         let elev_on = self.input.elevation_enabled;
         let worker_ref = &self.worker;
-        let (ray_origin, ray_dir) = crate::geodesy::screen_to_ray_with_up(
+        let (ray_origin, ray_dir) = screen_to_ray_for_morph(
             screen_x,
             screen_y,
             self.input.viewport.width as f64,
             self.input.viewport.height as f64,
             &self.input.camera,
+            morph,
             self.camera_up_dvec(),
         );
         raycast_surface_ray(ray_origin, ray_dir, elev_on, morph, &|lat, lon| {

@@ -165,9 +165,12 @@ fn ascending_through_freezing_level_transitions_rain_to_snow_and_stops_above_clo
     input.precipitation.atmosphere.base_temp_c = 12.0;
     input.precipitation.atmosphere.cloud_ceiling = CloudCeiling::FixedMsl(5_500.0);
 
-    // 1. Low altitude (400 m MSL -> ~+9.4°C): pure fast 2D rain streaks.
+    // 1. Low altitude (400 m MSL -> ~+9.4°C): fast 2D rain streaks (near, mid, far curtain shells).
     let (frame_rain, _) = builder.build_frame(&input, &mut src, 1, true);
-    assert_eq!(frame_rain.particle_layers.len(), 1);
+    assert!(
+        !frame_rain.particle_layers.is_empty(),
+        "rain must emit near + far-field shells"
+    );
     assert_eq!(
         frame_rain.particle_layers[0].sprite,
         RetainedParticleSprite::ProceduralStreak
@@ -186,10 +189,10 @@ fn ascending_through_freezing_level_transitions_rain_to_snow_and_stops_above_clo
         frame_mix.particle_layers.len()
     );
 
-    // 3. Cold sub-cloud altitude (3,200 m MSL -> ~-8.8°C): pure mathematical 2D snowflakes.
+    // 3. Cold sub-cloud altitude (3,200 m MSL -> ~-8.8°C): mathematical 2D snowflakes + squall curtains.
     input.camera.eye_offset_m = [0.0, -300.0, 3_200.0];
     let (frame_snow, _) = builder.build_frame(&input, &mut src, 3, true);
-    assert_eq!(frame_snow.particle_layers.len(), 1);
+    assert!(!frame_snow.particle_layers.is_empty());
     assert_eq!(
         frame_snow.particle_layers[0].sprite,
         RetainedParticleSprite::ProceduralSnowflake
@@ -202,7 +205,7 @@ fn ascending_through_freezing_level_transitions_rain_to_snow_and_stops_above_clo
     // 4. Approaching cloud ceiling (5,250 m MSL inside [4,600..5,500] fade band): reduced opacity/count.
     input.camera.eye_offset_m = [0.0, -300.0, 5_250.0];
     let (frame_fade, _) = builder.build_frame(&input, &mut src, 4, true);
-    assert_eq!(frame_fade.particle_layers.len(), 1);
+    assert!(!frame_fade.particle_layers.is_empty());
     assert!(
         frame_fade.particle_layers[0].color[3] < frame_snow.particle_layers[0].color[3],
         "opacity must smoothly fade as camera approaches cloud ceiling"
@@ -226,7 +229,7 @@ fn panning_camera_right_shifts_toroidal_rain_phase_left_with_zero_drift() {
     input.precipitation.wind_mps = [0.0, 0.0]; // Isolate pure camera-pan parallax
 
     let (frame_a, _) = builder.build_frame(&input, &mut src, 1, true);
-    assert_eq!(frame_a.particle_layers.len(), 1);
+    assert!(!frame_a.particle_layers.is_empty());
     let phase_a = frame_a.particle_layers[0].wrapped_phase;
     let extent_xy = frame_a.particle_layers[0].volume_params[0];
 
@@ -416,7 +419,7 @@ fn earth_viewport_runs_fast_particle_ticks_and_exposes_live_atmosphere_sample() 
         .retained_scene()
         .snapshot_terrain()
         .expect("terrain frame snapshot");
-    assert_eq!(frame.particle_layers.len(), 1);
+    assert!(!frame.particle_layers.is_empty());
     assert_eq!(
         frame.particle_layers[0].sprite,
         RetainedParticleSprite::ProceduralStreak
@@ -432,7 +435,7 @@ fn earth_viewport_runs_fast_particle_ticks_and_exposes_live_atmosphere_sample() 
         .retained_scene()
         .snapshot_terrain()
         .expect("cold terrain frame snapshot");
-    assert_eq!(cold_frame.particle_layers.len(), 1);
+    assert!(!cold_frame.particle_layers.is_empty());
     assert_eq!(
         cold_frame.particle_layers[0].sprite,
         RetainedParticleSprite::ProceduralSnowflake

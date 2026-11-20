@@ -7,15 +7,19 @@
 //! 3D/2.5D/2D surface morphing compile in `O(N)` into hardware-instanced [`RetainedGeoInstance`]s.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use strata_render::camera64::DVec3;
-use strata_render::scene3d::{RetainedGeoInstance, RetainedMeshAsset, RteTileVertex};
+use strata_render::scene3d::{
+    RetainedGeoInstance, RetainedMeshAsset, RetainedTileTexture, RteTileVertex,
+};
 use strata_render::terrain3d::MeshBuilder;
 use strata_style::Color;
 
 use crate::geodesy::{
-    project_morphed_point_and_frame, AltitudeMode, GeoPosition, LocalFrame, SurfaceMorphParams,
+    geodetic_to_ecef, project_morphed_point_and_frame, wgs84, wrap_longitude, AltitudeMode,
+    GeoPosition, Geodetic, LocalFrame, SurfaceMorphParams,
 };
 
 /// Stable handle to an [`EarthObject`] spawned in an [`EarthWorld`].
@@ -341,13 +345,15 @@ impl EarthGeometry {
 }
 
 /// Surface shading parameters for an [`EarthObject`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EarthMaterial {
     pub color: Color,
     pub roughness: f32,
     pub metalness: f32,
     pub emissive: Color,
     pub unlit: bool,
+    /// Optional RGBA8 albedo texture multiplied with `color` (`None` = solid color).
+    pub albedo_texture: Option<Arc<RetainedTileTexture>>,
 }
 
 impl Default for EarthMaterial {
@@ -365,6 +371,7 @@ impl EarthMaterial {
             metalness: 0.15,
             emissive: Color::rgba(0, 0, 0, 0),
             unlit: false,
+            albedo_texture: None,
         }
     }
 
@@ -376,6 +383,7 @@ impl EarthMaterial {
             metalness: 0.78,
             emissive: Color::rgba(0, 0, 0, 0),
             unlit: false,
+            albedo_texture: None,
         }
     }
 
@@ -387,6 +395,7 @@ impl EarthMaterial {
             metalness: 0.12,
             emissive,
             unlit: false,
+            albedo_texture: None,
         }
     }
 
@@ -398,7 +407,48 @@ impl EarthMaterial {
             metalness: 0.0,
             emissive: Color::rgba(0, 0, 0, 0),
             unlit: true,
+            albedo_texture: None,
         }
+    }
+
+    /// Attaches a pre-built [`RetainedTileTexture`] as the material's albedo texture.
+    #[inline]
+    pub fn with_albedo_texture(mut self, texture: Arc<RetainedTileTexture>) -> Self {
+        self.albedo_texture = Some(texture);
+        self
+    }
+
+    /// Creates and attaches an RGBA8 albedo texture with a globally unique GPU texture ID.
+    pub fn with_albedo_rgba8(mut self, width: u32, height: u32, rgba8: Vec<u8>) -> Self {
+        if width > 0 && height > 0 && rgba8.len() >= (width as usize) * (height as usize) * 4 {
+            self.albedo_texture = Some(Arc::new(RetainedTileTexture {
+                id: crate::gltf::alloc_earth_material_texture_id(),
+                revision: 1,
+                width,
+                height,
+                rgba8: Arc::new(rgba8),
+            }));
+        }
+        self
+    }
+
+    /// Decodes an encoded PNG, JPEG, or WebP image buffer and attaches it as the albedo texture.
+    pub fn with_albedo_image_bytes(mut self, encoded_bytes: &[u8]) -> Result<Self, String> {
+        let img = image::load_from_memory(encoded_bytes)
+            .map_err(|e| format!("failed to decode albedo texture image: {e}"))?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return Err("decoded albedo texture has zero dimensions".to_string());
+        }
+        self.albedo_texture = Some(Arc::new(RetainedTileTexture {
+            id: crate::gltf::alloc_earth_material_texture_id(),
+            revision: 1,
+            width: w,
+            height: h,
+            rgba8: Arc::new(rgba.into_raw()),
+        }));
+        Ok(self)
     }
 }
 
@@ -668,11 +718,17 @@ struct StoredObject {
     dynamic_polyline: Option<(Vec<GeoPosition>, f64, u64)>,
 }
 
+static NEXT_GLOBAL_MESH_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn alloc_global_mesh_id() -> EarthMeshId {
+    EarthMeshId(NEXT_GLOBAL_MESH_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Self-contained planetary 3D object scene graph for `strata_earth`.
 #[derive(Debug, Clone)]
 pub struct EarthWorld {
     next_object_id: u64,
-    next_mesh_id: u64,
     revision: u64,
     meshes: BTreeMap<EarthMeshId, CompiledMeshEntry>,
     primitive_cache: HashMap<PrimitiveCacheKey, EarthMeshId>,
@@ -692,7 +748,6 @@ impl EarthWorld {
     pub fn new() -> Self {
         Self {
             next_object_id: 1,
-            next_mesh_id: 1,
             revision: 1,
             meshes: BTreeMap::new(),
             primitive_cache: HashMap::new(),
@@ -718,11 +773,19 @@ impl EarthWorld {
         self.objects.is_empty()
     }
 
+    /// Returns the number of compiled [`EarthMeshId`] assets currently resident in this world.
+    #[inline]
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
+    }
+
     /// Registers a reusable local-space [`EarthGeometry`] and returns its [`EarthMeshId`].
     pub fn register_mesh(&mut self, geometry: EarthGeometry) -> EarthMeshId {
         if let Some(key) = PrimitiveCacheKey::from_geometry(&geometry) {
             if let Some(&existing) = self.primitive_cache.get(&key) {
-                return existing;
+                if self.meshes.contains_key(&existing) {
+                    return existing;
+                }
             }
             let id = self.insert_compiled_mesh(&geometry);
             self.primitive_cache.insert(key, id);
@@ -731,14 +794,78 @@ impl EarthWorld {
         self.insert_compiled_mesh(&geometry)
     }
 
+    /// Parses and registers a glTF 2.0 `.glb` mesh, returning an explicit error instead of
+    /// falling back to a placeholder triangle when the binary asset is malformed.
+    pub fn register_glb_checked(
+        &mut self,
+        bytes: &[u8],
+        unit_scale_m: f64,
+        anchor: ObjectAnchor,
+    ) -> Result<EarthMeshId, String> {
+        let parsed = crate::gltf::parse_glb_mesh(bytes)?;
+        let id = alloc_global_mesh_id();
+        let entry = build_glb_mesh_entry(id.0, 1, parsed, unit_scale_m, anchor);
+        self.meshes.insert(id, entry);
+        self.meshes_revision = self.meshes_revision.wrapping_add(1);
+        self.cached_asset_list = None;
+        Ok(id)
+    }
+
+    /// Parses and spawns a glTF 2.0 `.glb` object at `position`, returning an error if parsing fails.
+    pub fn spawn_glb(
+        &mut self,
+        position: GeoPosition,
+        bytes: &[u8],
+        unit_scale_m: f64,
+        anchor: ObjectAnchor,
+    ) -> Result<EarthObjectId, String> {
+        let parsed = crate::gltf::parse_glb_mesh(bytes)?;
+        let mat = EarthMaterial {
+            color: Color::rgba(
+                (parsed.base_color_factor[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (parsed.base_color_factor[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (parsed.base_color_factor[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (parsed.base_color_factor[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ),
+            roughness: parsed.roughness_factor,
+            metalness: parsed.metallic_factor,
+            emissive: Color::rgba(
+                (parsed.emissive_factor[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (parsed.emissive_factor[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (parsed.emissive_factor[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                if parsed.emissive_factor.iter().any(|&c| c > 1e-4) {
+                    255
+                } else {
+                    0
+                },
+            ),
+            unlit: false,
+            albedo_texture: parsed.albedo_texture.clone(),
+        };
+        let id = alloc_global_mesh_id();
+        let entry = build_glb_mesh_entry(id.0, 1, parsed, unit_scale_m, anchor);
+        self.meshes.insert(id, entry);
+        self.meshes_revision = self.meshes_revision.wrapping_add(1);
+        self.cached_asset_list = None;
+        Ok(self.spawn(EarthObject::instanced(position, id).with_material(mat)))
+    }
+
     fn insert_compiled_mesh(&mut self, geometry: &EarthGeometry) -> EarthMeshId {
-        let id = EarthMeshId(self.next_mesh_id);
-        self.next_mesh_id += 1;
+        let id = alloc_global_mesh_id();
         let entry = build_mesh_entry(id.0, 1, geometry);
         self.meshes.insert(id, entry);
         self.meshes_revision = self.meshes_revision.wrapping_add(1);
         self.cached_asset_list = None;
         id
+    }
+
+    fn evict_mesh_if_unreferenced(&mut self, mesh_id: EarthMeshId) {
+        let still_referenced = self.objects.values().any(|s| s.mesh_id == mesh_id);
+        if !still_referenced && self.meshes.remove(&mesh_id).is_some() {
+            self.primitive_cache.retain(|_, &mut mid| mid != mesh_id);
+            self.meshes_revision = self.meshes_revision.wrapping_add(1);
+            self.cached_asset_list = None;
+        }
     }
 
     /// Spawns an [`EarthObject`] into the world and returns its stable [`EarthObjectId`].
@@ -781,10 +908,14 @@ impl EarthWorld {
         self.objects.get(&id).map(|s| &s.object)
     }
 
-    /// Mutates an [`EarthObject`] in place and increments the world revision.
+    /// Mutates an [`EarthObject`] in place and increments the world revision when `id` exists.
     pub fn get_mut(&mut self, id: EarthObjectId) -> Option<&mut EarthObject> {
-        self.revision = self.revision.wrapping_add(1);
-        self.objects.get_mut(&id).map(|s| &mut s.object)
+        if let Some(s) = self.objects.get_mut(&id) {
+            self.revision = self.revision.wrapping_add(1);
+            Some(&mut s.object)
+        } else {
+            None
+        }
     }
 
     pub fn set_position(&mut self, id: EarthObjectId, position: GeoPosition) -> bool {
@@ -837,17 +968,136 @@ impl EarthWorld {
         }
     }
 
-    pub fn remove(&mut self, id: EarthObjectId) -> bool {
-        let removed = self.objects.remove(&id).is_some();
-        if removed {
-            self.revision = self.revision.wrapping_add(1);
+    /// Updates the waypoints of an existing `Polyline` object in place without allocating a new
+    /// [`EarthObjectId`] or [`EarthMeshId`], eliminating CPU and GPU buffer leaks on streaming tracks.
+    pub fn set_polyline_points(&mut self, id: EarthObjectId, points: Vec<GeoPosition>) -> bool {
+        let Some(old_mesh_id) = self.objects.get(&id).map(|s| s.mesh_id) else {
+            return false;
+        };
+        let is_shared = self
+            .objects
+            .iter()
+            .any(|(&oid, s)| oid != id && s.mesh_id == old_mesh_id);
+        let radius_m = self
+            .objects
+            .get(&id)
+            .and_then(|s| s.dynamic_polyline.as_ref().map(|(_, r, _)| *r))
+            .unwrap_or(2.0);
+        let new_geom = EarthGeometry::Polyline {
+            points: points.clone(),
+            radius_m,
+        };
+        if is_shared {
+            let new_mid = self.insert_compiled_mesh(&new_geom);
+            if let Some(s) = self.objects.get_mut(&id) {
+                if let Some(first) = points.first() {
+                    s.object.position = *first;
+                }
+                s.object.mesh_binding = ObjectMeshBinding::Inline(new_geom);
+                s.mesh_id = new_mid;
+                s.dynamic_polyline = Some((points, radius_m, 0));
+            }
+            self.evict_mesh_if_unreferenced(old_mesh_id);
+        } else if let Some(s) = self.objects.get_mut(&id) {
+            if let Some(first) = points.first() {
+                s.object.position = *first;
+            }
+            s.object.mesh_binding = ObjectMeshBinding::Inline(new_geom);
+            s.dynamic_polyline = Some((points, radius_m, 0));
         }
-        removed
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    /// Updates the tube radius (in metres) of an existing `Polyline` object in place.
+    pub fn set_polyline_radius(&mut self, id: EarthObjectId, radius_m: f64) -> bool {
+        let Some(pts) = self
+            .objects
+            .get(&id)
+            .and_then(|s| s.dynamic_polyline.as_ref().map(|(pts, _, _)| pts.clone()))
+        else {
+            return false;
+        };
+        if let Some(s) = self.objects.get_mut(&id) {
+            s.object.mesh_binding = ObjectMeshBinding::Inline(EarthGeometry::Polyline {
+                points: pts.clone(),
+                radius_m,
+            });
+            s.dynamic_polyline = Some((pts, radius_m, 0));
+        }
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    /// Replaces the [`EarthGeometry`] of an existing object in place and garbage-collects its
+    /// previous [`EarthMeshId`] when no longer referenced.
+    pub fn replace_geometry(&mut self, id: EarthObjectId, geometry: EarthGeometry) -> bool {
+        if let EarthGeometry::Polyline { points, radius_m } = &geometry {
+            let Some(old_mesh_id) = self.objects.get(&id).map(|s| s.mesh_id) else {
+                return false;
+            };
+            let is_unique_polyline = self
+                .objects
+                .get(&id)
+                .is_some_and(|s| s.dynamic_polyline.is_some())
+                && !self
+                    .objects
+                    .iter()
+                    .any(|(&oid, s)| oid != id && s.mesh_id == old_mesh_id);
+            if is_unique_polyline {
+                if let Some(s) = self.objects.get_mut(&id) {
+                    if let Some(first) = points.first() {
+                        s.object.position = *first;
+                    }
+                    s.dynamic_polyline = Some((points.clone(), *radius_m, 0));
+                    s.object.mesh_binding = ObjectMeshBinding::Inline(geometry);
+                }
+                self.revision = self.revision.wrapping_add(1);
+                return true;
+            }
+        }
+        let Some(old_mesh_id) = self.objects.get(&id).map(|s| s.mesh_id) else {
+            return false;
+        };
+        let mut dynamic_polyline = None;
+        let mut first_pos = None;
+        if let EarthGeometry::Polyline { points, radius_m } = &geometry {
+            first_pos = points.first().copied();
+            dynamic_polyline = Some((points.clone(), *radius_m, 0));
+        }
+        let new_mesh_id = self.register_mesh(geometry.clone());
+        if let Some(s) = self.objects.get_mut(&id) {
+            if let Some(first) = first_pos {
+                s.object.position = first;
+            }
+            s.object.mesh_binding = ObjectMeshBinding::Inline(geometry);
+            s.mesh_id = new_mesh_id;
+            s.dynamic_polyline = dynamic_polyline;
+        }
+        if old_mesh_id != new_mesh_id {
+            self.evict_mesh_if_unreferenced(old_mesh_id);
+        }
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
+    pub fn remove(&mut self, id: EarthObjectId) -> bool {
+        if let Some(removed) = self.objects.remove(&id) {
+            self.evict_mesh_if_unreferenced(removed.mesh_id);
+            self.revision = self.revision.wrapping_add(1);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn clear(&mut self) {
-        if !self.objects.is_empty() {
+        if !self.objects.is_empty() || !self.meshes.is_empty() {
             self.objects.clear();
+            self.meshes.clear();
+            self.primitive_cache.clear();
+            self.cached_asset_list = None;
+            self.meshes_revision = self.meshes_revision.wrapping_add(1);
             self.revision = self.revision.wrapping_add(1);
         }
     }
@@ -1054,6 +1304,33 @@ impl EarthWorld {
                 metalness: mat.metalness,
                 unlit: mat.unlit,
                 accent_mix,
+                albedo_texture: mat.albedo_texture.clone(),
+            });
+        }
+
+        if instances.len() > 1 {
+            let eye = [camera_eye_ecef.x, camera_eye_ecef.y, camera_eye_ecef.z];
+            instances.sort_by(|a, b| {
+                let a_trans = a.base_color[3] < 0.999;
+                let b_trans = b.base_color[3] < 0.999;
+                match (a_trans, b_trans) {
+                    (false, true) => std::cmp::Ordering::Less,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, false) => std::cmp::Ordering::Equal,
+                    (true, true) => {
+                        let dax = a.anchor_ecef[0] - eye[0];
+                        let day = a.anchor_ecef[1] - eye[1];
+                        let daz = a.anchor_ecef[2] - eye[2];
+                        let dbx = b.anchor_ecef[0] - eye[0];
+                        let dby = b.anchor_ecef[1] - eye[1];
+                        let dbz = b.anchor_ecef[2] - eye[2];
+                        let dist_a2 = dax * dax + day * day + daz * daz;
+                        let dist_b2 = dbx * dbx + dby * dby + dbz * dbz;
+                        dist_b2
+                            .partial_cmp(&dist_a2)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                }
             });
         }
 
@@ -1134,7 +1411,7 @@ impl EarthWorld {
                 builder.push_triangle(base_v + tri[0], base_v + tri[1], base_v + tri[2]);
             }
             if let Some(geom) = builder.finish() {
-                out.push((geom, stored.object.material));
+                out.push((geom, stored.object.material.clone()));
             }
         }
         out
@@ -1172,6 +1449,16 @@ fn compute_object_transform(
     );
 
     let map_2d = morph.map_2d_morph.clamp(0.0, 1.0);
+    if crate::geodesy::is_canonical_2d_morph(map_2d)
+        && morph.flat_blend >= crate::geodesy::CANONICAL_2D_MORPH_THRESHOLD
+    {
+        let world_circ = 2.0 * std::f64::consts::PI * crate::geodesy::wgs84::A;
+        let delta_e = camera_eye_ecef.sub(anchor_dvec).dot(frame.east);
+        let wrap_shift = (delta_e / world_circ).round();
+        if wrap_shift.abs() > 0.5 {
+            anchor_dvec = anchor_dvec.add(frame.east.scale(wrap_shift * world_circ));
+        }
+    }
     if map_2d > 1e-5 {
         // Keep 3D objects cleanly above 2D map tiles with deterministic altitude ordering.
         let lift_m = (2.0 + resolved_altitude_m.max(0.0) * 0.02) * map_2d;
@@ -1179,6 +1466,15 @@ fn compute_object_transform(
     }
 
     if stored.dynamic_polyline.is_some() {
+        let flat_t = morph.flat_blend.clamp(0.0, 1.0);
+        let cos_p0 = obj.position.lat_deg.to_radians().cos().abs().max(0.25);
+        let cos_scale_0 = (cos_p0 + (1.0 - cos_p0) * map_2d).max(1e-6);
+        let cos_focus = morph.focus.lat_deg.to_radians().cos().abs().max(0.25);
+        let cos_scale_focus = cos_focus + (1.0 - cos_focus) * map_2d;
+        let east_ratio = 1.0 + ((cos_scale_focus / cos_scale_0) - 1.0) * flat_t;
+        let col0 = frame.east.scale(east_ratio);
+        let col1 = frame.north;
+        let col2 = frame.up;
         return ResolvedObjectTransform {
             object_id: id,
             mesh_id: stored.mesh_id,
@@ -1186,10 +1482,14 @@ fn compute_object_transform(
             resolved_altitude_m,
             terrain_elevation_m: sampled_terrain_m,
             anchor_ecef: [anchor_dvec.x, anchor_dvec.y, anchor_dvec.z],
-            model_cols: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            model_cols: [
+                [col0.x, col0.y, col0.z],
+                [col1.x, col1.y, col1.z],
+                [col2.x, col2.y, col2.z],
+            ],
             local_aabb_min: mesh.local_aabb_min,
             local_aabb_max: mesh.local_aabb_max,
-            world_bounding_radius_m: mesh.local_radius_m,
+            world_bounding_radius_m: mesh.local_radius_m * east_ratio.max(1.0),
         };
     }
 
@@ -1254,8 +1554,6 @@ fn polyline_state_hash(
     let mut h = 0xcbf29ce484222325_u64 ^ radius_m.to_bits() ^ u64::from(elevation_enabled);
     h = h.wrapping_mul(0x100000001b3) ^ morph.flat_blend.to_bits();
     h = h.wrapping_mul(0x100000001b3) ^ morph.map_2d_morph.to_bits();
-    h = h.wrapping_mul(0x100000001b3) ^ morph.focus.lat_deg.to_bits();
-    h = h.wrapping_mul(0x100000001b3) ^ morph.focus.lon_deg.to_bits();
     for p in points {
         let terr = match p.altitude_mode {
             AltitudeMode::Terrain if elevation_enabled => dem_sampler(p.lat_deg, p.lon_deg),
@@ -1276,6 +1574,30 @@ fn finalize_mesh_entry(
     indices: Vec<u32>,
     accent_mix: f32,
 ) -> CompiledMeshEntry {
+    finalize_mesh_entry_with_extras(id, revision, vertices, indices, None, None, accent_mix)
+}
+
+fn finalize_mesh_entry_with_extras(
+    id: u64,
+    revision: u64,
+    vertices: Vec<RteTileVertex>,
+    indices: Vec<u32>,
+    vertex_colors: Option<Arc<Vec<[f32; 4]>>>,
+    albedo_texture: Option<Arc<RetainedTileTexture>>,
+    accent_mix: f32,
+) -> CompiledMeshEntry {
+    let vlen = vertices.len() as u32;
+    let valid_indices: Vec<u32> = if indices.chunks_exact(3).all(|t| t[0] < vlen && t[1] < vlen && t[2] < vlen)
+        && indices.len() % 3 == 0
+    {
+        indices
+    } else {
+        indices
+            .chunks_exact(3)
+            .filter(|t| t[0] < vlen && t[1] < vlen && t[2] < vlen)
+            .flat_map(|t| [t[0], t[1], t[2]])
+            .collect()
+    };
     let mut min_b = [f32::INFINITY; 3];
     let mut max_b = [f32::NEG_INFINITY; 3];
     let mut max_r2 = 0.0_f64;
@@ -1301,13 +1623,59 @@ fn finalize_mesh_entry(
             id,
             revision,
             vertices: Arc::new(vertices),
-            indices: Arc::new(indices),
+            indices: Arc::new(valid_indices),
+            vertex_colors,
+            albedo_texture,
         }),
         local_aabb_min: min_b,
         local_aabb_max: max_b,
         local_radius_m: max_r2.sqrt().max(0.05),
         accent_mix,
     }
+}
+
+fn build_glb_mesh_entry(
+    id: u64,
+    revision: u64,
+    parsed: crate::gltf::WeatherMesh,
+    unit_scale_m: f64,
+    anchor: ObjectAnchor,
+) -> CompiledMeshEntry {
+    let scale = unit_scale_m.max(1e-4) as f32;
+    let min_z = parsed
+        .positions
+        .iter()
+        .map(|p| p[2])
+        .fold(f32::INFINITY, f32::min);
+    let z_shift = match anchor {
+        ObjectAnchor::Center => 0.0,
+        ObjectAnchor::Base => {
+            if min_z.is_finite() {
+                -min_z * scale
+            } else {
+                0.0
+            }
+        }
+    };
+    let verts: Vec<RteTileVertex> = parsed
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let n = parsed.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+            let uv = parsed.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+            RteTileVertex::new([p[0] * scale, p[1] * scale, p[2] * scale + z_shift], n, uv)
+        })
+        .collect();
+    finalize_mesh_entry_with_extras(
+        id,
+        revision,
+        verts,
+        parsed.indices,
+        parsed.vertex_colors.map(Arc::new),
+        parsed.albedo_texture,
+        0.0,
+    )
 }
 
 fn build_mesh_entry(id: u64, revision: u64, geometry: &EarthGeometry) -> CompiledMeshEntry {
@@ -1524,41 +1892,20 @@ fn build_mesh_entry(id: u64, revision: u64, geometry: &EarthGeometry) -> Compile
             unit_scale_m,
             anchor,
         } => {
-            let parsed = crate::gltf::parse_glb_mesh(bytes).unwrap_or_else(|_| crate::gltf::WeatherMesh {
-                positions: vec![[0.0, 0.0, 0.5], [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5]],
-                normals: vec![[0.0, 0.0, 1.0]; 3],
-                indices: vec![0, 1, 2],
-            });
-            let scale = unit_scale_m.max(1e-4) as f32;
-            let min_z = parsed
-                .positions
-                .iter()
-                .map(|p| p[2])
-                .fold(f32::INFINITY, f32::min);
-            let z_shift = match anchor {
-                ObjectAnchor::Center => 0.0,
-                ObjectAnchor::Base => {
-                    if min_z.is_finite() {
-                        -min_z * scale
-                    } else {
-                        0.0
+            let parsed = match crate::gltf::parse_glb_mesh(bytes) {
+                Ok(mesh) => mesh,
+                Err(err) => {
+                    eprintln!("[strata-earth] warning: failed to parse EarthGeometry::Glb ({err}); using fallback placeholder triangle");
+                    crate::gltf::WeatherMesh {
+                        positions: vec![[0.0, 0.0, 0.5], [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5]],
+                        normals: vec![[0.0, 0.0, 1.0]; 3],
+                        uvs: vec![[0.5, 1.0], [0.0, 0.0], [1.0, 0.0]],
+                        indices: vec![0, 1, 2],
+                        ..Default::default()
                     }
                 }
             };
-            let verts: Vec<RteTileVertex> = parsed
-                .positions
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let n = parsed.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                    RteTileVertex::new(
-                        [p[0] * scale, p[1] * scale, p[2] * scale + z_shift],
-                        n,
-                        [0.0, 0.0],
-                    )
-                })
-                .collect();
-            finalize_mesh_entry(id, revision, verts, parsed.indices, 0.0)
+            build_glb_mesh_entry(id, revision, parsed, *unit_scale_m, *anchor)
         }
     }
 }
@@ -1820,60 +2167,107 @@ fn build_polyline_world_mesh(
     if points.len() < 2 {
         return finalize_mesh_entry(id, revision, Vec::new(), Vec::new(), 0.0);
     }
-    let resolve_pt = |gp: &GeoPosition| -> (DVec3, LocalFrame) {
+    let flat_t = morph.flat_blend.clamp(0.0, 1.0);
+    let map_2d = morph.map_2d_morph.clamp(0.0, 1.0);
+
+    let resolve_height = |gp: &GeoPosition| -> f64 {
         let terr = match gp.altitude_mode {
             AltitudeMode::Terrain if elevation_enabled => dem_sampler(gp.lat_deg, gp.lon_deg),
             _ => 0.0,
         };
-        let h = gp.resolve_height_m(elevation_enabled, terr);
-        project_morphed_point_and_frame(gp.lat_deg, gp.lon_deg, h, morph)
+        gp.resolve_height_m(elevation_enabled, terr)
     };
 
-    let (anchor, _) = resolve_pt(&points[0]);
+    let p0 = points[0];
+    let h0 = resolve_height(&p0);
+    let frame0 = LocalFrame::at(p0.lat_deg, p0.lon_deg);
+    let ecef0 = geodetic_to_ecef(Geodetic::new(p0.lat_deg, p0.lon_deg, h0));
+    let cos_p0 = p0.lat_deg.to_radians().cos().abs().max(0.25);
+    let cos_scale_0 = cos_p0 + (1.0 - cos_p0) * map_2d;
+
+    // Express every waypoint in `p0`'s focus-independent local ENU / flat frame `(east_m, north_m, up_m)`.
+    // `compute_object_transform` rotates & scales `[col0, col1, col2]` into world space and applies
+    // 2D periodic east-wrapping and altitude lift to `anchor_dvec` in lockstep.
+    let resolve_local_pt = |gp: &GeoPosition| -> (DVec3, DVec3) {
+        let h = resolve_height(gp);
+        let ecef = geodetic_to_ecef(Geodetic::new(gp.lat_deg, gp.lon_deg, h));
+        let rel_ecef = ecef.sub(ecef0);
+        let curved_local = DVec3::new(
+            rel_ecef.dot(frame0.east),
+            rel_ecef.dot(frame0.north),
+            rel_ecef.dot(frame0.up),
+        );
+        let curved_frame = LocalFrame::at(gp.lat_deg, gp.lon_deg);
+        let curved_up_local = DVec3::new(
+            curved_frame.up.dot(frame0.east),
+            curved_frame.up.dot(frame0.north),
+            curved_frame.up.dot(frame0.up),
+        );
+
+        let dlon_deg = wrap_longitude(gp.lon_deg - p0.lon_deg);
+        let dlat_deg = gp.lat_deg - p0.lat_deg;
+        let flat_east = dlon_deg.to_radians() * wgs84::A * cos_scale_0;
+        let flat_north = dlat_deg.to_radians() * wgs84::A;
+        let rel_lift_2d = (h.max(0.0) - h0.max(0.0)) * 0.02 * map_2d;
+        let flat_up = (h - h0) * (1.0 - map_2d) + rel_lift_2d;
+
+        let local_pos = DVec3::new(
+            curved_local.x + (flat_east - curved_local.x) * flat_t,
+            curved_local.y + (flat_north - curved_local.y) * flat_t,
+            curved_local.z + (flat_up - curved_local.z) * flat_t,
+        );
+        let local_up = DVec3::new(
+            curved_up_local.x * (1.0 - flat_t),
+            curved_up_local.y * (1.0 - flat_t),
+            curved_up_local.z + (1.0 - curved_up_local.z) * flat_t,
+        )
+        .normalize();
+        (local_pos, local_up)
+    };
+
     let r = radius_m.max(0.05);
     let sides = 8usize;
     let mut verts = Vec::with_capacity(points.len() * sides);
     let mut inds = Vec::with_capacity((points.len() - 1) * sides * 6);
 
-    let world_pts: Vec<(DVec3, LocalFrame)> = points.iter().map(resolve_pt).collect();
+    let local_pts: Vec<(DVec3, DVec3)> = points.iter().map(resolve_local_pt).collect();
 
-    for (i, &(pt, frame)) in world_pts.iter().enumerate() {
+    for (i, &(pt, up_vec)) in local_pts.iter().enumerate() {
         let tangent = if i == 0 {
-            world_pts[1].0.sub(pt)
-        } else if i + 1 == world_pts.len() {
-            pt.sub(world_pts[i - 1].0)
+            local_pts[1].0.sub(pt)
+        } else if i + 1 == local_pts.len() {
+            pt.sub(local_pts[i - 1].0)
         } else {
-            world_pts[i + 1].0.sub(world_pts[i - 1].0)
+            local_pts[i + 1].0.sub(local_pts[i - 1].0)
         };
         let t_dir = if tangent.length() > 1e-6 {
             tangent.normalize()
         } else {
-            frame.north
+            DVec3::new(0.0, 1.0, 0.0)
         };
-        let side_a_raw = t_dir.cross(frame.up);
+        let side_a_raw = t_dir.cross(up_vec);
         let side_a = if side_a_raw.length() > 1e-6 {
             side_a_raw.normalize()
         } else {
-            frame.east
+            DVec3::new(1.0, 0.0, 0.0)
         };
         let side_b = side_a.cross(t_dir).normalize();
-        let rel_center = pt.sub(anchor);
 
         for s in 0..sides {
             let u = s as f32 / sides as f32;
             let (sn, cs) = (u * std::f32::consts::TAU).sin_cos();
             let n = side_a.scale(cs as f64).add(side_b.scale(sn as f64));
-            let pos = rel_center.add(n.scale(r));
+            let pos = pt.add(n.scale(r));
             verts.push(RteTileVertex::new(
                 [pos.x as f32, pos.y as f32, pos.z as f32],
                 [n.x as f32, n.y as f32, n.z as f32],
-                [u, i as f32 / (world_pts.len() - 1) as f32],
+                [u, i as f32 / (local_pts.len() - 1) as f32],
             ));
         }
     }
 
     let stride = sides as u32;
-    for i in 0..(world_pts.len() as u32 - 1) {
+    for i in 0..(local_pts.len() as u32 - 1) {
         for s in 0..stride {
             let s_next = (s + 1) % stride;
             let i00 = i * stride + s;
@@ -1886,3 +2280,4 @@ fn build_polyline_world_mesh(
 
     finalize_mesh_entry(id, revision, verts, inds, 0.0)
 }
+

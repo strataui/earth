@@ -1,5 +1,6 @@
 // Interactive Earth preview embedding `strata_earth::EarthView` alongside floating
-// top-right Strata HUD controls, external keybind handling, and live raycast 3D object placement.
+// top-right Strata HUD controls, external keybind handling, realistic 2.5D atmosphere,
+// unified weather API controls, GPU ocean waves/coastal surf, and live raycast 3D placement.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -9,10 +10,11 @@ use strata::prelude::*;
 use strata::WindowConfig;
 use strata::{launch_with_frame, AppFrameInfo, FrameOutcome};
 use strata_earth::{
-    AtmosphereSample, Color, EarthDefaultTileSource, EarthGeometry, EarthInput, EarthMaterial,
-    EarthObject, EarthOrbitController, EarthView, EarthViewMode, GeoPosition, PrecipitationConfig,
-    PrecipitationMode, SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig,
-    LOCAL_TRANSITION_RANGE_M,
+    AtmosphereSample, BaseWeatherConfig, Color, EarthDefaultTileSource, EarthGeometry, EarthInput,
+    EarthMaterial, EarthObject, EarthOrbitController, EarthView, EarthViewMode, GeoPosition,
+    LocalAtmosphereConfig, LocalFrame, OceanWavesConfig, PrecipitationConfig, PrecipitationMode,
+    SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig, WeatherSnapshot,
+    WindVector, LOCAL_TRANSITION_RANGE_M,
 };
 
 /// Example-local continuous exponential zoom rate (natural-log range units per second) for `K` / `L`.
@@ -48,8 +50,85 @@ impl PreviewHeldZoom {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SunDemoMode {
     SystemClock,
+    LocalNoon,
+    GoldenSunset,
+    StarryNight,
     OrbitalCycle,
-    FixedSunset,
+}
+
+impl SunDemoMode {
+    fn next(self) -> Self {
+        match self {
+            Self::SystemClock => Self::LocalNoon,
+            Self::LocalNoon => Self::GoldenSunset,
+            Self::GoldenSunset => Self::StarryNight,
+            Self::StarryNight => Self::OrbitalCycle,
+            Self::OrbitalCycle => Self::SystemClock,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SystemClock => "Sun: OS Clock",
+            Self::LocalNoon => "Sun: Noon",
+            Self::GoldenSunset => "Sun: Sunset",
+            Self::StarryNight => "Sun: Night",
+            Self::OrbitalCycle => "Sun: Cycle",
+        }
+    }
+}
+
+fn dir_from_local_az_el(lat_deg: f64, lon_deg: f64, az_deg: f64, el_deg: f64) -> [f32; 3] {
+    let f = LocalFrame::at(lat_deg, lon_deg);
+    let el = el_deg.to_radians();
+    let az = az_deg.to_radians();
+    let cos_el = el.cos();
+    let v = f
+        .east
+        .scale(cos_el * az.sin())
+        .add(f.north.scale(cos_el * az.cos()))
+        .add(f.up.scale(el.sin()))
+        .normalize();
+    [v.x as f32, v.y as f32, v.z as f32]
+}
+
+fn apply_sun_demo_mode(
+    mode: SunDemoMode,
+    sim_s: f64,
+    lat_deg: f64,
+    lon_deg: f64,
+    heading_deg: f64,
+    sp: &mut SpaceEnvironmentConfig,
+) {
+    match mode {
+        SunDemoMode::SystemClock => {
+            sp.sun_direction = SunDirectionMode::SystemClock;
+            sp.custom_moon_dir = None;
+        }
+        SunDemoMode::LocalNoon => {
+            sp.sun_direction =
+                SunDirectionMode::CustomEcef(dir_from_local_az_el(lat_deg, lon_deg, heading_deg + 115.0, 50.0));
+            sp.custom_moon_dir = None;
+        }
+        SunDemoMode::GoldenSunset => {
+            // Places low golden Sun +8.5° above horizon slightly ahead-left of camera view for an
+            // unobstructed visible Sun disc, Mie aureole, long mountain shadows, and golden ocean glitter!
+            sp.sun_direction =
+                SunDirectionMode::CustomEcef(dir_from_local_az_el(lat_deg, lon_deg, heading_deg - 14.0, 8.5));
+            sp.custom_moon_dir = None;
+        }
+        SunDemoMode::StarryNight => {
+            // Places Sun -28° below local horizon and Moon +8.0° ahead-left for 2.5D stars + moonlight!
+            sp.sun_direction =
+                SunDirectionMode::CustomEcef(dir_from_local_az_el(lat_deg, lon_deg, heading_deg + 180.0, -28.0));
+            sp.custom_moon_dir = Some(dir_from_local_az_el(lat_deg, lon_deg, heading_deg - 14.0, 8.0));
+        }
+        SunDemoMode::OrbitalCycle => {
+            let _ = sim_s;
+            sp.sun_direction = SunDirectionMode::SimulationTime;
+            sp.custom_moon_dir = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,45 +158,139 @@ impl TempPreset {
         }
     }
 
-    fn apply_to(self, cfg: &mut PrecipitationConfig) {
+    fn apply_to(self, precip: &mut PrecipitationConfig, base: &mut BaseWeatherConfig) {
         match self {
             Self::Warm12C => {
-                cfg.use_live_temperature = false;
-                cfg.atmosphere.base_temp_c = 12.0;
+                precip.use_live_temperature = false;
+                precip.atmosphere.base_temp_c = 12.0;
+                base.use_live_api = false;
+                base.atmosphere.base_temp_c = 12.0;
             }
             Self::Cool2C => {
-                cfg.use_live_temperature = false;
-                cfg.atmosphere.base_temp_c = 2.0;
+                precip.use_live_temperature = false;
+                precip.atmosphere.base_temp_c = 2.0;
+                base.use_live_api = false;
+                base.atmosphere.base_temp_c = 2.0;
             }
             Self::FreezeNeg6C => {
-                cfg.use_live_temperature = false;
-                cfg.atmosphere.base_temp_c = -6.0;
+                precip.use_live_temperature = false;
+                precip.atmosphere.base_temp_c = -6.0;
+                base.use_live_api = false;
+                base.atmosphere.base_temp_c = -6.0;
             }
             Self::LiveOpenMeteo => {
-                cfg.use_live_temperature = true;
+                precip.use_live_temperature = true;
+                base.use_live_api = true;
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindPreset {
+    BreezeEast,
+    FreshSW,
+    GaleNorth,
+    LiveApi,
+}
+
+impl WindPreset {
+    fn next(self) -> Self {
+        match self {
+            Self::BreezeEast => Self::FreshSW,
+            Self::FreshSW => Self::GaleNorth,
+            Self::GaleNorth => Self::LiveApi,
+            Self::LiveApi => Self::BreezeEast,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::BreezeEast => "Wind: 7m/s E",
+            Self::FreshSW => "Wind: 15m/s SW",
+            Self::GaleNorth => "Wind: 24m/s N",
+            Self::LiveApi => "Wind: Live",
+        }
+    }
+
+    fn vector(self) -> WindVector {
+        match self {
+            Self::BreezeEast => WindVector::new(7.0, 90.0),
+            Self::FreshSW => WindVector::new(15.0, 225.0),
+            Self::GaleNorth => WindVector::new(24.0, 0.0),
+            Self::LiveApi => WindVector::new(11.0, 70.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OceanPreset {
+    Off,
+    OpenSea,
+    CoastalSurf,
+}
+
+impl OceanPreset {
+    fn next(self) -> Self {
+        match self {
+            Self::Off => Self::OpenSea,
+            Self::OpenSea => Self::CoastalSurf,
+            Self::CoastalSurf => Self::Off,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Ocean: Off",
+            Self::OpenSea => "Ocean: Sea",
+            Self::CoastalSurf => "Ocean: Coastal",
         }
     }
 }
 
 fn format_atmo_status(
     cfg: &PrecipitationConfig,
+    ocean: &OceanWavesConfig,
     eye_alt_m: f64,
     sample: Option<AtmosphereSample>,
+    weather_snap: Option<WeatherSnapshot>,
 ) -> Option<String> {
-    if !cfg.enabled {
+    let active_precip = cfg.enabled
+        || weather_snap.is_some_and(|w| w.precipitation_intensity > 0.02);
+    if !active_precip && !ocean.enabled {
         return None;
     }
-    let Some(s) = sample else {
+
+    let wind = weather_snap
+        .map(|w| w.wind)
+        .unwrap_or_else(|| WindVector::from_enu_mps(cfg.resolved_wind_enu()));
+    let wind_str = format!("{:.0}m/s {}", wind.speed_mps, wind.compass_label());
+
+    if !active_precip {
+        let mode_s = if ocean.coastal_shoaling {
+            "Coastal Surf + SDF"
+        } else {
+            "Open Sea Swells"
+        };
         return Some(format!(
-            "Precip Active · Alt {:.0}m",
+            "Ocean {mode_s} · Wind {wind_str} · Alt {:.0}m",
             eye_alt_m.max(0.0)
         ));
+    }
+
+    let s = match sample.or_else(|| weather_snap.map(|w| w.atmosphere)) {
+        Some(s) => s,
+        None => {
+            return Some(format!(
+                "Precip Active · Wind {wind_str} · Alt {:.0}m",
+                eye_alt_m.max(0.0)
+            ));
+        }
     };
     let src = if s.source_live { "Live" } else { "ISA" };
     if cfg.respect_cloud_ceiling && eye_alt_m > s.cloud_ceiling_msl_m {
         Some(format!(
-            "Above Clouds · Alt {:.0}m > {:.0}m · T {:+.1}°C ({src})",
+            "Above Clouds · Alt {:.0}m > {:.0}m · T {:+.1}°C · Wind {wind_str} ({src})",
             eye_alt_m, s.cloud_ceiling_msl_m, s.temperature_c
         ))
     } else {
@@ -127,12 +300,14 @@ fn format_atmo_status(
             PrecipitationMode::Snow => "Snow (Forced)",
             PrecipitationMode::CustomLayers(_) => "Custom 2D",
         };
+        let dark_pct = weather_snap
+            .map(|w| (w.storm_darkness * 100.0).round() as u32)
+            .unwrap_or_else(|| ((cfg.intensity.clamp(0.0, 1.2) / 1.2) * 76.0).round() as u32);
         Some(format!(
-            "{phase_txt} · Alt {:.0}m · T {:+.1}°C (Tw {:+.1}°C) · Freeze {:.0}m · Ceil {:.0}m ({src})",
+            "{phase_txt} · Alt {:.0}m · T {:+.1}°C (Tw {:+.1}°C) · Wind {wind_str} · Sky Dark {dark_pct}% · Ceil {:.0}m ({src})",
             eye_alt_m.max(0.0),
             s.temperature_c,
             s.wet_bulb_c,
-            s.freezing_level_msl_m.max(0.0),
             s.cloud_ceiling_msl_m,
         ))
     }
@@ -208,8 +383,136 @@ fn main() -> Result<(), String> {
     };
     input.view_mode = EarthViewMode::Mode3D;
     input.elevation_enabled = true;
+    input.layers.graticule = false;
     input.space = SpaceEnvironmentConfig::default().with_system_clock();
+    input.local_atmosphere = LocalAtmosphereConfig::realistic();
+    input.base_weather = BaseWeatherConfig::default().enabled().with_wind(7.0, 90.0);
     input.weather = WeatherConfig::default();
+
+    let mut initial_sun_mode = SunDemoMode::SystemClock;
+    let mut initial_wind_preset = WindPreset::BreezeEast;
+    let mut initial_ocean_preset = OceanPreset::Off;
+    let mut initial_temp_preset = TempPreset::Warm12C;
+
+    // Optional headless showcase scene preset via env var for deterministic visual regression capture.
+    if let Ok(preset) = std::env::var("STRATA_EARTH_DEMO_PRESET") {
+        match preset.as_str() {
+            "sunset_alps" => {
+                // Swiss Alps (Eiger / Jungfrau valley) with Golden Sunset Sun disc & dramatic mountain shadows!
+                orbit.jump_to(46.5775, 7.9850, 4_200.0, 118.0, 74.0);
+                initial_sun_mode = SunDemoMode::GoldenSunset;
+                apply_sun_demo_mode(
+                    initial_sun_mode,
+                    1_735_689_600.0,
+                    46.5775,
+                    7.9850,
+                    118.0,
+                    &mut input.space,
+                );
+            }
+            "night_sf" => {
+                // San Francisco Bay at Starry Night: Yale BSC5 stars, Milky Way, Moon & city lights!
+                orbit.jump_to(37.8050, -122.4300, 3_600.0, 35.0, 82.0);
+                initial_sun_mode = SunDemoMode::StarryNight;
+                apply_sun_demo_mode(
+                    initial_sun_mode,
+                    1_735_689_600.0,
+                    37.8050,
+                    -122.4300,
+                    35.0,
+                    &mut input.space,
+                );
+                input.base_weather = BaseWeatherConfig::default()
+                    .enabled()
+                    .with_wind(9.0, 75.0)
+                    .with_cloud_cover(0.04);
+                input.ocean_waves = OceanWavesConfig::enabled().with_wind(9.0, 75.0);
+                initial_ocean_preset = OceanPreset::OpenSea;
+            }
+            "storm_rain_curtains" => {
+                // Zoomed-out 2.5D valley storm: darkened sky & clouds + 3-shell far-field rain curtains!
+                orbit.jump_to(46.5775, 7.9850, 2_400.0, 95.0, 68.0);
+                initial_sun_mode = SunDemoMode::LocalNoon;
+                apply_sun_demo_mode(
+                    initial_sun_mode,
+                    1_735_689_600.0,
+                    46.5775,
+                    7.9850,
+                    95.0,
+                    &mut input.space,
+                );
+                initial_wind_preset = WindPreset::FreshSW;
+                input.base_weather = BaseWeatherConfig::default()
+                    .enabled()
+                    .with_wind(15.0, 225.0)
+                    .with_precipitation(1.15)
+                    .with_cloud_cover(0.92)
+                    .with_storm_darkness(0.78)
+                    .with_base_temp_c(14.0);
+                input.precipitation = PrecipitationConfig::default()
+                    .enabled()
+                    .with_mode(PrecipitationMode::Rain)
+                    .with_intensity(1.15)
+                    .with_wind_angle(15.0, 225.0);
+            }
+            "snow_squall_alps" => {
+                // Zoomed-out Alpine snow squall: 3-shell snowflakes + far snow curtains + darkened clouds!
+                orbit.jump_to(46.5775, 7.9850, 2_200.0, 95.0, 68.0);
+                initial_sun_mode = SunDemoMode::LocalNoon;
+                apply_sun_demo_mode(
+                    initial_sun_mode,
+                    1_735_689_600.0,
+                    46.5775,
+                    7.9850,
+                    95.0,
+                    &mut input.space,
+                );
+                initial_temp_preset = TempPreset::FreezeNeg6C;
+                initial_wind_preset = WindPreset::FreshSW;
+                input.base_weather = BaseWeatherConfig::default()
+                    .enabled()
+                    .with_wind(12.0, 225.0)
+                    .with_precipitation(1.1)
+                    .with_cloud_cover(0.88)
+                    .with_storm_darkness(0.66)
+                    .with_base_temp_c(-6.0);
+                input.precipitation = PrecipitationConfig::default()
+                    .enabled()
+                    .with_mode(PrecipitationMode::Snow)
+                    .with_intensity(1.1)
+                    .with_base_temp_c(-6.0)
+                    .with_wind_angle(12.0, 225.0);
+            }
+            "coastal_surf_sunset" => {
+                // Marin Headlands / Ocean Beach coast: Golden Sunset reflecting on 8-octave GPU swells + coastal surf!
+                orbit.jump_to(37.7680, -122.5180, 1_500.0, 250.0, 68.0);
+                initial_sun_mode = SunDemoMode::GoldenSunset;
+                apply_sun_demo_mode(
+                    initial_sun_mode,
+                    1_735_689_600.0,
+                    37.7680,
+                    -122.5180,
+                    250.0,
+                    &mut input.space,
+                );
+                initial_wind_preset = WindPreset::FreshSW;
+                initial_ocean_preset = OceanPreset::CoastalSurf;
+                input.base_weather = BaseWeatherConfig::default()
+                    .enabled()
+                    .with_wind(14.0, 75.0)
+                    .with_cloud_cover(0.18);
+                input.ocean_waves = OceanWavesConfig::enabled()
+                    .with_wind(14.0, 75.0)
+                    .with_coastal_shoaling(true)
+                    .with_shoaling_range_m(380.0)
+                    .with_strength(1.25);
+            }
+            _ => {}
+        }
+        let (cam, up) = orbit.to_camera_and_up(false, 0.0);
+        input.camera = cam;
+        input.camera_up_ecef = up;
+    }
 
     let earth = EarthView::with_orbit(&input, Box::new(source), orbit);
     let held_zoom = Rc::new(RefCell::new(PreviewHeldZoom::default()));
@@ -248,19 +551,21 @@ fn main() -> Result<(), String> {
         });
     }
 
-    let sun_demo_mode = Rc::new(RefCell::new(SunDemoMode::SystemClock));
+    let sun_demo_mode = Rc::new(RefCell::new(initial_sun_mode));
     let sun_cycle_sim_s = Rc::new(RefCell::new(1_735_689_600.0f64));
     let active_preset = Rc::new(RefCell::new(TileProviderPreset::ArcGisWorldImagery));
-    let temp_preset = Rc::new(RefCell::new(TempPreset::Warm12C));
+    let temp_preset = Rc::new(RefCell::new(initial_temp_preset));
+    let wind_preset = Rc::new(RefCell::new(initial_wind_preset));
+    let ocean_preset = Rc::new(RefCell::new(initial_ocean_preset));
     let fps_readout = Rc::new(RefCell::new((60u32, 16.7f64)));
     let atmo_readout: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let fly_target_idx = Rc::new(RefCell::new(0usize));
 
     const FLY_LANDMARKS: &[(&str, f64, f64)] = &[
+        ("Alps", 46.5775, 7.9850),
+        ("Big Sur", 36.2704, -121.8081),
         ("Tokyo", 35.6762, 139.6503),
         ("Paris", 48.8584, 2.2945),
-        ("Giza", 29.9792, 31.1342),
-        ("New York", 40.7580, -73.9855),
         ("Rio", -22.9519, -43.2105),
         ("Istanbul", 41.0082, 28.9784),
     ];
@@ -270,12 +575,14 @@ fn main() -> Result<(), String> {
     let sim_for_view = Rc::clone(&sun_cycle_sim_s);
     let preset_for_view = Rc::clone(&active_preset);
     let temp_for_view = Rc::clone(&temp_preset);
+    let wind_for_view = Rc::clone(&wind_preset);
+    let ocean_for_view = Rc::clone(&ocean_preset);
     let fps_for_view = Rc::clone(&fps_readout);
     let atmo_for_view = Rc::clone(&atmo_readout);
     let fly_idx_for_view = Rc::clone(&fly_target_idx);
 
     let build_root = move || -> View {
-        let (is_2d, at_local_25d, is_flying, sp, elev_on, labels_on, w, precip, ocean_on) =
+        let (is_2d, at_local_25d, is_flying, sp, la, elev_on, labels_on, w, precip, idle_hi_res_on) =
             earth_for_view.with_state(|st| {
                 let inp = st.viewport.input();
                 (
@@ -283,11 +590,12 @@ fn main() -> Result<(), String> {
                     st.orbit.range_m < LOCAL_TRANSITION_RANGE_M,
                     st.orbit.is_flying(),
                     inp.space.clone(),
+                    inp.local_atmosphere.clone(),
                     inp.elevation_enabled,
                     inp.layers.labels,
                     inp.weather.clone(),
                     inp.precipitation.clone(),
-                    inp.ocean_waves.enabled,
+                    inp.idle_high_res.enabled,
                 )
             });
         let cur_place_on = click_place_on.get();
@@ -296,6 +604,8 @@ fn main() -> Result<(), String> {
         let cur_sun_mode = *mode_for_view.borrow();
         let cur_preset = *preset_for_view.borrow();
         let cur_temp_preset = *temp_for_view.borrow();
+        let cur_wind_preset = *wind_for_view.borrow();
+        let cur_ocean_preset = *ocean_for_view.borrow();
         let (cur_fps, cur_ms) = *fps_for_view.borrow();
         let cur_atmo_status = atmo_for_view.borrow().clone();
         let next_landmark = FLY_LANDMARKS[*fly_idx_for_view.borrow() % FLY_LANDMARKS.len()];
@@ -333,7 +643,7 @@ fn main() -> Result<(), String> {
                             st.viewport.set_view_mode(EarthViewMode::Mode3D);
                             st.orbit.set_is_2d_hint(false);
                         }
-                        st.jump_to(37.7749, -122.4194, 3_200.0, 22.0, 58.0);
+                        st.jump_to(37.8199, -122.4980, 2_800.0, 28.0, 66.0);
                     }
                 });
             },
@@ -379,6 +689,44 @@ fn main() -> Result<(), String> {
             View::new(strata_dom::NodeBlueprint::fragment(Vec::new()))
         };
 
+        let e_sky25 = earth_for_view.clone();
+        let btn_sky_25d = control_btn(
+            if la.realistic_sky {
+                "2.5D Sky: Real"
+            } else {
+                "2.5D Sky: Flat"
+            }
+            .to_string(),
+            la.realistic_sky,
+            move |_| {
+                let mut next_la = e_sky25.local_atmosphere_config();
+                let next_on = !next_la.realistic_sky;
+                next_la.realistic_sky = next_on;
+                next_la.night_stars_sync = next_on;
+                next_la.terrain_lighting = next_on;
+                e_sky25.set_local_atmosphere_config(next_la);
+            },
+        );
+
+        let e_shd = earth_for_view.clone();
+        let btn_shadows = control_btn(
+            if la.terrain_shadows {
+                "Shadows: On"
+            } else {
+                "Shadows: Off"
+            }
+            .to_string(),
+            la.terrain_shadows,
+            move |_| {
+                let mut next_la = e_shd.local_atmosphere_config();
+                next_la.terrain_shadows = !next_la.terrain_shadows;
+                if next_la.terrain_shadows {
+                    next_la.terrain_lighting = true;
+                }
+                e_shd.set_local_atmosphere_config(next_la);
+            },
+        );
+
         let e3 = earth_for_view.clone();
         let btn_sun_lit = control_btn(
             if sp.day_night_lighting {
@@ -412,33 +760,20 @@ fn main() -> Result<(), String> {
         let m5 = Rc::clone(&mode_for_view);
         let s5 = Rc::clone(&sim_for_view);
         let btn_sun_mode = control_btn(
-            match cur_sun_mode {
-                SunDemoMode::SystemClock => "Sun: OS Clock",
-                SunDemoMode::OrbitalCycle => "Sun: Cycle",
-                SunDemoMode::FixedSunset => "Sun: Sunset",
-            }
-            .to_string(),
-            cur_sun_mode != SunDemoMode::FixedSunset,
+            cur_sun_mode.label().to_string(),
+            cur_sun_mode != SunDemoMode::SystemClock,
             move |_| {
-                let next = match *m5.borrow() {
-                    SunDemoMode::SystemClock => SunDemoMode::OrbitalCycle,
-                    SunDemoMode::OrbitalCycle => SunDemoMode::FixedSunset,
-                    SunDemoMode::FixedSunset => SunDemoMode::SystemClock,
-                };
+                let next = m5.borrow().next();
                 *m5.borrow_mut() = next;
+                let sim_s = *s5.borrow();
                 e5.with_state_mut(|st| {
+                    let lat = st.orbit.lat_deg;
+                    let lon = st.orbit.lon_deg;
+                    let hdg = st.orbit.heading_deg;
                     let mut sp = st.viewport.space_config().clone();
-                    match next {
-                        SunDemoMode::SystemClock => {
-                            sp.sun_direction = SunDirectionMode::SystemClock;
-                        }
-                        SunDemoMode::OrbitalCycle => {
-                            sp.sun_direction = SunDirectionMode::SimulationTime;
-                            st.viewport.set_sim_time_unix_s(*s5.borrow());
-                        }
-                        SunDemoMode::FixedSunset => {
-                            sp.sun_direction = SunDirectionMode::CustomEcef([0.85, 0.48, 0.22]);
-                        }
+                    apply_sun_demo_mode(next, sim_s, lat, lon, hdg, &mut sp);
+                    if next == SunDemoMode::OrbitalCycle {
+                        st.viewport.set_sim_time_unix_s(sim_s);
                     }
                     st.viewport.set_space_config(sp);
                     st.notify_ui_changed();
@@ -551,20 +886,30 @@ fn main() -> Result<(), String> {
         };
         let btn_precip = control_btn(precip_label.to_string(), precip.enabled, move |_| {
             let mut cfg = e14.precipitation_config();
+            let mut base = e14.base_weather_config();
             if !cfg.enabled {
                 cfg.enabled = true;
                 cfg.mode = PrecipitationMode::Physical;
-                tp14.borrow().apply_to(&mut cfg);
+                tp14.borrow().apply_to(&mut cfg, &mut base);
+                base.precipitation_intensity = cfg.intensity;
             } else {
                 match cfg.mode {
-                    PrecipitationMode::Physical => cfg.mode = PrecipitationMode::Rain,
-                    PrecipitationMode::Rain => cfg.mode = PrecipitationMode::Snow,
+                    PrecipitationMode::Physical => {
+                        cfg.mode = PrecipitationMode::Rain;
+                        base.precipitation_intensity = cfg.intensity;
+                    }
+                    PrecipitationMode::Rain => {
+                        cfg.mode = PrecipitationMode::Snow;
+                        base.precipitation_intensity = cfg.intensity;
+                    }
                     PrecipitationMode::Snow | PrecipitationMode::CustomLayers(_) => {
                         cfg.enabled = false;
                         cfg.mode = PrecipitationMode::Physical;
+                        base.precipitation_intensity = 0.0;
                     }
                 }
             }
+            e14.set_base_weather_config(base);
             e14.set_precipitation_config(cfg);
         });
 
@@ -577,8 +922,37 @@ fn main() -> Result<(), String> {
                 let next = tp15.borrow().next();
                 *tp15.borrow_mut() = next;
                 let mut cfg = e15.precipitation_config();
-                next.apply_to(&mut cfg);
+                let mut base = e15.base_weather_config();
+                next.apply_to(&mut cfg, &mut base);
+                e15.set_base_weather_config(base);
                 e15.set_precipitation_config(cfg);
+            },
+        );
+
+        let e_wind = earth_for_view.clone();
+        let wp_btn = Rc::clone(&wind_for_view);
+        let btn_wind = control_btn(
+            cur_wind_preset.label().to_string(),
+            cur_wind_preset != WindPreset::BreezeEast,
+            move |_| {
+                let next = wp_btn.borrow().next();
+                *wp_btn.borrow_mut() = next;
+                let wv = next.vector();
+                let mut base = e_wind.base_weather_config();
+                base.enabled = true;
+                base.wind = wv;
+                base.use_live_api = next == WindPreset::LiveApi;
+                e_wind.set_base_weather_config(base);
+
+                let cfg = e_wind
+                    .precipitation_config()
+                    .with_wind_angle(wv.speed_mps, wv.angle_deg);
+                e_wind.set_precipitation_config(cfg);
+
+                let ocfg = e_wind
+                    .ocean_waves_config()
+                    .with_wind(wv.speed_mps, wv.angle_deg);
+                e_wind.set_ocean_waves_config(ocfg);
             },
         );
 
@@ -598,9 +972,46 @@ fn main() -> Result<(), String> {
         );
 
         let e17 = earth_for_view.clone();
-        let btn_ocean = control_btn("Ocean Waves".to_string(), ocean_on, move |_| {
-            e17.set_ocean_waves_enabled(!ocean_on);
-        });
+        let op17 = Rc::clone(&ocean_for_view);
+        let btn_ocean = control_btn(
+            cur_ocean_preset.label().to_string(),
+            cur_ocean_preset != OceanPreset::Off,
+            move |_| {
+                let next = op17.borrow().next();
+                *op17.borrow_mut() = next;
+                let mut ocfg = e17.ocean_waves_config();
+                match next {
+                    OceanPreset::Off => {
+                        ocfg.enabled = false;
+                        ocfg.coastal_shoaling = false;
+                    }
+                    OceanPreset::OpenSea => {
+                        ocfg.enabled = true;
+                        ocfg.coastal_shoaling = false;
+                    }
+                    OceanPreset::CoastalSurf => {
+                        ocfg.enabled = true;
+                        ocfg.coastal_shoaling = true;
+                    }
+                }
+                e17.set_ocean_waves_config(ocfg);
+            },
+        );
+
+        let e_idle = earth_for_view.clone();
+        let btn_idle_hires = control_btn(
+            if idle_hi_res_on {
+                "Idle Hi-Res: On"
+            } else {
+                "Idle Hi-Res: Off"
+            }
+            .to_string(),
+            idle_hi_res_on,
+            move |_| {
+                let cur = e_idle.idle_high_res_config().enabled;
+                e_idle.set_idle_high_res_enabled(!cur);
+            },
+        );
 
         let fps_text = format!("{cur_fps} FPS · {cur_ms:.1} ms");
         let atmo_badge = match cur_atmo_status {
@@ -639,7 +1050,7 @@ fn main() -> Result<(), String> {
                 {status_badge}
                 <div
                     data-earth-controls="true"
-                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[460px] p-2 rounded-xl bg-neutral-950/85 border border-neutral-800/85"
+                    class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[520px] p-2 rounded-xl bg-neutral-950/85 border border-neutral-800/85"
                 >
                     {btn_mode}
                     {btn_provider}
@@ -647,20 +1058,24 @@ fn main() -> Result<(), String> {
                     {btn_fly}
                     {btn_place}
                     {btn_clear}
+                    {btn_sky_25d}
+                    {btn_shadows}
+                    {btn_sun_mode}
+                    {btn_ocean}
+                    {btn_precip}
+                    {btn_temp}
+                    {btn_wind}
                     {btn_sun_lit}
                     {btn_city}
-                    {btn_ocean}
-                    {btn_sun_mode}
                     {btn_stars}
                     {btn_survey}
                     {btn_sky_res}
                     {btn_sats}
                     {btn_elev}
+                    {btn_idle_hires}
                     {btn_labels}
                     {btn_gcloud}
                     {btn_cloud_res}
-                    {btn_precip}
-                    {btn_temp}
                 </div>
             </div>
         }
@@ -740,13 +1155,14 @@ fn main() -> Result<(), String> {
                 });
             }
             let outcome = earth_for_frame.step_frame(dt);
-            let (now_flying, now_local_25d, precip_cfg, eye_alt_m) =
+            let (now_flying, now_local_25d, precip_cfg, ocean_cfg, eye_alt_m) =
                 earth_for_frame.with_state(|st| {
                     let inp = st.viewport.input();
                     (
                         st.orbit.is_flying(),
                         st.orbit.range_m < LOCAL_TRANSITION_RANGE_M,
                         inp.precipitation.clone(),
+                        inp.ocean_waves.clone(),
                         inp.camera.altitude_m(),
                     )
                 });
@@ -755,7 +1171,11 @@ fn main() -> Result<(), String> {
             let view_edge = now_local_25d != was_local_25d;
             was_local_25d = now_local_25d;
 
-            if !precip_cfg.enabled {
+            let weather_snap = earth_for_frame.last_weather_snapshot();
+            let need_badge = precip_cfg.enabled
+                || ocean_cfg.enabled
+                || weather_snap.is_some_and(|w| w.precipitation_intensity > 0.02);
+            if !need_badge {
                 if atmo_for_frame.borrow().is_some() {
                     *atmo_for_frame.borrow_mut() = None;
                     hud_dirty = true;
@@ -764,8 +1184,10 @@ fn main() -> Result<(), String> {
                 atmo_refresh_start = std::time::Instant::now();
                 let next_msg = format_atmo_status(
                     &precip_cfg,
+                    &ocean_cfg,
                     eye_alt_m,
                     earth_for_frame.last_atmosphere_sample(),
+                    weather_snap,
                 );
                 if *atmo_for_frame.borrow() != next_msg {
                     *atmo_for_frame.borrow_mut() = next_msg;

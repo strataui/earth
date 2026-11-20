@@ -383,3 +383,136 @@ fn programmatic_3d_to_2d_morph_transition_and_back() {
     assert!(!viewport.is_transitioning());
     assert!(viewport.low_level_state().map_2d_morph.abs() < 1e-4);
 }
+
+#[test]
+fn mode_2d_fast_horizontal_pan_has_zero_rotation_zero_mesh_rebuild_and_seamless_wrap() {
+    use strata_earth::{
+        EarthGeometry, EarthObject, EarthOrbitController, EarthScreenProjector, GeoPosition,
+        RetainedTerrainBuilder,
+    };
+
+    let base_input = EarthInput {
+        surface_mode: SurfaceMode::QuadtreeLod,
+        view_mode: EarthViewMode::Mode2D,
+        view_morph: 1.0,
+        camera: EarthCamera {
+            focus: Geodetic::new(-45.0, 90.0, 0.0),
+            eye_offset_m: [0.0, 0.0, 12_000_000.0],
+            ..EarthCamera::default()
+        },
+        ..EarthInput::default()
+    };
+
+    // 1. Camera orientation (`view_rot`) must be strictly constant across all longitudes & latitudes
+    //    (especially Southern Hemisphere -45° where moving spherical tangent frames caused CCW tilt!).
+    let ref_cam = RetainedTerrainBuilder::camera_from_input(&base_input);
+    for &(lat, lon) in &[
+        (-75.0, -179.0),
+        (-45.0, 20.0),
+        (-45.0, 145.0),
+        (0.0, 0.0),
+        (55.0, -120.0),
+        (75.0, 179.5),
+    ] {
+        let mut inp = base_input.clone();
+        inp.camera.focus = Geodetic::new(lat, lon, 0.0);
+        let c = RetainedTerrainBuilder::camera_from_input(&inp);
+        for col in 0..4 {
+            for row in 0..4 {
+                assert!(
+                    (c.view_rot[col][row] - ref_cam.view_rot[col][row]).abs() < 1e-6,
+                    "2D view_rot must never rotate or tilt at ({lat}, {lon}): diff at [{col}][{row}]"
+                );
+            }
+        }
+    }
+
+    // 2. Rapid panning across Southern Hemisphere must reuse 2D meshes with zero morph invalidation
+    //    and keep every mesh normal fixed at +X = (1, 0, 0).
+    let mut builder = RetainedTerrainBuilder::new();
+    let mut src = EmbeddedBaseMapSource::new();
+    let (frame_a, _) = builder.build_frame(&base_input, &mut src, 1, true);
+    assert!(!frame_a.meshes.is_empty());
+    for mesh in &frame_a.meshes {
+        for v in mesh.vertices.iter() {
+            let n = v.normal();
+            assert!(
+                (n[0] - 1.0).abs() < 1e-4 && n[1].abs() < 1e-4 && n[2].abs() < 1e-4,
+                "canonical 2D tile mesh normal must stay fixed (1,0,0), got {:?}",
+                n
+            );
+        }
+    }
+
+    // Pan rapidly east by 75°, then pan back to original focus: cached meshes must hit 100%!
+    let mut panned = base_input.clone();
+    panned.camera.focus = Geodetic::new(-45.0, 165.0, 0.0);
+    let _ = builder.build_frame(&panned, &mut src, 2, true);
+    let (_, stats_return) = builder.build_frame(&base_input, &mut src, 3, true);
+    assert_eq!(
+        stats_return.mesh_cache_misses, 0,
+        "returning after fast 2D pan must hit 100% of cached canonical 2D tile meshes"
+    );
+
+    // 3. Antimeridian (+170° viewing Hawaii at -155°): labels, objects, and raycasting must align seamlessly.
+    let mut pacific = base_input.clone();
+    pacific.camera.focus = Geodetic::new(20.0, 170.0, 0.0);
+    pacific.camera.eye_offset_m = [0.0, 0.0, 6_000_000.0];
+    let proj = EarthScreenProjector::from_input(&pacific);
+    let (sx, sy, ndc_x, _ndc_y, _) = proj
+        .project_raw(20.0, -155.0, 0.0)
+        .expect("Hawaii (-155°) must project onto screen when 2D camera is at +170°");
+    assert!(
+        ndc_x > 0.1 && sx > pacific.viewport.width * 0.5,
+        "Hawaii (-155°) must appear East (right) of +170°, got sx={sx}, ndc_x={ndc_x}"
+    );
+
+    let mut viewport = EarthViewport::new(&pacific, Box::new(EmbeddedBaseMapSource::new()));
+    let hawaii_obj = viewport.spawn_object(EarthObject::new(
+        GeoPosition::sea_level(20.0, -155.0, 0.0),
+        EarthGeometry::sphere(10_000.0),
+    ));
+    viewport.sync_now();
+
+    let hit = viewport
+        .raycast_terrain(sx as f64, sy as f64)
+        .expect("raycast onto wrapped Hawaii screen position must hit");
+    assert!(
+        (hit.lat_deg - 20.0).abs() < 0.05 && (hit.lon_deg - (-155.0)).abs() < 0.05,
+        "wrapped 2D raycast must unproject back to (20°, -155°), got ({}, {})",
+        hit.lat_deg,
+        hit.lon_deg
+    );
+    let tf = viewport
+        .resolve_object_transform(hawaii_obj)
+        .expect("resolve Hawaii object");
+    let cam_eye_y = viewport.retained_scene().camera().eye_ecef[1];
+    assert!(
+        (tf.anchor_ecef[1] - cam_eye_y).abs() < 5_000_000.0,
+        "Hawaii object must wrap to +205° copy near camera at +170° (diff={} m)",
+        (tf.anchor_ecef[1] - cam_eye_y).abs()
+    );
+
+    // 4. 2D controller drag speed must stay 1:1 uniform across latitudes (Equator vs -70° Antarctica).
+    let mut c_eq = EarthOrbitController::new();
+    c_eq.set_viewport_size(1440.0, 900.0);
+    c_eq.set_is_2d_hint(true);
+    c_eq.jump_to(0.0, 10.0, 8_000_000.0, 0.0, 0.0);
+    assert!(c_eq.handle_mouse_down(0, 720.0, 450.0));
+    assert!(c_eq.handle_mouse_move(820.0, 450.0));
+    let dlon_eq = (c_eq.lon_deg - 10.0).abs();
+
+    let mut c_south = EarthOrbitController::new();
+    c_south.set_viewport_size(1440.0, 900.0);
+    c_south.set_is_2d_hint(true);
+    c_south.jump_to(-70.0, 10.0, 8_000_000.0, 0.0, 0.0);
+    assert!(c_south.handle_mouse_down(0, 720.0, 450.0));
+    assert!(c_south.handle_mouse_move(820.0, 450.0));
+    let dlon_south = (c_south.lon_deg - 10.0).abs();
+
+    assert!(
+        (dlon_eq - dlon_south).abs() < 1e-6,
+        "2D horizontal drag speed must match flat equirectangular metric at all latitudes: eq={dlon_eq}, south={dlon_south}"
+    );
+}
+
