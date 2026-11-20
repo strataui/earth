@@ -13,6 +13,7 @@ pub mod geodesy;
 pub mod gltf;
 pub mod json;
 pub mod labels;
+pub mod ocean;
 pub mod plugins;
 pub mod precipitation;
 pub mod raycast;
@@ -20,6 +21,7 @@ pub mod satellites;
 pub mod scene;
 pub mod skybox;
 pub mod tiles;
+pub mod weather_api;
 #[cfg(feature = "widget")]
 pub mod widget;
 pub mod worker;
@@ -72,26 +74,28 @@ pub use events::{
 pub use geodesy::{
     build_tile_local_rtc_mesh, build_tile_local_rtc_mesh_morphed, clamp_latitude,
     compute_seamless_25d_blend, compute_tile_sse, depth_range, ecef_to_geodetic, geodetic_to_ecef,
-    horizon_distance_m, is_tile_horizon_culled, is_tile_in_frustum, level_for_altitude,
-    mercator_gy_to_lat_deg, pick_geodetic, pick_geodetic_with_up, project_morphed_point_and_frame,
-    raycast_ellipsoid, resolve_tile_imagery, retained_camera_uniforms,
-    retained_camera_uniforms_with_up, rte_gpu_relative_position, rte_relative_position_f32,
-    screen_to_ray, screen_to_ray_with_up, split_dvec3_to_high_low, split_f64_to_high_low,
-    stabilized_surface_morph, tile_bounding_sphere, tile_bounding_sphere_projected, tile_bounds,
-    tile_bounds_mercator, traverse_quadtree_lod, traverse_quadtree_lod_2d_flat,
-    traverse_quadtree_lod_frustum6, traverse_quadtree_lod_frustum6_projected,
-    traverse_quadtree_lod_frustum6_projected_with_up, unproject_morphed_surface_lat_lon,
+    horizon_distance_m, is_canonical_2d_morph, is_tile_horizon_culled, is_tile_in_frustum,
+    level_for_altitude, mercator_gy_to_lat_deg, pick_geodetic, pick_geodetic_with_up,
+    project_morphed_point_and_frame, raycast_ellipsoid, resolve_tile_imagery,
+    retained_camera_uniforms, retained_camera_uniforms_for_morph, retained_camera_uniforms_with_up,
+    rte_gpu_relative_position, rte_relative_position_f32, screen_to_ray, screen_to_ray_for_morph,
+    screen_to_ray_with_up, split_dvec3_to_high_low, split_f64_to_high_low,
+    stabilized_surface_morph, tile_bounding_sphere, tile_bounding_sphere_projected,
+    tile_bounding_sphere_projected_with_altitude, tile_bounds, tile_bounds_mercator,
+    traverse_quadtree_lod, traverse_quadtree_lod_2d_flat, traverse_quadtree_lod_frustum6,
+    traverse_quadtree_lod_frustum6_projected, traverse_quadtree_lod_frustum6_projected_with_up,
+    traverse_quadtree_lod_frustum6_with_elevation, unproject_morphed_surface_lat_lon,
     wrap_longitude, AltitudeMode, CameraPlacement, EarthCamera, Frustum6, GeoPosition, Geodetic,
-    LocalFrame, RteEyeUniforms, SurfaceMorphParams, TileKey, TileProjection,
-    TileTextureResolution, GLOBE_ALTITUDE_M, MAX_QUADTREE_LEAVES,
+    IdleLodParams, LocalFrame, RteEyeUniforms, SurfaceMorphParams, TileKey, TileProjection,
+    TileTextureResolution, CANONICAL_2D_MORPH_THRESHOLD, GLOBE_ALTITUDE_M, MAX_QUADTREE_LEAVES,
 };
 pub use gltf::{parse_glb_mesh, WeatherConfig, WeatherMesh};
+pub use ocean::{classify_non_land_water, compute_coastal_sdf_grid, OceanWavesPlugin};
 pub use plugins::{
-    classify_non_land_water, sample_land_mask_at, CelestialPlugin, CityLightsPlugin,
-    EarthDynamicOverlayContext, EarthParticleContext, EarthPlugin, EarthPluginFrameContext,
+    sample_land_mask_at, CelestialPlugin, CityLightsPlugin, EarthDynamicOverlayContext,
+    EarthOceanContext, EarthParticleContext, EarthPlugin, EarthPluginFrameContext,
     EarthPluginHooks, EarthPluginRegistry, EarthTextureInjector, EarthTileBuildContext,
-    EarthWorldBuildContext, LoadedTileImagerySnapshot, OceanWavesPlugin, SatellitesPlugin,
-    WeatherPlugin,
+    EarthWorldBuildContext, LoadedTileImagerySnapshot, SatellitesPlugin, WeatherPlugin,
 };
 pub use precipitation::{
     climatological_sea_level_temp_c, compute_precipitation_phase, isa_pressure_hpa,
@@ -116,18 +120,24 @@ pub use scene::{
     parse_overpass_buildings, requested_tile, sky_gradient, surrounding_patches, surrounding_tiles,
     terrain_skirt_triangle_count, terrain_triangle_count, terrain_triangle_count_with_skirts,
     tile_patch_span_deg, BuildingFootprint, BuildingSource, EarthInput, EarthLowLevelState,
-    EarthScene, EarthViewMode, FrameStats, LayerToggles, MemoryBuildingSource,
-    NetworkBuildingSource, OceanWavesConfig, PatchBounds, PatchFrame, SpaceEnvironmentConfig,
-    SunDirectionMode, SurfaceMode,
+    EarthScene, EarthViewMode, FrameStats, IdleHighResConfig, LayerToggles, LocalAtmosphereConfig,
+    MemoryBuildingSource, NetworkBuildingSource, OceanWavesConfig, PatchBounds, PatchFrame,
+    SpaceEnvironmentConfig, SunDirectionMode, SurfaceMode,
 };
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{
     decode_png_to_rgba, decode_terrain_rgb, decode_terrarium, format_slippy_url, format_tile_url,
-    is_unavailable_placeholder_tile, tile_key_to_quadkey, tile_sampler, DirectoryTileSource,
+    is_unavailable_placeholder_tile, stitch_elevation_with_neighbors,
+    synthesize_elevation_from_neighbors, tile_key_to_quadkey, tile_sampler, DirectoryTileSource,
     ElevationEncoding, HttpTransport, LruTileCache, LruTileCacheSource, MemoryTileSource,
-    MockHttpTransport, NetworkTileSource, NetworkTileStats, StandardHttpTransport, TextureSlot,
-    TileElevation, TileElevationPreset, TileError, TileImage, TileProviderConfig,
-    TileProviderPreset, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
+    MockHttpTransport, NeighborElevationEdges, NetworkTileSource, NetworkTileStats,
+    StandardHttpTransport, TextureSlot, TileElevation, TileElevationPreset, TileError, TileImage,
+    TileProviderConfig, TileProviderPreset, TileRegistry, TileSource, DEFAULT_MAX_CACHE_BYTES,
+};
+pub use weather_api::{
+    parse_open_meteo_weather_json, BaseWeatherConfig, FnWeatherProvider, OpenMeteoWeatherProvider,
+    OpenMeteoWeatherReport, StaticWeatherProvider, WeatherProvider, WeatherQuery, WeatherSnapshot,
+    WindVector,
 };
 pub use controller::{
     altitude_for_zoom_2d, fly_to, zoom_2d_for_altitude, EarthOrbitController,

@@ -27,8 +27,11 @@ use crate::precipitation::{
     AtmosphereSample, PrecipitationConfig, PrecipitationEvaluator, TemperatureProvider,
 };
 use crate::raycast::EarthRayHit;
-use crate::scene::{EarthInput, EarthViewMode, OceanWavesConfig};
+use crate::scene::{
+    EarthInput, EarthViewMode, IdleHighResConfig, LocalAtmosphereConfig, OceanWavesConfig,
+};
 use crate::tiles::TileSource;
+use crate::weather_api::{BaseWeatherConfig, WeatherProvider, WeatherSnapshot};
 use crate::worker::EarthViewport;
 use crate::world::{EarthObject, EarthObjectId, EarthWorld, ResolvedObjectTransform};
 
@@ -263,6 +266,17 @@ impl EarthViewState {
         self.notify_ui_changed();
     }
 
+    /// Switches view mode (`Mode3D` <-> `Mode2D`) immediately without animation.
+    pub fn set_view_mode_immediate(&mut self, mode: EarthViewMode) {
+        self.viewport.set_view_mode_immediate(mode);
+        self.orbit.set_is_2d_hint(mode == EarthViewMode::Mode2D);
+        self.sync_camera();
+        let (labels, sig) = self.project_and_hash_labels();
+        self.cached_labels = labels;
+        self.last_label_sig = sig;
+        self.notify_ui_changed();
+    }
+
     /// Jumps camera target immediately to a geographic location & framing.
     pub fn jump_to(
         &mut self,
@@ -337,7 +351,7 @@ impl EarthViewState {
     fn project_and_hash_labels(&mut self) -> (Vec<ProjectedEarthLabel>, u64) {
         let labels_on = self.viewport.input().layers.labels;
         let plugins_on = self.has_active_overlay_plugins();
-        let projected = if !labels_on {
+        let mut projected = if !labels_on {
             Vec::new()
         } else if self.orbit.range_m < 250_000.0 {
             let sector = (
@@ -372,6 +386,10 @@ impl EarthViewState {
         } else {
             project_earth_labels(self.viewport.input(), &self.builtin_labels, 36)
         };
+        let obj_labels = self.viewport.project_object_labels();
+        if !obj_labels.is_empty() {
+            projected.extend(obj_labels);
+        }
 
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         let mut mix = |v: u64| {
@@ -384,6 +402,9 @@ impl EarthViewState {
         mix(projected.len() as u64);
         for lbl in &projected {
             mix(lbl.id);
+            for b in lbl.text.as_bytes() {
+                mix(*b as u64);
+            }
             mix((lbl.screen_x * 2.0).round() as i32 as u64);
             mix((lbl.screen_y * 2.0).round() as i32 as u64);
             mix((lbl.alpha * 40.0).round() as i32 as u64);
@@ -403,23 +424,26 @@ impl EarthViewState {
     #[cfg(test)]
     fn compute_projected_labels(&self) -> Vec<ProjectedEarthLabel> {
         let inp = self.viewport.input();
-        if !inp.layers.labels {
-            return Vec::new();
-        }
-        let nearby = if self.orbit.range_m < 250_000.0 {
-            self.live_labels
-                .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg)
-        } else {
+        let mut out = if !inp.layers.labels {
             Vec::new()
-        };
-        if nearby.is_empty() {
-            project_earth_labels(inp, &self.builtin_labels, 36)
         } else {
-            let mut combined = Vec::with_capacity(self.builtin_labels.len() + nearby.len());
-            combined.extend_from_slice(&self.builtin_labels);
-            combined.extend(nearby);
-            project_earth_labels(inp, &combined, 38)
-        }
+            let nearby = if self.orbit.range_m < 250_000.0 {
+                self.live_labels
+                    .collect_nearby(self.orbit.lat_deg, self.orbit.lon_deg)
+            } else {
+                Vec::new()
+            };
+            if nearby.is_empty() {
+                project_earth_labels(inp, &self.builtin_labels, 36)
+            } else {
+                let mut combined = Vec::with_capacity(self.builtin_labels.len() + nearby.len());
+                combined.extend_from_slice(&self.builtin_labels);
+                combined.extend(nearby);
+                project_earth_labels(inp, &combined, 38)
+            }
+        };
+        out.extend(self.viewport.project_object_labels());
+        out
     }
 
     fn compute_plugin_overlay_nodes(&self) -> Vec<strata_dom::NodeBlueprint> {
@@ -464,6 +488,10 @@ impl EarthViewState {
         if camera_moving {
             self.sync_camera();
         }
+        let _idle_refined = self.viewport.step_idle_refinement(
+            dt_s,
+            camera_moving || self.orbit.is_dragging() || self.orbit.is_flying(),
+        );
 
         if self.viewport.labels_enabled()
             && self.orbit.range_m < 180_000.0
@@ -480,8 +508,14 @@ impl EarthViewState {
         let toggled_labels = labels_enabled != self.last_labels_enabled;
         self.last_labels_enabled = labels_enabled;
         let overlay_plugins_active = self.has_active_overlay_plugins();
+        let obj_labels_active = self.viewport.has_labeled_objects();
 
-        if !toggled_labels && !label_dirty && !labels_enabled && !overlay_plugins_active {
+        if !toggled_labels
+            && !label_dirty
+            && !labels_enabled
+            && !overlay_plugins_active
+            && !obj_labels_active
+        {
             return FrameOutcome::Unchanged;
         }
 
@@ -822,22 +856,67 @@ impl EarthView {
 
     /// Mutates the geodetic [`EarthWorld`] and immediately publishes updated GPU instances.
     pub fn world_mut<R>(&self, f: impl FnOnce(&mut EarthWorld) -> R) -> R {
-        self.state.borrow_mut().viewport.world_mut(f)
+        let mut st = self.state.borrow_mut();
+        let had_labeled = st.viewport.has_labeled_objects();
+        let out = st.viewport.world_mut(f);
+        if had_labeled || st.viewport.has_labeled_objects() {
+            let (projected, new_sig) = st.project_and_hash_labels();
+            if new_sig != st.last_label_sig {
+                st.cached_labels = projected;
+                st.last_label_sig = new_sig;
+                st.notify_ui_changed();
+            }
+        }
+        out
     }
 
     /// Spawns a geodetic [`EarthObject`] into the world and returns its [`EarthObjectId`].
     pub fn spawn_object(&self, object: EarthObject) -> EarthObjectId {
-        self.state.borrow_mut().viewport.spawn_object(object)
+        self.world_mut(|w| w.spawn(object))
+    }
+
+    /// Validated convenience wrapper spawning a glTF 2.0 binary (`.glb`) object and returning a `Result`.
+    pub fn spawn_glb(
+        &self,
+        position: crate::geodesy::GeoPosition,
+        bytes: &[u8],
+        unit_scale_m: f64,
+        anchor: crate::world::ObjectAnchor,
+    ) -> Result<EarthObjectId, String> {
+        self.world_mut(|w| w.spawn_glb(position, bytes, unit_scale_m, anchor))
+    }
+
+    /// Updates a [`crate::world::EarthGeometry::Polyline`] object's vertices in place without leaking CPU or GPU meshes.
+    pub fn set_polyline_points(
+        &self,
+        id: EarthObjectId,
+        points: Vec<crate::geodesy::GeoPosition>,
+    ) -> bool {
+        self.world_mut(|w| w.set_polyline_points(id, points))
+    }
+
+    /// Updates a [`crate::world::EarthGeometry::Polyline`] object's tube radius in place without leaking CPU or GPU meshes.
+    pub fn set_polyline_radius(&self, id: EarthObjectId, radius_m: f64) -> bool {
+        self.world_mut(|w| w.set_polyline_radius(id, radius_m))
+    }
+
+    /// Replaces `id`'s [`crate::world::EarthGeometry`] in place and evicts any unreferenced mesh buffers.
+    pub fn replace_geometry(
+        &self,
+        id: EarthObjectId,
+        geometry: crate::world::EarthGeometry,
+    ) -> bool {
+        self.world_mut(|w| w.replace_geometry(id, geometry))
     }
 
     /// Removes an [`EarthObject`] by ID, returning `true` if it existed.
     pub fn remove_object(&self, id: EarthObjectId) -> bool {
-        self.state.borrow_mut().viewport.remove_object(id)
+        self.world_mut(|w| w.remove(id))
     }
 
     /// Removes all [`EarthObject`]s from the world.
     pub fn clear_objects(&self) {
-        self.state.borrow_mut().viewport.clear_objects();
+        self.world_mut(|w| w.clear());
     }
 
     /// Returns the number of [`EarthObject`]s currently in the world.
@@ -861,6 +940,147 @@ impl EarthView {
 
     pub fn elevation_enabled(&self) -> bool {
         self.state.borrow().viewport.elevation_enabled()
+    }
+
+    /// Samples terrain elevation in metres above the WGS84 ellipsoid at `(lat_deg, lon_deg)`.
+    pub fn sample_ground_elevation_m(&self, lat_deg: f64, lon_deg: f64) -> f64 {
+        self.state
+            .borrow()
+            .viewport
+            .sample_ground_elevation_m(lat_deg, lon_deg)
+    }
+
+    /// Toggles geographic map labels in O(1) without rebuilding terrain geometry.
+    pub fn set_labels_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_labels_enabled(enabled);
+        let (projected, new_sig) = st.project_and_hash_labels();
+        st.cached_labels = projected;
+        st.last_label_sig = new_sig;
+        st.last_labels_enabled = enabled;
+        st.notify_ui_changed();
+    }
+
+    pub fn labels_enabled(&self) -> bool {
+        self.state.borrow().viewport.labels_enabled()
+    }
+
+    /// Toggles extruded 3D building rendering from the configured [`crate::scene::BuildingSource`].
+    pub fn set_buildings_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_buildings_enabled(enabled);
+        st.notify_ui_changed();
+    }
+
+    pub fn buildings_enabled(&self) -> bool {
+        self.state.borrow().viewport.buildings_enabled()
+    }
+
+    /// Installs or clears a [`crate::scene::BuildingSource`] on the background tile worker.
+    pub fn set_building_source(
+        &self,
+        source: Option<Box<dyn crate::scene::BuildingSource + Send>>,
+    ) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_building_source(source);
+        st.notify_ui_changed();
+    }
+
+    /// Toggles the geodetic meridian/parallel graticule overlay in O(1).
+    pub fn set_graticule_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_graticule_enabled(enabled);
+        st.notify_ui_changed();
+    }
+
+    pub fn graticule_enabled(&self) -> bool {
+        self.state.borrow().viewport.graticule_enabled()
+    }
+
+    /// Returns a snapshot of the active [`SpaceEnvironmentConfig`].
+    pub fn space_config(&self) -> crate::scene::SpaceEnvironmentConfig {
+        self.state.borrow().viewport.space_config().clone()
+    }
+
+    /// Updates planetary lighting, starfield, Sun/Moon, satellites, and city-light configuration in O(1).
+    pub fn set_space_config(&self, config: crate::scene::SpaceEnvironmentConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_space_config(config);
+        st.notify_ui_changed();
+    }
+
+    /// Returns a snapshot of the active [`crate::gltf::WeatherConfig`].
+    pub fn weather_config(&self) -> crate::gltf::WeatherConfig {
+        self.state.borrow().viewport.weather_config().clone()
+    }
+
+    /// Updates global & local cloud-shell configuration in O(1) without terrain rebuilds.
+    pub fn set_weather_config(&self, config: crate::gltf::WeatherConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_weather_config(config);
+        st.notify_ui_changed();
+    }
+
+    /// Returns a snapshot of the active [`TileProviderConfig`].
+    pub fn tile_provider(&self) -> crate::tiles::TileProviderConfig {
+        self.state.borrow().viewport.tile_provider().clone()
+    }
+
+    /// Switches the active [`TileProviderConfig`] at runtime.
+    pub fn set_tile_provider(&self, config: crate::tiles::TileProviderConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_tile_provider(config);
+        st.notify_ui_changed();
+    }
+
+    /// Switches the active map/satellite preset cleanly.
+    pub fn set_tile_preset(&self, preset: crate::tiles::TileProviderPreset) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_tile_preset(preset);
+        st.notify_ui_changed();
+    }
+
+    /// Replaces the underlying [`TileSource`] cleanly and rebuilds terrain textures & meshes.
+    pub fn set_tile_source(&self, source: Box<dyn crate::tiles::TileSource + Send>) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_tile_source(source);
+        st.notify_ui_changed();
+    }
+
+    /// Returns the high-level view mode (`Mode3D` or `Mode2D`).
+    pub fn view_mode(&self) -> EarthViewMode {
+        self.state.borrow().viewport.view_mode()
+    }
+
+    /// Programmatically initiates a smooth animated transition between `Mode3D` and `Mode2D`.
+    pub fn set_view_mode(&self, mode: EarthViewMode) {
+        let mut st = self.state.borrow_mut();
+        st.set_view_mode(mode);
+        st.notify_ui_changed();
+    }
+
+    /// Programmatically switches between `Mode3D` and `Mode2D` immediately without animation.
+    pub fn set_view_mode_immediate(&self, mode: EarthViewMode) {
+        let mut st = self.state.borrow_mut();
+        st.set_view_mode_immediate(mode);
+        st.notify_ui_changed();
+    }
+
+    /// Returns the simulation UNIX UTC timestamp configured on this view.
+    pub fn sim_time_unix_s(&self) -> f64 {
+        self.state.borrow().viewport.input().sim_time_unix_s
+    }
+
+    /// Updates the simulation UNIX UTC timestamp in O(1) (solar/lunar/sidereal/satellite uniforms).
+    pub fn set_sim_time_unix_s(&self, unix_utc_s: f64) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_sim_time_unix_s(unix_utc_s);
+        st.notify_ui_changed();
+    }
+
+    /// Returns a snapshot of the live camera state.
+    pub fn camera_state(&self) -> EarthCameraState {
+        self.state.borrow().camera_state()
     }
 
     // -------------------------------------------------------------------------
@@ -890,11 +1110,65 @@ impl EarthView {
         self.state.borrow().viewport.is_plugin_enabled(id)
     }
 
+    /// Returns a snapshot of the active [`OceanWavesConfig`].
+    pub fn ocean_waves_config(&self) -> OceanWavesConfig {
+        self.state.borrow().viewport.ocean_waves_config().clone()
+    }
+
+    /// Updates GPU-native physical ocean waves and optional coastal surf settings in O(1).
+    pub fn set_ocean_waves_config(&self, config: OceanWavesConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_ocean_waves_config(config);
+        st.notify_ui_changed();
+    }
+
     /// Enables or disables animated wavy ocean renders on non-land water areas.
     pub fn set_ocean_waves_enabled(&self, enabled: bool) {
         let mut st = self.state.borrow_mut();
         st.viewport.set_ocean_waves_enabled(enabled);
         st.notify_ui_changed();
+    }
+
+    /// Returns a snapshot of the active [`LocalAtmosphereConfig`].
+    pub fn local_atmosphere_config(&self) -> LocalAtmosphereConfig {
+        self.state
+            .borrow()
+            .viewport
+            .local_atmosphere_config()
+            .clone()
+    }
+
+    /// Updates optional realistic 2.5D sky, visible Sun, horizon-synced night stars, terrain
+    /// lighting, and real-time GPU mountain shadows in O(1).
+    pub fn set_local_atmosphere_config(&self, config: LocalAtmosphereConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_local_atmosphere_config(config);
+        st.notify_ui_changed();
+    }
+
+    /// Returns a snapshot of the active unified [`BaseWeatherConfig`].
+    pub fn base_weather_config(&self) -> BaseWeatherConfig {
+        self.state.borrow().viewport.base_weather_config().clone()
+    }
+
+    /// Updates the unified Base Weather API configuration in O(1), driving precipitation,
+    /// cloud storm darkening, 2.5D sky/haze, and ocean wave wind transitions coherently.
+    pub fn set_base_weather_config(&self, config: BaseWeatherConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_base_weather_config(config);
+        st.notify_ui_changed();
+    }
+
+    /// Installs or clears a custom unified [`WeatherProvider`] driving all atmospheric & marine plugins.
+    pub fn set_weather_provider(&self, provider: Option<Arc<dyn WeatherProvider>>) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_weather_provider(provider);
+        st.notify_ui_changed();
+    }
+
+    /// Returns the most recently evaluated unified [`WeatherSnapshot`], if `base_weather.enabled` is active.
+    pub fn last_weather_snapshot(&self) -> Option<WeatherSnapshot> {
+        self.state.borrow().viewport.last_weather_snapshot()
     }
 
     /// Returns a snapshot of the active [`PrecipitationConfig`].
@@ -914,6 +1188,36 @@ impl EarthView {
         let mut st = self.state.borrow_mut();
         st.viewport.set_precipitation_enabled(enabled);
         st.notify_ui_changed();
+    }
+
+    /// Configures opt-in idle high-resolution view refinement via builder style (`enabled: false` by default).
+    pub fn with_idle_high_res(self, config: IdleHighResConfig) -> Self {
+        self.set_idle_high_res_config(config);
+        self
+    }
+
+    /// Returns the active [`IdleHighResConfig`].
+    pub fn idle_high_res_config(&self) -> IdleHighResConfig {
+        self.state.borrow().viewport.idle_high_res_config()
+    }
+
+    /// Updates opt-in idle high-resolution view refinement settings.
+    pub fn set_idle_high_res_config(&self, config: IdleHighResConfig) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_idle_high_res_config(config);
+        st.notify_ui_changed();
+    }
+
+    /// Convenience toggle enabling or disabling optional idle high-resolution refinement.
+    pub fn set_idle_high_res_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_idle_high_res_enabled(enabled);
+        st.notify_ui_changed();
+    }
+
+    /// Returns `true` when idle high-res refinement is enabled and currently active on a stationary view.
+    pub fn is_idle_high_res_active(&self) -> bool {
+        self.state.borrow().viewport.is_idle_high_res_active()
     }
 
     /// Installs a custom functional [`PrecipitationEvaluator`] controlling which 2D layers render.

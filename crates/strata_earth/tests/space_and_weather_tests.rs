@@ -239,10 +239,10 @@ fn glb_parser_and_precipitation_layers_spawn_only_below_cloud_ceiling() {
         "precipitation must stop completely above the cloud ceiling"
     );
 
-    // Must emit GPU-instanced 2D particle layers below the cloud ceiling with zero CPU weather meshes.
+    // Must emit GPU-instanced 2D particle layers (near, mid, far curtain) below the cloud ceiling.
     input.camera.eye_offset_m = [0.0, -400.0, 1_800.0];
     let (frame_low, _) = builder.build_frame(&input, &mut src, 2, true);
-    assert_eq!(frame_low.particle_layers.len(), 1);
+    assert!(!frame_low.particle_layers.is_empty());
     assert!(frame_low.particle_layers[0].particle_count > 0);
     assert!(
         frame_low

@@ -71,61 +71,53 @@ fn input_at(lat_deg: f64, lon_deg: f64, range_m: f64) -> EarthInput {
 fn ocean_waves_emit_animated_gerstner_meshes_over_sea_and_skip_inland() {
     // Open Pacific Ocean near Hawaii
     let mut sea_input = input_at(24.0, -156.0, 8_000.0);
-    sea_input.ocean_waves = OceanWavesConfig::enabled();
+    sea_input.ocean_waves = OceanWavesConfig::enabled().with_wind(12.0, 90.0);
     let mut vp = EarthViewport::new(&sea_input, Box::new(MemoryTileSource::default()));
     vp.sync_now();
 
     let frame0 = vp.retained_scene().snapshot_terrain().expect("retained frame");
-    let ocean_base0 = frame0
-        .dynamic_meshes
-        .iter()
-        .find(|m| m.id == 0xE47A_0C01)
-        .expect("ocean base Gerstner wave mesh present over open ocean");
+    let ocean0 = frame0
+        .ocean
+        .as_ref()
+        .expect("GPU RetainedOceanSurface must be emitted over open Pacific");
+    assert!(ocean0.enabled);
+    assert!(ocean0.alt_fade > 0.9);
+    assert!((ocean0.train_a.wind_speed_mps - 12.0).abs() < 0.05);
     assert!(
-        frame0.dynamic_meshes.iter().any(|m| m.id == 0xE47A_0C03),
-        "ocean trough shadow layer should accompany Gerstner swells"
+        frame0
+            .dynamic_meshes
+            .iter()
+            .all(|m| m.id != 0xE47A_0C01 && m.id != 0xE47A_0C02 && m.id != 0xE47A_0C03),
+        "legacy CPU polygon ocean meshes must not be emitted"
     );
-    assert!(
-        frame0.dynamic_meshes.iter().any(|m| m.id == 0xE47A_0C02),
-        "ocean crest/glint layer should accompany Gerstner swells"
-    );
-    assert!(
-        ocean_base0.vertices.len() > 200 && ocean_base0.indices.len() >= 300,
-        "expected radial Gerstner wave mesh over Pacific, got {} verts / {} indices",
-        ocean_base0.vertices.len(),
-        ocean_base0.indices.len()
-    );
-    let verts_before = ocean_base0.vertices.clone();
+    let phase0 = ocean0.train_a.phase_time_s;
 
-    // Ticking animation advances wave phase in O(1) and updates wave heights smoothly
-    assert!(vp.step_dynamic_overlays(1.0 / 30.0, false));
+    // Ticking animation advances GPU wave phase in O(1) without rebuilding dynamic meshes
+    assert!(vp.step_dynamic_overlays(0.25, false));
     let frame1 = vp.retained_scene().snapshot_terrain().expect("updated frame");
-    let ocean_base1 = frame1
-        .dynamic_meshes
-        .iter()
-        .find(|m| m.id == 0xE47A_0C01)
-        .expect("ocean base mesh after animation step");
-    assert_ne!(
-        verts_before.as_ref(),
-        ocean_base1.vertices.as_ref(),
-        "Gerstner wave vertices must animate across frames"
+    let ocean1 = frame1
+        .ocean
+        .as_ref()
+        .expect("GPU ocean surface after animation step");
+    assert!(
+        ocean1.train_a.phase_time_s > phase0,
+        "GPU ocean wave train phase must advance across animation ticks ({} -> {})",
+        phase0,
+        ocean1.train_a.phase_time_s
     );
 
-    // Turning ocean waves off clears dynamic ocean wave meshes immediately
+    // Turning ocean waves off clears GPU ocean surface immediately
     vp.set_ocean_waves_enabled(false);
     let frame_off = vp
         .retained_scene()
         .snapshot_terrain()
         .expect("frame after disable");
     assert!(
-        !frame_off
-            .dynamic_meshes
-            .iter()
-            .any(|m| m.id == 0xE47A_0C01 || m.id == 0xE47A_0C02 || m.id == 0xE47A_0C03),
-        "disabling OceanWaves must remove ocean wave meshes cleanly"
+        frame_off.ocean.is_none(),
+        "disabling OceanWaves must clear RetainedTerrainFrame::ocean cleanly"
     );
 
-    // Deep inland North America (Denver) must never render ocean waves even when option is enabled
+    // Deep inland North America (Denver) must skip GPU ocean shading cleanly even when enabled
     let mut land_input = input_at(39.7392, -104.9903, 8_000.0);
     land_input.ocean_waves = OceanWavesConfig::enabled();
     let vp_land = EarthViewport::new(&land_input, Box::new(MemoryTileSource::default()));
@@ -135,11 +127,8 @@ fn ocean_waves_emit_animated_gerstner_meshes_over_sea_and_skip_inland() {
         .snapshot_terrain()
         .expect("inland frame");
     assert!(
-        !land_frame
-            .dynamic_meshes
-            .iter()
-            .any(|m| m.id == 0xE47A_0C01 || m.id == 0xE47A_0C02 || m.id == 0xE47A_0C03),
-        "inland continent must produce zero ocean wave meshes"
+        land_frame.ocean.is_none(),
+        "deep inland continent must skip GPU ocean surface cleanly"
     );
 }
 

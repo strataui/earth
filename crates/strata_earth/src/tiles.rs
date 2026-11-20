@@ -136,6 +136,467 @@ impl TileElevation {
         let dv = (south - north) / (2.0 * eps_v);
         (centre, du, dv)
     }
+
+    /// Computes the arithmetic mean elevation in metres across all finite heightmap samples
+    /// in this tile (returning `0.0` when the grid is empty or invalid).
+    pub fn average_elevation_m(&self) -> f64 {
+        if !self.is_valid() {
+            return 0.0;
+        }
+        let mut sum = 0.0f64;
+        let mut count = 0u64;
+        for &h in &self.heights_m {
+            if h.is_finite() {
+                sum += h as f64;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            sum / (count as f64)
+        } else {
+            0.0
+        }
+    }
+
+    /// Computes the average elevation in metres over the normalized UV sub-rectangle
+    /// `[u0..=u1] x [v0..=v1]` of this heightmap tile (e.g. a descendant quadtree tile
+    /// covered by a loaded ancestor DEM tile).
+    ///
+    /// Samples directly from grid cells when the rectangle spans multiple texels (strided for
+    /// O(1) bounded work during LOD traversal) and falls back to a 3x3 bilinear average when
+    /// the child footprint is smaller than one texel.
+    pub fn average_elevation_in_uv_rect_m(&self, u0: f32, v0: f32, u1: f32, v1: f32) -> f64 {
+        if !self.is_valid() {
+            return 0.0;
+        }
+        let u_min = u0.min(u1).clamp(0.0, 1.0);
+        let u_max = u0.max(u1).clamp(0.0, 1.0);
+        let v_min = v0.min(v1).clamp(0.0, 1.0);
+        let v_max = v0.max(v1).clamp(0.0, 1.0);
+        if u_min <= 1e-6 && u_max >= 1.0 - 1e-6 && v_min <= 1e-6 && v_max >= 1.0 - 1e-6 {
+            return self.average_elevation_m();
+        }
+
+        let max_x = (self.width - 1) as f32;
+        let max_y = (self.height - 1) as f32;
+        let fx0 = u_min * max_x;
+        let fx1 = u_max * max_x;
+        let fy0 = v_min * max_y;
+        let fy1 = v_max * max_y;
+
+        if (fx1 - fx0) < 1.5 || (fy1 - fy0) < 1.5 {
+            // Sub-texel child tile: evaluate a 3x3 bilinear grid inside the sub-rectangle.
+            let mut sum = 0.0f64;
+            let mut count = 0u64;
+            for iy in 0..3 {
+                let tv = (iy as f32 + 0.5) / 3.0;
+                let v = v_min + (v_max - v_min) * tv;
+                for ix in 0..3 {
+                    let tu = (ix as f32 + 0.5) / 3.0;
+                    let u = u_min + (u_max - u_min) * tu;
+                    let h = self.sample_bilinear(u, v);
+                    if h.is_finite() {
+                        sum += h as f64;
+                        count += 1;
+                    }
+                }
+            }
+            return if count > 0 { sum / count as f64 } else { 0.0 };
+        }
+
+        let x0 = (fx0.floor() as usize).min(self.width as usize - 1);
+        let x1 = (fx1.ceil() as usize).min(self.width as usize - 1);
+        let y0 = (fy0.floor() as usize).min(self.height as usize - 1);
+        let y1 = (fy1.ceil() as usize).min(self.height as usize - 1);
+        let span_x = (x1 - x0 + 1).max(1);
+        let span_y = (y1 - y0 + 1).max(1);
+        let step_x = (span_x / 8).max(1);
+        let step_y = (span_y / 8).max(1);
+
+        let mut sum = 0.0f64;
+        let mut count = 0u64;
+        let mut y = y0;
+        while y <= y1 {
+            let row = y * self.width as usize;
+            let mut x = x0;
+            while x <= x1 {
+                let h = self.heights_m[row + x];
+                if h.is_finite() {
+                    sum += h as f64;
+                    count += 1;
+                }
+                x += step_x;
+            }
+            y += step_y;
+        }
+        if count > 0 {
+            sum / (count as f64)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Boundary and diagonal-corner elevation profiles sampled from surrounding loaded tiles for a
+/// target tile whose own heightmap is still downloading or coarser than its neighbors.
+///
+/// Edge slices have identical length `res >= 2`, parameterized monotonically from `0.0..=1.0`:
+/// - `west`:  `(u = 0, v = 0..1)` North -> South
+/// - `east`:  `(u = 1, v = 0..1)` North -> South
+/// - `north`: `(u = 0..1, v = 0)` West -> East
+/// - `south`: `(u = 0..1, v = 1)` West -> East
+#[derive(Debug, Clone, Default)]
+pub struct NeighborElevationEdges {
+    pub west: Option<Vec<f32>>,
+    pub east: Option<Vec<f32>>,
+    pub north: Option<Vec<f32>>,
+    pub south: Option<Vec<f32>>,
+    pub nw: Option<f32>,
+    pub ne: Option<f32>,
+    pub sw: Option<f32>,
+    pub se: Option<f32>,
+}
+
+impl NeighborElevationEdges {
+    /// Returns `true` when at least one cardinal edge or diagonal corner has loaded height data.
+    #[inline]
+    pub fn has_any(&self) -> bool {
+        self.west.is_some()
+            || self.east.is_some()
+            || self.north.is_some()
+            || self.south.is_some()
+            || self.nw.is_some()
+            || self.ne.is_some()
+            || self.sw.is_some()
+            || self.se.is_some()
+    }
+
+    /// Returns `true` when at least one cardinal edge (`west`, `east`, `north`, or `south`) is present.
+    #[inline]
+    pub fn has_any_edge(&self) -> bool {
+        self.west.is_some()
+            || self.east.is_some()
+            || self.north.is_some()
+            || self.south.is_some()
+    }
+}
+
+#[inline]
+fn lerp_edge_samples(a: f32, b: f32, n: usize) -> Vec<f32> {
+    let denom = (n.saturating_sub(1)).max(1) as f32;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / denom;
+            a + (b - a) * t
+        })
+        .collect()
+}
+
+#[inline]
+fn extrude_edge_samples(
+    opp: &[f32],
+    c0: f32,
+    c1: f32,
+    blend_shape: f32,
+) -> Vec<f32> {
+    let n = opp.len();
+    let denom = (n.saturating_sub(1)).max(1) as f32;
+    let d0 = c0 - opp[0];
+    let d1 = c1 - opp[n - 1];
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / denom;
+            let lin = c0 + (c1 - c0) * t;
+            let shifted = opp[i] + d0 + (d1 - d0) * t;
+            lin + (shifted - lin) * blend_shape
+        })
+        .collect()
+}
+
+#[inline]
+fn valid_edge_slice(opt: &Option<Vec<f32>>, n: usize) -> Option<&[f32]> {
+    opt.as_deref().filter(|s| s.len() == n)
+}
+
+/// Synthesizes a smooth, boundary-exact `res × res` [`TileElevation`] for an unloaded tile by
+/// evaluating a bilinear Coons patch across any loaded surrounding edges and diagonal corners.
+///
+/// Guarantees `0.0 m` seam error along every loaded surrounding tile edge (preventing vertical
+/// drop-offs to sea level or exposed undermap gaps while the tile's real DEM downloads).
+/// Returns `None` when `edges` contains no loaded neighbor data.
+pub fn synthesize_elevation_from_neighbors(
+    res: u32,
+    edges: &NeighborElevationEdges,
+) -> Option<TileElevation> {
+    if !edges.has_any() {
+        return None;
+    }
+    let n = res.clamp(2, 65) as usize;
+    let w_in = valid_edge_slice(&edges.west, n);
+    let e_in = valid_edge_slice(&edges.east, n);
+    let n_in = valid_edge_slice(&edges.north, n);
+    let s_in = valid_edge_slice(&edges.south, n);
+
+    let mut sum = 0.0f64;
+    let mut cnt = 0u64;
+    let mut min_h = f32::INFINITY;
+    let mut max_h = f32::NEG_INFINITY;
+    let mut accum = |h: f32| {
+        if h.is_finite() {
+            sum += h as f64;
+            cnt += 1;
+            min_h = min_h.min(h);
+            max_h = max_h.max(h);
+        }
+    };
+    for slice in [w_in, e_in, n_in, s_in].into_iter().flatten() {
+        for &h in slice {
+            accum(h);
+        }
+    }
+    for h in [edges.nw, edges.ne, edges.sw, edges.se].into_iter().flatten() {
+        accum(h);
+    }
+    if cnt == 0 {
+        return None;
+    }
+    let mean_h = (sum / cnt as f64) as f32;
+
+    let pick_corner = |a: Option<f32>, b: Option<f32>, diag: Option<f32>| -> Option<f32> {
+        match (a.filter(|v| v.is_finite()), b.filter(|v| v.is_finite())) {
+            (Some(va), Some(vb)) => Some(0.5 * (va + vb)),
+            (Some(va), None) => Some(va),
+            (None, Some(vb)) => Some(vb),
+            (None, None) => diag.filter(|v| v.is_finite()),
+        }
+    };
+
+    let mut k00 = pick_corner(w_in.map(|s| s[0]), n_in.map(|s| s[0]), edges.nw);
+    let mut k10 = pick_corner(e_in.map(|s| s[0]), n_in.map(|s| s[n - 1]), edges.ne);
+    let mut k01 = pick_corner(w_in.map(|s| s[n - 1]), s_in.map(|s| s[0]), edges.sw);
+    let mut k11 = pick_corner(e_in.map(|s| s[n - 1]), s_in.map(|s| s[n - 1]), edges.se);
+
+    // Fill any unresolved corners cleanly (tangent plane extrapolation if 3 of 4 exist, else adjacent average).
+    let clamp_lo = min_h - 150.0;
+    let clamp_hi = max_h + 150.0;
+    for _ in 0..2 {
+        if k00.is_none() {
+            if let (Some(a), Some(b), Some(c)) = (k10, k01, k11) {
+                k00 = Some((a + b - c).clamp(clamp_lo, clamp_hi));
+            } else if let Some(v) = match (k10, k01) {
+                (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            } {
+                k00 = Some(v);
+            }
+        }
+        if k10.is_none() {
+            if let (Some(a), Some(b), Some(c)) = (k00, k11, k01) {
+                k10 = Some((a + b - c).clamp(clamp_lo, clamp_hi));
+            } else if let Some(v) = match (k00, k11) {
+                (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            } {
+                k10 = Some(v);
+            }
+        }
+        if k01.is_none() {
+            if let (Some(a), Some(b), Some(c)) = (k00, k11, k10) {
+                k01 = Some((a + b - c).clamp(clamp_lo, clamp_hi));
+            } else if let Some(v) = match (k00, k11) {
+                (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            } {
+                k01 = Some(v);
+            }
+        }
+        if k11.is_none() {
+            if let (Some(a), Some(b), Some(c)) = (k10, k01, k00) {
+                k11 = Some((a + b - c).clamp(clamp_lo, clamp_hi));
+            } else if let Some(v) = match (k10, k01) {
+                (Some(a), Some(b)) => Some(0.5 * (a + b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            } {
+                k11 = Some(v);
+            }
+        }
+    }
+
+    let c00 = k00.unwrap_or(mean_h);
+    let c10 = k10.unwrap_or(mean_h);
+    let c01 = k01.unwrap_or(mean_h);
+    let c11 = k11.unwrap_or(mean_h);
+
+    let ns_count = (n_in.is_some() as u8) + (s_in.is_some() as u8);
+    let we_count = (w_in.is_some() as u8) + (e_in.is_some() as u8);
+    let shape_for_we = match ns_count {
+        0 => 1.0,
+        1 => 0.45,
+        _ => 0.0,
+    };
+    let shape_for_ns = match we_count {
+        0 => 1.0,
+        1 => 0.45,
+        _ => 0.0,
+    };
+
+    let w_edge: Vec<f32> = match (w_in, e_in) {
+        (Some(w), _) => w.to_vec(),
+        (None, Some(e)) => extrude_edge_samples(e, c00, c01, shape_for_we),
+        (None, None) => lerp_edge_samples(c00, c01, n),
+    };
+    let e_edge: Vec<f32> = match (e_in, w_in) {
+        (Some(e), _) => e.to_vec(),
+        (None, Some(w)) => extrude_edge_samples(w, c10, c11, shape_for_we),
+        (None, None) => lerp_edge_samples(c10, c11, n),
+    };
+    let n_edge: Vec<f32> = match (n_in, s_in) {
+        (Some(ne), _) => ne.to_vec(),
+        (None, Some(se)) => extrude_edge_samples(se, c00, c10, shape_for_ns),
+        (None, None) => lerp_edge_samples(c00, c10, n),
+    };
+    let s_edge: Vec<f32> = match (s_in, n_in) {
+        (Some(se), _) => se.to_vec(),
+        (None, Some(ne)) => extrude_edge_samples(ne, c01, c11, shape_for_ns),
+        (None, None) => lerp_edge_samples(c01, c11, n),
+    };
+
+    let denom = (n - 1) as f32;
+    let safe_lo = min_h - 400.0;
+    let safe_hi = max_h + 400.0;
+    let mut heights_m = Vec::with_capacity(n * n);
+    for row in 0..n {
+        let v = row as f32 / denom;
+        let on_n = row == 0 && n_in.is_some();
+        let on_s = row == n - 1 && s_in.is_some();
+        for col in 0..n {
+            let u = col as f32 / denom;
+            let on_w = col == 0 && w_in.is_some();
+            let on_e = col == n - 1 && e_in.is_some();
+            let bilerp = (1.0 - u) * (1.0 - v) * c00
+                + u * (1.0 - v) * c10
+                + (1.0 - u) * v * c01
+                + u * v * c11;
+            let mut h = (1.0 - u) * w_edge[row]
+                + u * e_edge[row]
+                + (1.0 - v) * n_edge[col]
+                + v * s_edge[col]
+                - bilerp;
+            if !(on_w || on_e || on_n || on_s) {
+                h = h.clamp(safe_lo, safe_hi);
+            }
+            heights_m.push(h);
+        }
+    }
+
+    Some(TileElevation {
+        width: n as u32,
+        height: n as u32,
+        heights_m,
+    })
+}
+
+/// Resamples a coarse ancestor `base` elevation grid over `target_tile` (`uv_rect = (u0, v0, u1, v1)`)
+/// and smoothly stitches any edges bordering finer loaded neighbors via a residual Coons patch.
+///
+/// Preserves 100% of the ancestor's interior mountain relief while locking every boundary shared
+/// with a finer loaded neighbor to exact `0.0 m` continuity.
+pub fn stitch_elevation_with_neighbors(
+    base: &TileElevation,
+    uv_rect: (f32, f32, f32, f32),
+    res: u32,
+    edges: &NeighborElevationEdges,
+) -> TileElevation {
+    let n = res.clamp(2, 65) as usize;
+    let denom = (n - 1) as f32;
+    let (u0, v0, u1, v1) = uv_rect;
+    let mut base_h = Vec::with_capacity(n * n);
+    for row in 0..n {
+        let tv = v0 + (v1 - v0) * (row as f32 / denom);
+        for col in 0..n {
+            let tu = u0 + (u1 - u0) * (col as f32 / denom);
+            base_h.push(base.sample_bilinear(tu, tv));
+        }
+    }
+
+    if !edges.has_any_edge() {
+        return TileElevation {
+            width: n as u32,
+            height: n as u32,
+            heights_m: base_h,
+        };
+    }
+
+    let dw_opt: Option<Vec<f32>> = valid_edge_slice(&edges.west, n)
+        .map(|w| (0..n).map(|r| w[r] - base_h[r * n]).collect());
+    let de_opt: Option<Vec<f32>> = valid_edge_slice(&edges.east, n)
+        .map(|e| (0..n).map(|r| e[r] - base_h[r * n + (n - 1)]).collect());
+    let dn_opt: Option<Vec<f32>> = valid_edge_slice(&edges.north, n)
+        .map(|ne| (0..n).map(|c| ne[c] - base_h[c]).collect());
+    let ds_opt: Option<Vec<f32>> = valid_edge_slice(&edges.south, n)
+        .map(|se| (0..n).map(|c| se[c] - base_h[(n - 1) * n + c]).collect());
+
+    let avg_res = |a: Option<f32>, b: Option<f32>| -> f32 {
+        match (a, b) {
+            (Some(va), Some(vb)) => 0.5 * (va + vb),
+            (Some(va), None) => va,
+            (None, Some(vb)) => vb,
+            (None, None) => 0.0,
+        }
+    };
+    let rc00 = avg_res(
+        dw_opt.as_ref().map(|v| v[0]),
+        dn_opt.as_ref().map(|v| v[0]),
+    );
+    let rc10 = avg_res(
+        de_opt.as_ref().map(|v| v[0]),
+        dn_opt.as_ref().map(|v| v[n - 1]),
+    );
+    let rc01 = avg_res(
+        dw_opt.as_ref().map(|v| v[n - 1]),
+        ds_opt.as_ref().map(|v| v[0]),
+    );
+    let rc11 = avg_res(
+        de_opt.as_ref().map(|v| v[n - 1]),
+        ds_opt.as_ref().map(|v| v[n - 1]),
+    );
+
+    let dw = dw_opt.unwrap_or_else(|| lerp_edge_samples(rc00, rc01, n));
+    let de = de_opt.unwrap_or_else(|| lerp_edge_samples(rc10, rc11, n));
+    let dn = dn_opt.unwrap_or_else(|| lerp_edge_samples(rc00, rc10, n));
+    let ds = ds_opt.unwrap_or_else(|| lerp_edge_samples(rc01, rc11, n));
+
+    let mut heights_m = Vec::with_capacity(n * n);
+    for row in 0..n {
+        let v = row as f32 / denom;
+        for col in 0..n {
+            let u = col as f32 / denom;
+            let bilerp = (1.0 - u) * (1.0 - v) * rc00
+                + u * (1.0 - v) * rc10
+                + (1.0 - u) * v * rc01
+                + u * v * rc11;
+            let residual = (1.0 - u) * dw[row]
+                + u * de[row]
+                + (1.0 - v) * dn[col]
+                + v * ds[col]
+                - bilerp;
+            heights_m.push(base_h[row * n + col] + residual);
+        }
+    }
+
+    TileElevation {
+        width: n as u32,
+        height: n as u32,
+        heights_m,
+    }
 }
 
 /// Errors a tile source can report.

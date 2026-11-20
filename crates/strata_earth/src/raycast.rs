@@ -9,7 +9,7 @@ use strata_render::camera64::DVec3;
 
 use crate::geodesy::{
     ecef_to_geodetic, geodetic_to_ecef, project_morphed_point_and_frame, raycast_ellipsoid,
-    screen_to_ray_with_up, unproject_morphed_surface_lat_lon, wgs84, wrap_longitude, EarthCamera,
+    screen_to_ray_for_morph, unproject_morphed_surface_lat_lon, wgs84, wrap_longitude, EarthCamera,
     Geodetic, LocalFrame, SurfaceMorphParams,
 };
 use crate::world::{CompiledMeshEntry, EarthObjectId, EarthWorld, ResolvedObjectTransform};
@@ -59,12 +59,13 @@ pub fn raycast_viewport(
     if viewport_width <= 0.0 || viewport_height <= 0.0 {
         return None;
     }
-    let (ray_origin, ray_dir) = screen_to_ray_with_up(
+    let (ray_origin, ray_dir) = screen_to_ray_for_morph(
         screen_x,
         screen_y,
         viewport_width,
         viewport_height,
         camera,
+        morph,
         up_override,
     );
     raycast_ray(
@@ -610,9 +611,16 @@ fn intersect_transformed_mesh(
     let mut best_local_n: Option<[f64; 3]> = None;
 
     for tri in inds.chunks_exact(3) {
-        let p0 = verts[tri[0] as usize].position();
-        let p1 = verts[tri[1] as usize].position();
-        let p2 = verts[tri[2] as usize].position();
+        let (Some(v0), Some(v1), Some(v2)) = (
+            verts.get(tri[0] as usize),
+            verts.get(tri[1] as usize),
+            verts.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        let p0 = v0.position();
+        let p1 = v1.position();
+        let p2 = v2.position();
         if let Some((t, ln)) = ray_triangle_mt(lo, ld, p0, p1, p2) {
             if t > 1e-3 && t < best_t {
                 best_t = t;

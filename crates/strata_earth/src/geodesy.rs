@@ -307,44 +307,66 @@ impl EarthCamera {
             far_m: far,
         }
     }
+
+    /// Resolves camera placement matching `morph` across 3D curved globe, 2.5D local tangent
+    /// plane, and steady-state canonical 2D flat map (`map_2d_morph >= 0.999`).
+    ///
+    /// In canonical 2D mode, the camera is positioned strictly nadir over the fixed equatorial
+    /// plane (`LocalFrame::at(morph.focus.lat_deg, morph.focus.lon_deg)` with `morph.focus = (0, 0)`),
+    /// keeping `view_rot` constant across arbitrary fast panning so the flat map never tilts or
+    /// rotates from spherical meridian convergence.
+    pub fn placement_for_morph(
+        &self,
+        morph: SurfaceMorphParams,
+        up_override: Option<DVec3>,
+    ) -> CameraPlacement {
+        if is_canonical_2d_morph(morph.map_2d_morph)
+            && morph.flat_blend >= CANONICAL_2D_MORPH_THRESHOLD
+        {
+            let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
+            let frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
+            let origin = geodetic_to_ecef(focus_surface);
+            let focus_lat = self.focus.lat_deg.clamp(-85.051129, 85.051129);
+            let focus_lon = wrap_longitude(self.focus.lon_deg);
+            let dlon_deg = wrap_longitude(focus_lon - morph.focus.lon_deg);
+            let dlat_deg = focus_lat - morph.focus.lat_deg;
+            let east_m = dlon_deg.to_radians() * wgs84::A;
+            let north_m = dlat_deg.to_radians() * wgs84::A;
+            let dist = self.eye_distance_m().max(self.altitude_m()).max(1.0);
+            let aim = origin
+                .add(frame.east.scale(east_m))
+                .add(frame.north.scale(north_m));
+            let eye = aim.add(frame.up.scale(dist));
+            let horizon = horizon_distance_m(dist);
+            let (near, far) = depth_range(dist, horizon, self.near_m);
+            return CameraPlacement {
+                eye,
+                aim,
+                up: frame.north,
+                fov_y_deg: self.fov_y_deg,
+                near_m: near,
+                far_m: far.max(dist * 4.0 + 100_000.0),
+            };
+        }
+        self.placement_with_up(up_override)
+    }
 }
 
-/// Unprojects a 2D screen coordinate in the viewport to a 3D ray in ECEF world space.
-///
-/// Returns `(ray_origin, ray_direction)` in ECEF metres.
-pub fn screen_to_ray(
+fn screen_to_ray_from_placement(
     screen_x: f64,
     screen_y: f64,
     viewport_width: f64,
     viewport_height: f64,
-    camera: &EarthCamera,
+    placement: CameraPlacement,
+    fallback_lat_deg: f64,
+    fallback_lon_deg: f64,
 ) -> (DVec3, DVec3) {
-    screen_to_ray_with_up(
-        screen_x,
-        screen_y,
-        viewport_width,
-        viewport_height,
-        camera,
-        None,
-    )
-}
-
-/// Same as [`screen_to_ray`] with an optional explicit ECEF camera-up hint.
-pub fn screen_to_ray_with_up(
-    screen_x: f64,
-    screen_y: f64,
-    viewport_width: f64,
-    viewport_height: f64,
-    camera: &EarthCamera,
-    up_override: Option<DVec3>,
-) -> (DVec3, DVec3) {
-    let placement = camera.placement_with_up(up_override);
     let eye = placement.eye;
     let aim = placement.aim;
 
     let forward = aim.sub(eye).normalize();
     let cam_up = if forward.cross(placement.up).length() < 1e-6 {
-        let frame = LocalFrame::at(camera.focus.lat_deg, camera.focus.lon_deg);
+        let frame = LocalFrame::at(fallback_lat_deg, fallback_lon_deg);
         if forward.cross(frame.north).length() > 1e-6 {
             frame.north
         } else if forward.cross(frame.east).length() > 1e-6 {
@@ -380,6 +402,70 @@ pub fn screen_to_ray_with_up(
         .normalize();
 
     (eye, dir)
+}
+
+/// Unprojects a 2D screen coordinate in the viewport to a 3D ray in ECEF world space.
+///
+/// Returns `(ray_origin, ray_direction)` in ECEF metres.
+pub fn screen_to_ray(
+    screen_x: f64,
+    screen_y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    camera: &EarthCamera,
+) -> (DVec3, DVec3) {
+    screen_to_ray_with_up(
+        screen_x,
+        screen_y,
+        viewport_width,
+        viewport_height,
+        camera,
+        None,
+    )
+}
+
+/// Same as [`screen_to_ray`] with an optional explicit ECEF camera-up hint.
+pub fn screen_to_ray_with_up(
+    screen_x: f64,
+    screen_y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+) -> (DVec3, DVec3) {
+    let placement = camera.placement_with_up(up_override);
+    screen_to_ray_from_placement(
+        screen_x,
+        screen_y,
+        viewport_width,
+        viewport_height,
+        placement,
+        camera.focus.lat_deg,
+        camera.focus.lon_deg,
+    )
+}
+
+/// Same as [`screen_to_ray_with_up`], honoring the active [`SurfaceMorphParams`] coordinate frame
+/// (including the fixed canonical 2D map plane when `map_2d_morph >= 0.999`).
+pub fn screen_to_ray_for_morph(
+    screen_x: f64,
+    screen_y: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    camera: &EarthCamera,
+    morph: SurfaceMorphParams,
+    up_override: Option<DVec3>,
+) -> (DVec3, DVec3) {
+    let placement = camera.placement_for_morph(morph, up_override);
+    screen_to_ray_from_placement(
+        screen_x,
+        screen_y,
+        viewport_width,
+        viewport_height,
+        placement,
+        camera.focus.lat_deg,
+        camera.focus.lon_deg,
+    )
 }
 
 /// Picks a geographic coordinate on the WGS84 ellipsoid under a screen position.
@@ -744,6 +830,17 @@ impl Default for SurfaceMorphParams {
     }
 }
 
+/// Threshold on [`SurfaceMorphParams::map_2d_morph`] at or above which the flat 2D map uses
+/// the fixed canonical equatorial plane (`(0°, 0°)`), preventing tangent-frame rotation lag
+/// and keeping 2D tile meshes 100% cache-stable across arbitrary fast panning.
+pub const CANONICAL_2D_MORPH_THRESHOLD: f64 = 0.999;
+
+/// Returns `true` when `map_2d_morph` represents steady-state flat 2D map mode.
+#[inline]
+pub fn is_canonical_2d_morph(map_2d_morph: f64) -> bool {
+    map_2d_morph >= CANONICAL_2D_MORPH_THRESHOLD
+}
+
 /// Computes the canonical quantized [`SurfaceMorphParams`] shared identically across terrain tile
 /// mesh generation, [`crate::world::EarthWorld`] 3D object placement, and world raycasting.
 #[inline]
@@ -753,7 +850,11 @@ pub fn stabilized_surface_morph(
     map_2d_morph: f64,
     projection: TileProjection,
 ) -> SurfaceMorphParams {
-    let anchor = if flat_blend >= 0.99 && map_2d_morph <= 1e-4 {
+    let anchor = if is_canonical_2d_morph(map_2d_morph)
+        && flat_blend >= CANONICAL_2D_MORPH_THRESHOLD
+    {
+        Geodetic::new(0.0, 0.0, 0.0)
+    } else if flat_blend >= 0.99 && map_2d_morph <= 1e-4 {
         Geodetic::new(
             (focus.lat_deg * 50.0).round() / 50.0,
             (focus.lon_deg * 50.0).round() / 50.0,
@@ -892,8 +993,13 @@ pub fn unproject_morphed_surface_lat_lon(
 }
 
 /// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)
-/// for a `TileKey` on the WGS84 ellipsoid using the requested tile projection.
-pub fn tile_bounding_sphere_projected(key: TileKey, projection: TileProjection) -> (DVec3, f64) {
+/// for a `TileKey` on the WGS84 ellipsoid at `avg_altitude_m` (use `0.0` for sea level
+/// when heightmaps are disabled) using the requested tile projection.
+pub fn tile_bounding_sphere_projected_with_altitude(
+    key: TileKey,
+    projection: TileProjection,
+    avg_altitude_m: f64,
+) -> (DVec3, f64) {
     if key.level == 0 {
         return (DVec3::new(0.0, 0.0, 0.0), wgs84::A * 1.08);
     }
@@ -901,19 +1007,24 @@ pub fn tile_bounding_sphere_projected(key: TileKey, projection: TileProjection) 
         TileProjection::WebMercator => tile_bounds_mercator(key),
         TileProjection::Geographic4326 => tile_bounds(key),
     };
+    let h = if avg_altitude_m.is_finite() {
+        avg_altitude_m.clamp(-12_000.0, 12_000.0)
+    } else {
+        0.0
+    };
     let mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
     let mid_lat = (bounds.lat0 + bounds.lat1) * 0.5;
-    let center = geodetic_to_ecef(Geodetic::new(mid_lat, mid_lon, 0.0));
+    let center = geodetic_to_ecef(Geodetic::new(mid_lat, mid_lon, h));
 
     let sample_points = [
-        Geodetic::new(bounds.lat0, bounds.lon0, 0.0),
-        Geodetic::new(bounds.lat0, bounds.lon1, 0.0),
-        Geodetic::new(bounds.lat1, bounds.lon0, 0.0),
-        Geodetic::new(bounds.lat1, bounds.lon1, 0.0),
-        Geodetic::new(bounds.lat0, mid_lon, 0.0),
-        Geodetic::new(bounds.lat1, mid_lon, 0.0),
-        Geodetic::new(mid_lat, bounds.lon0, 0.0),
-        Geodetic::new(mid_lat, bounds.lon1, 0.0),
+        Geodetic::new(bounds.lat0, bounds.lon0, h),
+        Geodetic::new(bounds.lat0, bounds.lon1, h),
+        Geodetic::new(bounds.lat1, bounds.lon0, h),
+        Geodetic::new(bounds.lat1, bounds.lon1, h),
+        Geodetic::new(bounds.lat0, mid_lon, h),
+        Geodetic::new(bounds.lat1, mid_lon, h),
+        Geodetic::new(mid_lat, bounds.lon0, h),
+        Geodetic::new(mid_lat, bounds.lon1, h),
     ];
 
     let mut max_dist_sq = 0.0f64;
@@ -929,6 +1040,12 @@ pub fn tile_bounding_sphere_projected(key: TileKey, projection: TileProjection) 
     // Include 5000 metres margin for topography relief and curvature
     let radius = max_dist_sq.sqrt() + 5000.0;
     (center, radius)
+}
+
+/// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)
+/// for a `TileKey` on the WGS84 ellipsoid at sea level (`0.0 m`) using the requested tile projection.
+pub fn tile_bounding_sphere_projected(key: TileKey, projection: TileProjection) -> (DVec3, f64) {
+    tile_bounding_sphere_projected_with_altitude(key, projection, 0.0)
 }
 
 /// Computes the 3D bounding sphere center (ECEF `DVec3`) and radius (metres)
@@ -1375,6 +1492,44 @@ pub fn traverse_quadtree_lod_frustum6_projected(
     )
 }
 
+/// Runtime LOD refinement parameters applied while the camera is idle and
+/// [`crate::scene::IdleHighResConfig`] is enabled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IdleLodParams {
+    /// Effective SSE threshold scale (`1.0` = normal moving LOD; `< 1.0` = finer detail).
+    pub sse_scale: f64,
+    /// Gaze-center priority weight in `[0.0..=1.0]` favoring tiles directly in front of the camera.
+    pub view_center_bias: f64,
+    /// Additional leaf tiles allowed beyond `max_leaves` while idle.
+    pub extra_leaves: usize,
+    /// Maximum extra zoom levels permitted above normal moving LOD (`0..=4`).
+    pub max_extra_levels: u8,
+}
+
+impl Default for IdleLodParams {
+    fn default() -> Self {
+        Self::inactive()
+    }
+}
+
+impl IdleLodParams {
+    /// Disabled / moving-camera LOD parameters (zero overhead).
+    #[inline]
+    pub const fn inactive() -> Self {
+        Self {
+            sse_scale: 1.0,
+            view_center_bias: 0.0,
+            extra_leaves: 0,
+            max_extra_levels: 0,
+        }
+    }
+
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.sse_scale < 0.999 && self.max_extra_levels > 0
+    }
+}
+
 /// Same as [`traverse_quadtree_lod_frustum6_projected`] with an optional explicit camera up hint.
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_quadtree_lod_frustum6_projected_with_up(
@@ -1389,9 +1544,52 @@ pub fn traverse_quadtree_lod_frustum6_projected_with_up(
     max_leaves: usize,
     projection: TileProjection,
 ) -> Vec<TileKey> {
-    let cap = max_leaves.max(4);
+    traverse_quadtree_lod_frustum6_with_elevation(
+        camera,
+        up_override,
+        viewport_width_px,
+        viewport_height_px,
+        sse_threshold_px,
+        max_level,
+        tile_grid,
+        horizon_cull,
+        max_leaves,
+        projection,
+        IdleLodParams::inactive(),
+        0.0,
+        |_| 0.0,
+    )
+}
+
+/// Traverses the planetary quadtree using exact 6-plane frustum culling, horizon occlusion,
+/// heightmap average-altitude tile proximity (`tile_avg_altitude_m`, returning `0.0` for sea level
+/// when heightmaps are off), and optional gaze-centered idle high-resolution refinement (`idle_lod`).
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod_frustum6_with_elevation<F>(
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+    horizon_cull: bool,
+    max_leaves: usize,
+    projection: TileProjection,
+    idle_lod: IdleLodParams,
+    focus_elevation_m: f64,
+    mut tile_avg_altitude_m: F,
+) -> Vec<TileKey>
+where
+    F: FnMut(TileKey) -> f64,
+{
+    let idle_active = idle_lod.is_active();
+    let cap = max_leaves
+        .saturating_add(if idle_active { idle_lod.extra_leaves } else { 0 })
+        .max(4);
     let placement = camera.placement_with_up(up_override);
     let eye = placement.eye;
+    let cam_forward = placement.aim.sub(eye).normalize();
     let frustum = Frustum6::from_camera_with_up(
         camera,
         up_override,
@@ -1416,7 +1614,19 @@ pub fn traverse_quadtree_lod_frustum6_projected_with_up(
         key: root,
     });
 
-    let eye_alt = (eye.length() - wgs84::A).max(200.0);
+    let focus_h = if focus_elevation_m.is_finite() {
+        focus_elevation_m.max(0.0)
+    } else {
+        0.0
+    };
+    let eye_alt = (eye.length() - (wgs84::A + focus_h)).max(200.0);
+    let max_idle_boost = if idle_active {
+        (1.0 / idle_lod.sse_scale.clamp(0.15, 1.0))
+            .min(2.0f64.powi(idle_lod.max_extra_levels.min(4) as i32))
+    } else {
+        1.0
+    };
+    let center_bias = idle_lod.view_center_bias.clamp(0.0, 1.0);
 
     while let Some(node) = heap.pop() {
         let key = node.key;
@@ -1427,7 +1637,9 @@ pub fn traverse_quadtree_lod_frustum6_projected_with_up(
                 let Some(child) = key.child(q) else {
                     continue;
                 };
-                let (center, radius) = tile_bounding_sphere_projected(child, projection);
+                let avg_alt_m = tile_avg_altitude_m(child);
+                let (center, radius) =
+                    tile_bounding_sphere_projected_with_altitude(child, projection, avg_alt_m);
                 if horizon_cull && is_tile_horizon_culled(center, radius, eye) {
                     continue;
                 }
@@ -1457,11 +1669,28 @@ pub fn traverse_quadtree_lod_frustum6_projected_with_up(
                 if eye_alt < 450_000.0 {
                     let surf_up = center.scale(1.0 / center.length().max(1.0));
                     let cos_inc = (-to_center.dot(surf_up) / center_dist).clamp(0.16, 1.0);
-                    let foreshorten = cos_inc.sqrt().clamp(0.42, 1.0);
+                    let mut foreshorten = cos_inc.sqrt().clamp(0.42, 1.0);
                     let dist_ratio = dist_to_eye / eye_alt;
-                    let dist_falloff =
+                    let mut dist_falloff =
                         (1.0 / (1.0 + 0.24 * (dist_ratio - 2.0).max(0.0))).max(0.22);
+                    if idle_active {
+                        // While idle, relax grazing foreshortening & distant-valley falloff on tiles
+                        // directly in front of the view ray so mountains & vistas sharpen visibly.
+                        let gaze_cos = (to_center.dot(cam_forward) / center_dist).clamp(0.0, 1.0);
+                        let gaze_w = gaze_cos.powf(3.0);
+                        let relax = 0.40 + 0.45 * gaze_w;
+                        foreshorten += (1.0 - foreshorten) * relax;
+                        dist_falloff += (1.0 - dist_falloff) * (relax * 0.72);
+                    }
                     child_sse *= foreshorten * dist_falloff;
+                }
+                if idle_active {
+                    let gaze_cos = (to_center.dot(cam_forward) / center_dist).clamp(0.0, 1.0);
+                    let gaze_focus = gaze_cos.powf(4.0);
+                    // Prioritize tiles directly near the camera gaze center before peripheral edges.
+                    let boost_blend = (1.0 - center_bias) + center_bias * (0.28 + 0.72 * gaze_focus);
+                    let eff_boost = 1.0 + (max_idle_boost - 1.0) * boost_blend;
+                    child_sse *= eff_boost;
                 }
                 visible_children[q as usize] = Some(LodCandidate {
                     sse: child_sse,
@@ -1519,11 +1748,18 @@ pub fn traverse_quadtree_lod_2d_flat(
     let aspect = (viewport_width_px.max(1.0) / viewport_height_px.max(1.0)).max(0.01);
     let tan_half_y = (camera.fov_y_deg.to_radians() * 0.5).tan().max(1e-4);
     let half_h_m = alt_m * tan_half_y * 1.15;
-    let half_w_m = half_h_m * aspect;
+    let half_w_m = half_h_m * aspect * 1.15;
     let m_per_deg = (std::f64::consts::PI * wgs84::A) / 180.0;
     let half_lat_deg = half_h_m / m_per_deg;
     let half_lon_deg = half_w_m / m_per_deg;
-    let max_wrap = ((half_lon_deg / 360.0).ceil() as i32 + 1).clamp(1, 3);
+    let max_wrap = ((half_lon_deg / 360.0).ceil() as i32 + 2).clamp(1, 4);
+    let mirror_shift: Option<i32> = if focus_lon > 135.0 {
+        Some(-1)
+    } else if focus_lon < -135.0 {
+        Some(1)
+    } else {
+        None
+    };
 
     let tile_eval = |key: TileKey| -> Option<(f64, Vec<i32>)> {
         let bounds = match projection {
@@ -1535,11 +1771,13 @@ pub fn traverse_quadtree_lod_2d_flat(
         }
         let tile_mid_lon = (bounds.lon0 + bounds.lon1) * 0.5;
         let half_span_lon = (bounds.lon1 - bounds.lon0) * 0.5;
-        let dlon0 = wrap_longitude(tile_mid_lon - focus_lon);
+        // Base 2D tile meshes live in the fixed canonical (0°, 0°) plane at `tile_mid_lon ∈ [-180°, +180°]`.
+        // Copy `w` shifts the tile by `w * 360°`, placing it at `tile_mid_lon + w*360 - focus_lon` relative to camera.
+        let raw_dlon = tile_mid_lon - focus_lon;
         let mut wraps = Vec::new();
         let mut min_dlon_abs = f64::INFINITY;
         for w in -max_wrap..=max_wrap {
-            let dlon = dlon0 + (w as f64) * 360.0;
+            let dlon = raw_dlon + (w as f64) * 360.0;
             if dlon + half_span_lon >= -half_lon_deg && dlon - half_span_lon <= half_lon_deg {
                 wraps.push(w);
                 let edge_gap_lon = (dlon.abs() - half_span_lon).max(0.0);
@@ -1636,7 +1874,16 @@ pub fn traverse_quadtree_lod_2d_flat(
 
     let mut out = Vec::with_capacity(leaves.len() * 2);
     for key in leaves {
-        if let Some((_, wraps)) = tile_eval(key) {
+        if let Some((_, mut wraps)) = tile_eval(key) {
+            if let Some(shift) = mirror_shift {
+                let base_len = wraps.len();
+                for i in 0..base_len {
+                    let mw = wraps[i] + shift;
+                    if !wraps.contains(&mw) {
+                        wraps.push(mw);
+                    }
+                }
+            }
             for w in wraps {
                 out.push((key, w));
             }
@@ -1768,11 +2015,9 @@ pub fn retained_camera_uniforms(
     )
 }
 
-/// Same as [`retained_camera_uniforms`] with an optional explicit ECEF camera up vector.
 #[allow(clippy::too_many_arguments)]
-pub fn retained_camera_uniforms_with_up(
-    camera: &EarthCamera,
-    up_override: Option<DVec3>,
+fn retained_camera_uniforms_from_placement(
+    placement: CameraPlacement,
     viewport_w: f64,
     viewport_h: f64,
     sun_dir: [f32; 3],
@@ -1780,7 +2025,6 @@ pub fn retained_camera_uniforms_with_up(
     ambient_color: [f32; 3],
     background: strata_render::scene3d::Background3D,
 ) -> strata_render::scene3d::RetainedCameraUniforms {
-    let placement = camera.placement_with_up(up_override);
     let aspect = (viewport_w.max(1.0) / viewport_h.max(1.0)).max(0.01);
     let view_rel = DMat4::view_rotation_only(placement.eye, placement.aim, placement.up);
     let f = 1.0 / (placement.fov_y_deg.to_radians() * 0.5).tan();
@@ -1828,6 +2072,56 @@ pub fn retained_camera_uniforms_with_up(
         far: placement.far_m as f32,
         ..Default::default()
     }
+}
+
+/// Same as [`retained_camera_uniforms`] with an optional explicit ECEF camera up vector.
+#[allow(clippy::too_many_arguments)]
+pub fn retained_camera_uniforms_with_up(
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+    viewport_w: f64,
+    viewport_h: f64,
+    sun_dir: [f32; 3],
+    sun_color: [f32; 3],
+    ambient_color: [f32; 3],
+    background: strata_render::scene3d::Background3D,
+) -> strata_render::scene3d::RetainedCameraUniforms {
+    let placement = camera.placement_with_up(up_override);
+    retained_camera_uniforms_from_placement(
+        placement,
+        viewport_w,
+        viewport_h,
+        sun_dir,
+        sun_color,
+        ambient_color,
+        background,
+    )
+}
+
+/// Same as [`retained_camera_uniforms_with_up`], honoring the active [`SurfaceMorphParams`] frame
+/// (including the fixed canonical 2D map plane when `map_2d_morph >= 0.999`).
+#[allow(clippy::too_many_arguments)]
+pub fn retained_camera_uniforms_for_morph(
+    camera: &EarthCamera,
+    morph: SurfaceMorphParams,
+    up_override: Option<DVec3>,
+    viewport_w: f64,
+    viewport_h: f64,
+    sun_dir: [f32; 3],
+    sun_color: [f32; 3],
+    ambient_color: [f32; 3],
+    background: strata_render::scene3d::Background3D,
+) -> strata_render::scene3d::RetainedCameraUniforms {
+    let placement = camera.placement_for_morph(morph, up_override);
+    retained_camera_uniforms_from_placement(
+        placement,
+        viewport_w,
+        viewport_h,
+        sun_dir,
+        sun_color,
+        ambient_color,
+        background,
+    )
 }
 
 /// Builds a tile-local RTC [`strata_render::scene3d::RetainedTileMesh`] relative to the tile's
