@@ -18,7 +18,7 @@ keywords = ["geospatial", "3d", "globe", "tiles", "strata"]
 categories = ["graphics", "rendering", "science"]
 
 [workspace.dependencies]
-strata-earth = { path = "crates/strata_earth", version = "0.1.1" }
+strata-earth = { path = "crates/strata_earth", version = "0.1.2" }
 strata-primitives = { version = "0.1.0", path = "../strata/crates/core/strata_primitives" }
 strata-style = { version = "0.1.0", path = "../strata/crates/core/strata_style" }
 strata-layout = { version = "0.1.0", path = "../strata/crates/core/strata_layout" }

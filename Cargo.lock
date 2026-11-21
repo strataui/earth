@@ -1631,7 +1631,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strata-a11y"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "accesskit",
  "strata-dom",
@@ -1650,14 +1650,14 @@ dependencies = [
 
 [[package]]
 name = "strata-dom"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "strata-primitives",
 ]
 
 [[package]]
 name = "strata-earth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "image",
@@ -1672,7 +1672,7 @@ dependencies = [
 
 [[package]]
 name = "strata-gpu-path"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "strata-primitives",
 ]
@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "strata-macro"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "strata-primitives"
@@ -1703,7 +1703,7 @@ version = "0.1.0"
 
 [[package]]
 name = "strata-render"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "bytemuck",
  "miniz_oxide 0.8.9",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "strata-ui"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1757,7 +1757,7 @@ dependencies = [
 
 [[package]]
 name = "strata-ui-platform"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "cairo-rs",
  "gtk",
