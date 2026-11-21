@@ -1718,6 +1718,146 @@ impl RetainedTerrainBuilder {
         ));
     }
 
+    /// Synchronously builds an immediate Frame-0 [`RetainedTerrainFrame`] containing the
+    /// procedural skybox + environment assets and the single `z=0` root tile (from non-blocking
+    /// `source.peek_cached_imagery` or the compiled-in embedded base map) so first paint never stalls
+    /// on background LOD traversal, DEMs, or `.ssky` cubemap disk/network fetches.
+    pub fn build_frame_zero_bootstrap(
+        input: &EarthInput,
+        source: Option<&dyn TileSource>,
+        plugins: &EarthPluginRegistry,
+    ) -> (Arc<RetainedTerrainFrame>, RetainedBuildStats) {
+        let ll = input.low_level_state();
+        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
+        let morph = stabilized_morph_params(
+            input.camera.focus,
+            flat_t as f64,
+            ll.map_2d_morph as f64,
+            input.tile_projection,
+        );
+        let camera = Self::camera_from_input_with_plugins(
+            input,
+            plugins,
+            input.weather.weather_time_s,
+            1,
+            false,
+        );
+        let frame_ctx = EarthPluginFrameContext {
+            input,
+            low_level: ll,
+            altitude_m: input.camera.altitude_m(),
+            ground_elevation_m: 0.0,
+            time_s: input.weather.weather_time_s,
+            overlay_rev: 1,
+            is_dragging: false,
+            weather_snapshot: None,
+        };
+        let mut env = build_environment_assets_with_skybox(
+            Some(crate::astro::embedded_clouds_fallback()),
+            None,
+            1,
+        );
+        if plugins
+            .active_hooks()
+            .intersects(EarthPluginHooks::ENVIRONMENT)
+        {
+            plugins.run_prepare_environment(&frame_ctx, Arc::make_mut(&mut env));
+        }
+
+        let mut meshes = Vec::new();
+        let mut instances = Vec::new();
+        let mut textures = Vec::new();
+        let mut stats = RetainedBuildStats::default();
+
+        if input.layers.terrain {
+            let root = TileKey::new(0, 0, 0);
+            let key_id = TileKeyId::quadtree(0, 0, 0);
+            let bounds = match input.tile_projection {
+                TileProjection::WebMercator => tile_bounds_mercator(root),
+                TileProjection::Geographic4326 => tile_bounds(root),
+            };
+            let grid = input.tile_grid.clamp(2, 17);
+            let with_skirts = input
+                .terrain_skirts
+                .unwrap_or(ll.active_surface_mode == SurfaceMode::QuadtreeLod);
+            let mut mesh = build_tile_local_rtc_mesh_morphed(
+                root,
+                bounds,
+                grid,
+                None,
+                root,
+                with_skirts,
+                0.0,
+                1,
+                key_id.face,
+                morph,
+            );
+            mesh.key = key_id;
+            let center_ecef = mesh.center_ecef;
+            meshes.push(Arc::new(mesh));
+            stats.mesh_cache_misses = 1;
+
+            let root_img = source
+                .and_then(|s| s.peek_cached_imagery(root))
+                .or_else(|| crate::basemap::embedded_base_tile(root));
+            let (texture_id, texture_revision, tint) = if let Some(img) = root_img {
+                let tid = 0xE47F_0001u64;
+                textures.push(Arc::new(RetainedTileTexture {
+                    id: tid,
+                    revision: 1,
+                    width: img.width,
+                    height: img.height,
+                    rgba8: Arc::new(img.pixels),
+                }));
+                stats.texture_cache_misses = 1;
+                (Some(tid), 1, [1.0, 1.0, 1.0, 1.0])
+            } else {
+                (
+                    None,
+                    0,
+                    [
+                        input.fallback_tint.r(),
+                        input.fallback_tint.g(),
+                        input.fallback_tint.b(),
+                        input.fallback_tint.a(),
+                    ],
+                )
+            };
+
+            instances.push(RetainedTileInstance {
+                key: key_id,
+                mesh_revision: 1,
+                center_ecef,
+                texture_id,
+                texture_revision,
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                tint,
+                unlit: false,
+                night_texture_id: None,
+                night_texture_revision: 0,
+                night_uv_rect: [0.0, 0.0, 1.0, 1.0],
+            });
+            stats.visible_tiles = 1;
+        }
+
+        let frame = Arc::new(RetainedTerrainFrame {
+            camera,
+            geometry_revision: 1,
+            geo_revision: 0,
+            meshes,
+            instances,
+            textures,
+            dynamic_meshes: Vec::new(),
+            geo_mesh_assets: Arc::default(),
+            geo_instances: Arc::default(),
+            particle_layers: Arc::default(),
+            particle_textures: Arc::default(),
+            ocean: None,
+            environment: Some(env),
+        });
+        (frame, stats)
+    }
+
     /// Builds a [`RetainedTerrainFrame`] from cached tile-local RTC geometry & textures.
     pub fn build_frame(
         &mut self,
@@ -3421,6 +3561,50 @@ impl EarthViewport {
         wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
         plugins: EarthPluginRegistry,
     ) -> Self {
+        Self::with_plugins_and_bootstrap(
+            input,
+            source,
+            wakeup,
+            plugins,
+            input.frame_zero_bootstrap,
+        )
+    }
+
+    /// Creates an [`EarthViewport`] and synchronously installs a Frame-0 root tile plus
+    /// procedural skybox when `bootstrap_frame_zero` is `true`, before the background worker completes.
+    pub fn new_with_bootstrap(
+        input: &EarthInput,
+        source: Box<dyn TileSource + Send>,
+        bootstrap_frame_zero: bool,
+    ) -> Self {
+        Self::with_wakeup_and_bootstrap(input, source, None, bootstrap_frame_zero)
+    }
+
+    /// Creates an [`EarthViewport`] with a wakeup callback and optional synchronous Frame-0 bootstrap.
+    pub fn with_wakeup_and_bootstrap(
+        input: &EarthInput,
+        source: Box<dyn TileSource + Send>,
+        wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+        bootstrap_frame_zero: bool,
+    ) -> Self {
+        Self::with_plugins_and_bootstrap(
+            input,
+            source,
+            wakeup,
+            EarthPluginRegistry::standard(),
+            bootstrap_frame_zero,
+        )
+    }
+
+    /// Creates an [`EarthViewport`] backed by a custom [`EarthPluginRegistry`] with optional
+    /// synchronous Frame-0 root-tile and procedural skybox bootstrap.
+    pub fn with_plugins_and_bootstrap(
+        input: &EarthInput,
+        source: Box<dyn TileSource + Send>,
+        wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+        plugins: EarthPluginRegistry,
+        bootstrap_frame_zero: bool,
+    ) -> Self {
         let ll = input.low_level_state();
         let initial_morph = ll.map_2d_morph;
         let initial_flat_t = ll.local_25d_blend.max(ll.map_2d_morph);
@@ -3432,6 +3616,14 @@ impl EarthViewport {
             false,
         );
         let retained = RetainedScene3D::new(cam_uniforms);
+        if bootstrap_frame_zero {
+            let (frame, _) = RetainedTerrainBuilder::build_frame_zero_bootstrap(
+                input,
+                Some(&*source),
+                &plugins,
+            );
+            retained.update_terrain_preserving_camera(frame);
+        }
         let world = Arc::new(RwLock::new(EarthWorld::new()));
         let mut worker = EarthTileWorker::spawn_with_plugins_and_world(
             retained.clone(),
@@ -3473,6 +3665,18 @@ impl EarthViewport {
             vp.publish_camera_and_particles_and_ocean();
         }
         vp
+    }
+
+    /// Installs a synchronous Frame-0 root-tile + procedural skybox frame on demand if no terrain
+    /// frame has been published yet. Returns `true` if a bootstrap frame was installed.
+    pub fn bootstrap_frame_zero(&mut self) -> bool {
+        if self.retained.snapshot_terrain().is_some() {
+            return false;
+        }
+        let (frame, _) =
+            RetainedTerrainBuilder::build_frame_zero_bootstrap(&self.input, None, &self.plugins);
+        self.retained.update_terrain_preserving_camera(frame);
+        true
     }
 
     #[inline]

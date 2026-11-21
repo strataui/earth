@@ -482,6 +482,9 @@ pub struct EarthInput {
     /// Optional idle high-resolution refinement loading sharper tiles in the current view when
     /// the camera rests stationary (`enabled: false` by default).
     pub idle_high_res: IdleHighResConfig,
+    /// Opt-in synchronous Frame-0 root-tile and procedural skybox bootstrap when constructing
+    /// an [`EarthViewport`] (`false` by default so async worker behavior stays unchanged unless enabled).
+    pub frame_zero_bootstrap: bool,
 }
 
 /// Opt-in configuration for progressive high-resolution tile refinement while the camera is idle.
@@ -692,6 +695,7 @@ impl Default for EarthInput {
             precipitation: crate::precipitation::PrecipitationConfig::default(),
             ocean_waves: OceanWavesConfig::default(),
             idle_high_res: IdleHighResConfig::default(),
+            frame_zero_bootstrap: false,
         }
     }
 }
@@ -705,6 +709,13 @@ impl EarthInput {
             tile_grid: 17,
             ..Self::default()
         }
+    }
+
+    /// Enables or disables optional synchronous Frame-0 root-tile and procedural skybox bootstrap
+    /// on [`EarthViewport`] construction.
+    pub fn with_frame_zero_bootstrap(mut self, enabled: bool) -> Self {
+        self.frame_zero_bootstrap = enabled;
+        self
     }
 }
 
@@ -1497,7 +1508,41 @@ impl EarthScene {
         let (frame, r_stats) =
             self.retained_builder
                 .build_frame(input, source, self.retained_geom_rev, true);
-        self.last_retained_stats = r_stats;
+        self.install_retained_frame(input, low_state, frame, r_stats);
+    }
+
+    /// Synchronously builds and installs an immediate Frame-0 root-tile + procedural
+    /// skybox frame without spawning tile/environment background workers or waiting
+    /// for network imagery. Intended for eliminating first-frame stalls at startup.
+    pub fn bootstrap_frame_zero(
+        &mut self,
+        input: &EarthInput,
+        source: Option<&dyn TileSource>,
+    ) -> std::sync::Arc<strata_render::scene3d::RetainedTerrainFrame> {
+        self.last_retained_leaves = None;
+        self.retained_geom_rev += 1;
+        let (frame, stats) = crate::worker::RetainedTerrainBuilder::build_frame_zero_bootstrap(
+            input,
+            source,
+            self.retained_builder.plugins(),
+        );
+        self.install_retained_frame(
+            input,
+            input.low_level_state(),
+            std::sync::Arc::clone(&frame),
+            stats,
+        );
+        frame
+    }
+
+    fn install_retained_frame(
+        &mut self,
+        input: &EarthInput,
+        low_state: EarthLowLevelState,
+        frame: std::sync::Arc<strata_render::scene3d::RetainedTerrainFrame>,
+        stats: crate::worker::RetainedBuildStats,
+    ) {
+        self.last_retained_stats = stats;
         self.retained_handle
             .update_terrain(std::sync::Arc::clone(&frame));
         let mut scene = Scene3D::new()

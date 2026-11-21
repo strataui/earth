@@ -736,4 +736,100 @@ fn unloaded_single_tile_adapts_watertight_to_surrounding_heightmaps_until_loaded
     );
 }
 
+#[test]
+fn frame_zero_bootstrap_populates_root_tile_and_procedural_skybox_synchronously() {
+    // 1. Default EarthInput keeps async behavior (frame_zero_bootstrap = false).
+    let default_input = quadtree_input(37.7749, -122.4194, 150_000.0);
+    assert!(!default_input.frame_zero_bootstrap);
+
+    // 2. Opting in via EarthInput::with_frame_zero_bootstrap(true) publishes a Frame-0
+    //    terrain frame immediately on EarthViewport::new without calling sync_now().
+    let bootstrap_input = default_input.clone().with_frame_zero_bootstrap(true);
+    assert!(bootstrap_input.frame_zero_bootstrap);
+    let vp_input = EarthViewport::new(&bootstrap_input, Box::new(MemoryTileSource::default()));
+    let frame_vp = vp_input
+        .retained_scene()
+        .snapshot_terrain()
+        .expect("Frame-0 bootstrap via EarthInput flag must populate retained terrain immediately");
+    assert_eq!(frame_vp.meshes.len(), 1);
+    assert_eq!(frame_vp.instances.len(), 1);
+    assert_eq!(
+        frame_vp.instances[0].key,
+        strata_render::scene3d::TileKeyId::quadtree(0, 0, 0)
+    );
+    assert_eq!(frame_vp.textures.len(), 1);
+    let env_vp = frame_vp
+        .environment
+        .as_ref()
+        .expect("Frame-0 bootstrap must attach procedural skybox & environment assets");
+    assert!(env_vp.cloud_map.is_some());
+    assert!(env_vp.skybox_cubemap.is_none());
+
+    // 3. Explicit EarthViewport::new_with_bootstrap also populates Frame-0 immediately
+    //    even when input.frame_zero_bootstrap is false, and prefers cached root imagery if present.
+    let mut cached_src = MemoryTileSource::new();
+    let custom_root = TileImage {
+        width: 2,
+        height: 2,
+        pixels: [11, 22, 33, 255].repeat(4),
+    };
+    cached_src.insert_imagery(TileKey::new(0, 0, 0), custom_root);
+    let vp_explicit =
+        EarthViewport::new_with_bootstrap(&default_input, Box::new(cached_src), true);
+    let frame_explicit = vp_explicit
+        .retained_scene()
+        .snapshot_terrain()
+        .expect("EarthViewport::new_with_bootstrap(true) must populate Frame-0 immediately");
+    assert_eq!(frame_explicit.textures.len(), 1);
+    assert_eq!(frame_explicit.textures[0].width, 2);
+    assert_eq!(frame_explicit.textures[0].rgba8[..4], [11, 22, 33, 255]);
+
+    // 4. On-demand EarthViewport::bootstrap_frame_zero works when unbootstrapped and is idempotent.
+    let mut vp_manual =
+        EarthViewport::new_with_bootstrap(&default_input, Box::new(MemoryTileSource::default()), false);
+    if vp_manual.bootstrap_frame_zero() {
+        let f = vp_manual
+            .retained_scene()
+            .snapshot_terrain()
+            .expect("bootstrap_frame_zero() must install Frame-0 frame");
+        assert_eq!(f.instances.len(), 1);
+        assert!(f.environment.is_some());
+        assert!(
+            !vp_manual.bootstrap_frame_zero(),
+            "second bootstrap_frame_zero() call must be a no-op once a frame exists"
+        );
+    }
+
+    // 5. Synchronous EarthScene::bootstrap_frame_zero works without a worker and later upgrades
+    //    cleanly when build_retained runs.
+    let mut earth_scene = EarthScene::new();
+    let scene_frame = earth_scene.bootstrap_frame_zero(&default_input, None);
+    assert_eq!(scene_frame.meshes.len(), 1);
+    assert_eq!(scene_frame.instances.len(), 1);
+    assert!(scene_frame.environment.is_some());
+    assert!(
+        scene_frame
+            .environment
+            .as_ref()
+            .unwrap()
+            .skybox_cubemap
+            .is_none()
+    );
+    assert_eq!(
+        earth_scene
+            .retained_scene()
+            .snapshot_terrain()
+            .map(|f| f.instances.len()),
+        Some(1)
+    );
+
+    let mut full_src = MemoryTileSource::new();
+    earth_scene.build_retained(&default_input, &mut full_src);
+    let upgraded = earth_scene
+        .retained_scene()
+        .snapshot_terrain()
+        .expect("build_retained after Frame-0 bootstrap must publish full LOD frame");
+    assert!(upgraded.instances.len() >= 1);
+}
+
 
