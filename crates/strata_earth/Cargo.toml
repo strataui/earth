@@ -1,6 +1,6 @@
 [package]
 name = "strata-earth"
-version.workspace = true
+version = "0.1.1"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
