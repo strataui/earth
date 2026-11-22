@@ -630,7 +630,8 @@ impl RetainedTerrainBuilder {
                 cam.aim_offset_m[2] * (1.0 - map_t),
             ];
         }
-        let flat_t = ll.local_25d_blend.max(ll.map_2d_morph).clamp(0.0, 1.0);
+        let morph_flat_t = ll.local_25d_blend.max(ll.map_2d_morph).clamp(0.0, 1.0);
+        let lighting_25d = (ll.local_25d_blend * (1.0 - ll.map_2d_morph)).clamp(0.0, 1.0);
         let in_2d_hide = map_t > 0.05;
         let mut bg = sky_gradient(input.daylight);
         if map_t > 1e-4 {
@@ -657,7 +658,7 @@ impl RetainedTerrainBuilder {
         };
         let morph = stabilized_morph_params(
             cam.focus,
-            flat_t as f64,
+            morph_flat_t as f64,
             map_t,
             input.tile_projection,
         );
@@ -672,7 +673,8 @@ impl RetainedTerrainBuilder {
             ambient_color,
             bg,
         );
-        u.local_25d_blend = flat_t;
+        u.local_25d_blend = lighting_25d;
+        u.map_2d_morph = ll.map_2d_morph.clamp(0.0, 1.0);
         u.day_night_strength = 0.0;
         u.city_lights_intensity = 0.0;
         u.sun_visible = false;
@@ -1653,6 +1655,30 @@ impl RetainedTerrainBuilder {
         (Some(env), sat_elements)
     }
 
+fn close_ground_leaf_grid(
+    base_grid: u32,
+    is_flat_2d: bool,
+    eye_alt_m: f64,
+    focus_lat_deg: f64,
+    focus_lon_deg: f64,
+    bounds: PatchBounds,
+) -> u32 {
+    if is_flat_2d || eye_alt_m >= 160.0 {
+        return base_grid;
+    }
+    let clamped_lat = focus_lat_deg.clamp(bounds.lat0, bounds.lat1);
+    let clamped_lon = focus_lon_deg.clamp(bounds.lon0, bounds.lon1);
+    let dlat_m = (clamped_lat - focus_lat_deg) * 111_320.0;
+    let dlon_m = crate::geodesy::wrap_longitude(clamped_lon - focus_lon_deg)
+        * 111_320.0
+        * focus_lat_deg.to_radians().cos().abs().max(0.15);
+    if dlat_m.hypot(dlon_m) < 420.0 {
+        base_grid.max(if eye_alt_m < 60.0 { 33 } else { 25 })
+    } else {
+        base_grid
+    }
+}
+
     #[allow(clippy::too_many_arguments)]
     fn emit_tile_instance(
         &mut self,
@@ -1664,6 +1690,7 @@ impl RetainedTerrainBuilder {
         bounds: PatchBounds,
         want_night_tiles: bool,
         elev_enabled: bool,
+        unlit: bool,
         fallback_tint: [f32; 4],
         source: &mut dyn TileSource,
         max_tile_level: u8,
@@ -1704,7 +1731,7 @@ impl RetainedTerrainBuilder {
             texture_revision: tex_rev,
             uv_rect,
             tint,
-            unlit: false,
+            unlit,
             night_texture_id,
             night_texture_revision,
             night_uv_rect,
@@ -1824,6 +1851,8 @@ impl RetainedTerrainBuilder {
                 )
             };
 
+            let root_unlit =
+                is_canonical_2d_morph(ll.map_2d_morph as f64) || ll.map_2d_morph >= 0.95;
             instances.push(RetainedTileInstance {
                 key: key_id,
                 mesh_revision: 1,
@@ -1832,7 +1861,7 @@ impl RetainedTerrainBuilder {
                 texture_revision,
                 uv_rect: [0.0, 0.0, 1.0, 1.0],
                 tint,
-                unlit: false,
+                unlit: root_unlit,
                 night_texture_id: None,
                 night_texture_revision: 0,
                 night_uv_rect: [0.0, 0.0, 1.0, 1.0],
@@ -2341,6 +2370,7 @@ impl RetainedTerrainBuilder {
                                     anc_bounds,
                                     leaf_want_night,
                                     leaf_elev_enabled,
+                                    is_flat_2d || ll.map_2d_morph >= 0.95,
                                     fallback_tint,
                                     source,
                                     input.max_tile_level,
@@ -2360,11 +2390,22 @@ impl RetainedTerrainBuilder {
                         TileProjection::WebMercator => tile_bounds_mercator(leaf),
                         TileProjection::Geographic4326 => tile_bounds(leaf),
                     };
+                    let is_tile_2d_unlit = is_flat_2d || ll.map_2d_morph >= 0.95;
+                    let eye_alt_m =
+                        (input.camera.altitude_m() - ground_elev_focus.max(0.0)).max(1.0);
+                    let leaf_grid = Self::close_ground_leaf_grid(
+                        grid,
+                        is_flat_2d,
+                        eye_alt_m,
+                        input.camera.focus.lat_deg,
+                        input.camera.focus.lon_deg,
+                        bounds,
+                    );
                     let mesh = self.ensure_tile_mesh(
                         leaf,
                         key_id,
                         bounds,
-                        grid,
+                        leaf_grid,
                         with_skirts,
                         elev,
                         elev_tile,
@@ -2396,6 +2437,7 @@ impl RetainedTerrainBuilder {
                         bounds,
                         leaf_want_night,
                         leaf_elev_enabled,
+                        is_tile_2d_unlit,
                         fallback_tint,
                         source,
                         input.max_tile_level,
@@ -2507,11 +2549,25 @@ impl RetainedTerrainBuilder {
                         elev,
                     );
 
+                    let eye_alt_m =
+                        (input.camera.altitude_m() - ground_elev_focus.max(0.0)).max(1.0);
+                    let patch_grid = if effective_mode == SurfaceMode::FlatPatches {
+                        Self::close_ground_leaf_grid(
+                            grid,
+                            ll.map_2d_morph >= 0.95,
+                            eye_alt_m,
+                            input.camera.focus.lat_deg,
+                            input.camera.focus.lon_deg,
+                            bounds,
+                        )
+                    } else {
+                        grid
+                    };
                     let mesh = self.ensure_tile_mesh(
                         tile,
                         key_id,
                         bounds,
-                        grid,
+                        patch_grid,
                         with_skirts,
                         elev,
                         elev_tile,
@@ -2533,6 +2589,7 @@ impl RetainedTerrainBuilder {
                         bounds,
                         patch_want_night,
                         patch_elev_enabled,
+                        ll.map_2d_morph >= 0.95,
                         fallback_tint,
                         source,
                         input.max_tile_level,
@@ -2657,7 +2714,10 @@ impl RetainedTerrainBuilder {
                 .run_particle_layers(&mut p_ctx, &mut particle_layers, &mut particle_textures);
         }
 
-        let ocean = if self.include_ocean && hooks.intersects(EarthPluginHooks::OCEAN) {
+        let ocean = if self.include_ocean
+            && ll.map_2d_morph <= 0.05
+            && hooks.intersects(EarthPluginHooks::OCEAN)
+        {
             let mut o_ctx = EarthOceanContext {
                 input,
                 low_level: ll,
@@ -4431,6 +4491,24 @@ impl EarthViewport {
                 self.worker.request_update(self.input.clone());
             }
         }
+    }
+
+    /// Returns whether automatic seamless 3D -> 2.5D ground transition is enabled.
+    #[inline]
+    pub fn seamless_25d(&self) -> bool {
+        self.input.seamless_25d
+    }
+
+    /// Enables or disables automatic seamless 3D -> 2.5D ground flattening at runtime.
+    pub fn set_seamless_25d(&mut self, enabled: bool) {
+        if self.input.seamless_25d == enabled {
+            return;
+        }
+        self.input.seamless_25d = enabled;
+        if !self.stopped.load(Ordering::Relaxed) {
+            self.worker.request_update(self.input.clone());
+        }
+        self.publish_camera_and_overlays();
     }
 
     /// Returns `true` while a programmatic 3D <-> 2D morph transition is still in progress.

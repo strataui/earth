@@ -1619,7 +1619,7 @@ where
     } else {
         0.0
     };
-    let eye_alt = (eye.length() - (wgs84::A + focus_h)).max(200.0);
+    let eye_alt = (eye.length() - (wgs84::A + focus_h)).max(1.0);
     let max_idle_boost = if idle_active {
         (1.0 / idle_lod.sse_scale.clamp(0.15, 1.0))
             .min(2.0f64.powi(idle_lod.max_extra_levels.min(4) as i32))
@@ -1683,6 +1683,11 @@ where
                         dist_falloff += (1.0 - dist_falloff) * (relax * 0.72);
                     }
                     child_sse *= foreshorten * dist_falloff;
+                }
+                if eye_alt < 180.0 {
+                    let close_w = (1.0 - eye_alt / 180.0).clamp(0.0, 1.0);
+                    let prox_w = (1.0 - dist_to_eye / 280.0).clamp(0.0, 1.0);
+                    child_sse *= 1.0 + 1.75 * close_w * prox_w;
                 }
                 if idle_active {
                     let gaze_cos = (to_center.dot(cam_forward) / center_dist).clamp(0.0, 1.0);

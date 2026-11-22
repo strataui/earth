@@ -277,6 +277,19 @@ impl EarthViewState {
         self.notify_ui_changed();
     }
 
+    /// Returns whether seamless 3D -> 2.5D ground flattening is enabled.
+    #[inline]
+    pub fn seamless_25d(&self) -> bool {
+        self.viewport.seamless_25d()
+    }
+
+    /// Enables or disables automatic seamless 3D -> 2.5D ground transition at runtime.
+    pub fn set_seamless_25d(&mut self, enabled: bool) {
+        self.viewport.set_seamless_25d(enabled);
+        self.sync_camera();
+        self.notify_ui_changed();
+    }
+
     /// Jumps camera target immediately to a geographic location & framing.
     pub fn jump_to(
         &mut self,
@@ -1063,6 +1076,19 @@ impl EarthView {
     pub fn set_view_mode_immediate(&self, mode: EarthViewMode) {
         let mut st = self.state.borrow_mut();
         st.set_view_mode_immediate(mode);
+        st.notify_ui_changed();
+    }
+
+    /// Returns whether automatic seamless 3D -> 2.5D ground transition is enabled.
+    #[inline]
+    pub fn seamless_25d(&self) -> bool {
+        self.state.borrow().viewport.seamless_25d()
+    }
+
+    /// Enables or disables automatic seamless 3D -> 2.5D ground transition at runtime.
+    pub fn set_seamless_25d(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        st.set_seamless_25d(enabled);
         st.notify_ui_changed();
     }
 

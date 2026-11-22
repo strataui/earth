@@ -543,3 +543,91 @@ fn standard_plugins_preserve_space_and_terrain_parity() {
     assert!(env.cloud_map.is_some());
     assert!(env.stars.as_ref().is_some_and(|s| s.len() > 8_000));
 }
+
+#[test]
+fn mode_2d_separates_lighting_sets_tiles_unlit_and_bypasses_ocean_while_3d_ocean_reaches_high_altitude() {
+    let mut input = input_at(24.0, -156.0, 2_000.0);
+    input.ocean_waves = OceanWavesConfig::enabled();
+    let mut vp = EarthViewport::new(&input, Box::new(MemoryTileSource::default()));
+    vp.sync_now();
+
+    let frame_3d = vp.retained_scene().snapshot_terrain().expect("3d local frame");
+    assert!(frame_3d.camera.local_25d_blend > 0.9);
+    assert_eq!(frame_3d.camera.map_2d_morph, 0.0);
+    assert!(frame_3d.ocean.is_some(), "3D local ocean must emit wave surface");
+    assert!(frame_3d.instances.iter().all(|i| !i.unlit));
+
+    // Higher orbital/regional 3D altitude (~900km) still renders 3D ocean waves cleanly
+    let mut orb = input_at(24.0, -156.0, 900_000.0);
+    orb.ocean_waves = OceanWavesConfig::enabled();
+    let vp_orb = EarthViewport::new(&orb, Box::new(MemoryTileSource::default()));
+    vp_orb.sync_now();
+    let frame_orb = vp_orb.retained_scene().snapshot_terrain().expect("orbital ocean frame");
+    assert!(
+        frame_orb.ocean.is_some(),
+        "3D/2.5D ocean wave pass must remain visible up to high regional/orbital altitude (~900km)"
+    );
+
+    // Switching to Mode2D separates map_2d_morph=1.0 from lighting local_25d_blend=0.0,
+    // marks all tiles unlit, and disables OceanWavesPlugin completely.
+    vp.set_view_mode_immediate(strata_earth::EarthViewMode::Mode2D);
+    vp.sync_now();
+    let frame_2d = vp.retained_scene().snapshot_terrain().expect("2d frame");
+    assert_eq!(frame_2d.camera.map_2d_morph, 1.0);
+    assert_eq!(
+        frame_2d.camera.local_25d_blend, 0.0,
+        "Mode2D must zero lighting local_25d_blend so aerial_haze never darkens 2D imagery"
+    );
+    assert!(frame_2d.ocean.is_none(), "Mode2D must bypass OceanWavesPlugin");
+    assert!(!frame_2d.instances.is_empty());
+    assert!(
+        frame_2d.instances.iter().all(|i| i.unlit),
+        "all tiles in Mode2D must be marked unlit=true"
+    );
+}
+
+#[test]
+fn close_ground_below_50m_sharpened_lod_and_runtime_set_seamless_25d_toggle() {
+    let mut input = EarthInput::globe();
+    input.camera = EarthCamera {
+        focus: Geodetic::new(37.7749, -122.4194, 0.0),
+        eye_offset_m: [0.0, 0.0, 35.0],
+        ..Default::default()
+    };
+    input.elevation_enabled = false;
+    input.layers.labels = false;
+    input.tile_grid = 9;
+    let mut vp = EarthViewport::new(&input, Box::new(MemoryTileSource::default()));
+    assert!(vp.seamless_25d());
+    vp.sync_now();
+
+    let f_25d = vp.retained_scene().snapshot_terrain().expect("close ground 2.5d frame");
+    assert!(
+        f_25d.camera.local_25d_blend > 0.95,
+        "with seamless_25d enabled at 35m altitude, local_25d_blend must be active"
+    );
+    let max_verts = f_25d
+        .meshes
+        .iter()
+        .map(|m| m.vertices.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_verts >= 33 * 33,
+        "close-ground (<50m) leaves near eye must subdivide mesh grid >= 33x33 even when tile_grid=9 (got max {max_verts} verts)"
+    );
+
+    // Disabling seamless_25d at runtime takes effect cleanly without rebuilding EarthViewport
+    vp.set_seamless_25d(false);
+    assert!(!vp.seamless_25d());
+    vp.sync_now();
+    let f_no_25d = vp.retained_scene().snapshot_terrain().expect("3d without 25d");
+    assert_eq!(f_no_25d.camera.local_25d_blend, 0.0);
+
+    vp.set_seamless_25d(true);
+    assert!(vp.seamless_25d());
+    vp.sync_now();
+    let f_re_enabled = vp.retained_scene().snapshot_terrain().expect("re-enabled 25d");
+    assert!(f_re_enabled.camera.local_25d_blend > 0.95);
+}
+

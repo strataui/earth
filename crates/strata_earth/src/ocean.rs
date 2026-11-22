@@ -308,12 +308,11 @@ impl OceanWavesPlugin {
     }
 
     fn altitude_visibility(alt_m: f64, map_2d_morph: f32) -> f32 {
-        let alt = alt_m as f32;
         if map_2d_morph > 0.05 {
-            1.0 - smoothstep_f32(900_000.0, 2_200_000.0, alt)
-        } else {
-            1.0 - smoothstep_f32(280_000.0, 520_000.0, alt)
+            return 0.0;
         }
+        let alt = alt_m as f32;
+        1.0 - smoothstep_f32(1_200_000.0, 3_200_000.0, alt)
     }
 
     fn target_wind(&self, cfg: &OceanWavesConfig, ctx_weather: Option<&crate::weather_api::WeatherSnapshot>) -> WindVector {
