@@ -23,4 +23,5 @@ strata-primitives = { version = "0.1.0", path = "../strata/crates/core/strata_pr
 strata-style = { version = "0.1.0", path = "../strata/crates/core/strata_style" }
 strata-layout = { version = "0.1.0", path = "../strata/crates/core/strata_layout" }
 strata-render = { version = "0.1.0", path = "../strata/crates/render/strata_render" }
+strata-device = { version = "0.1.0", path = "../strata/crates/runtime/strata_device" }
 strata-ui = { version = "0.1.0", path = "../strata/crates/strata" }

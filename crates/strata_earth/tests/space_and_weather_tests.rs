@@ -1032,6 +1032,47 @@ fn cloud_opacity_has_no_mid_orbit_dip_and_shader_defines_plane_fade() {
     }
 }
 
+#[test]
+fn transition_to_2d_fades_celestial_lighting_clouds_and_city_lights_smoothly_without_005_snap() {
+    let mut input = EarthInput::default();
+    input.view_mode = strata_earth::EarthViewMode::Mode2D;
+    input.layers.clouds = true;
+    input.layers.celestial = true;
+    input.weather.global_cloud_map = true;
+    input.weather.global_cloud_opacity = 0.80;
+    input.space.day_night_lighting = true;
+    input.space.city_lights = true;
+    input.space.stars_visible = true;
+    input.space.sun_visible = true;
+    input.space.moon_visible = true;
+    input.camera.eye_offset_m = [0.0, 0.0, 8_000_000.0];
 
+    let sample_at = |morph: f32| {
+        let mut inp = input.clone();
+        inp.view_morph = morph;
+        RetainedTerrainBuilder::camera_from_input(&inp)
+    };
 
+    let c0 = sample_at(0.001);
+    let c1 = sample_at(0.10);
+    let c2 = sample_at(0.35);
+    let c3 = sample_at(0.65);
+    let c4 = sample_at(1.0);
 
+    assert!(c1.day_night_strength > 0.4 * c0.day_night_strength);
+    assert!(c1.stars_visible && c1.stars_intensity > 0.0);
+    assert!(c1.cloud_layer_opacity > 0.4 * c0.cloud_layer_opacity);
+    assert!(c1.city_lights_intensity > 0.4 * c0.city_lights_intensity);
+
+    assert!(c0.stars_intensity >= c1.stars_intensity);
+    assert!(c1.stars_intensity > c2.stars_intensity);
+    assert!(c2.stars_intensity > c3.stars_intensity);
+    assert!(c3.stars_intensity > c4.stars_intensity);
+    assert_eq!(c4.stars_intensity, 0.0);
+    assert!(!c4.stars_visible);
+    assert!(!c4.sun_visible);
+    assert!(!c4.moon_visible);
+    assert_eq!(c4.cloud_layer_opacity, 0.0);
+    assert_eq!(c4.city_lights_intensity, 0.0);
+    assert_eq!(c4.day_night_strength, 0.0);
+}

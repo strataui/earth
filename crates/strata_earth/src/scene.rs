@@ -706,7 +706,8 @@ impl EarthInput {
     pub fn globe() -> Self {
         Self {
             surface_mode: SurfaceMode::QuadtreeLod,
-            tile_grid: 17,
+            tile_grid: 25,
+            sse_threshold: 2.3,
             ..Self::default()
         }
     }
@@ -716,6 +717,280 @@ impl EarthInput {
     pub fn with_frame_zero_bootstrap(mut self, enabled: bool) -> Self {
         self.frame_zero_bootstrap = enabled;
         self
+    }
+
+    /// Extracts the unified [`EarthRenderQuality`] snapshot from this [`EarthInput`].
+    #[inline]
+    pub fn render_quality(&self) -> EarthRenderQuality {
+        EarthRenderQuality::from_input(self)
+    }
+
+    /// Detects which canonical [`EarthQualityPreset`] matches this input (or [`EarthQualityPreset::Custom`]).
+    #[inline]
+    pub fn quality_preset(&self) -> EarthQualityPreset {
+        self.render_quality().matching_preset()
+    }
+
+    /// Applies an [`EarthRenderQuality`] profile onto this [`EarthInput`].
+    #[inline]
+    pub fn set_render_quality(&mut self, quality: EarthRenderQuality) {
+        quality.apply_to_input(self);
+    }
+
+    /// Applies a canonical [`EarthQualityPreset`] onto this [`EarthInput`].
+    #[inline]
+    pub fn set_quality_preset(&mut self, preset: EarthQualityPreset) {
+        EarthRenderQuality::from_preset(preset).apply_to_input(self);
+    }
+
+    /// Builder-style helper applying an [`EarthRenderQuality`] profile.
+    #[inline]
+    pub fn with_render_quality(mut self, quality: EarthRenderQuality) -> Self {
+        self.set_render_quality(quality);
+        self
+    }
+
+    /// Builder-style helper applying a canonical [`EarthQualityPreset`].
+    #[inline]
+    pub fn with_quality_preset(mut self, preset: EarthQualityPreset) -> Self {
+        self.set_quality_preset(preset);
+        self
+    }
+}
+
+/// Canonical rendering quality presets shared across `strata_earth` and `earth_preview`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EarthQualityPreset {
+    Low,
+    Medium,
+    #[default]
+    High,
+    Ultra,
+    Custom,
+}
+
+impl EarthQualityPreset {
+    /// Ordered list of the four canonical presets (excluding [`Self::Custom`]).
+    pub const ALL_CANONICAL: [Self; 4] = [Self::Low, Self::Medium, Self::High, Self::Ultra];
+
+    /// Human-readable display label for HUD buttons and settings dropdowns.
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Ultra => "Ultra",
+            Self::Custom => "Custom",
+        }
+    }
+
+    /// Lowercase canonical identifier string for serialization / env configuration.
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Ultra => "ultra",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Parses a preset name case-insensitively (`low`, `med`/`medium`, `high`, `ultra`, `custom`).
+    pub fn from_str_loose(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" | "l" => Some(Self::Low),
+            "medium" | "med" | "m" => Some(Self::Medium),
+            "high" | "hi" | "h" => Some(Self::High),
+            "ultra" | "u" | "max" => Some(Self::Ultra),
+            "custom" | "c" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// Cycles through the canonical presets (`Low -> Medium -> High -> Ultra -> Low`).
+    /// When currently `Custom`, cycles to `Low` so users can snap back onto a canonical tier.
+    #[inline]
+    pub const fn next_canonical(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Ultra,
+            Self::Ultra | Self::Custom => Self::Low,
+        }
+    }
+}
+
+impl std::fmt::Display for EarthQualityPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Unified rendering quality configuration controlling terrain LOD, mesh density, shadows,
+/// 2.5D physical atmosphere, telescope skybox, global cloud map, ocean coastal shoaling,
+/// and stationary idle high-res refinement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EarthRenderQuality {
+    /// Per-tile terrain subdivision grid density (`13`, `17`, `25`, `33`).
+    pub tile_grid: u32,
+    /// Quadtree screen-space error threshold in pixels (lower = sharper LOD).
+    pub sse_threshold: f64,
+    /// Maximum quadtree zoom level (`16..=19`).
+    pub max_tile_level: u8,
+    /// Physical 2.5D Rayleigh/Mie sky & horizon-synced night stars.
+    pub realistic_sky_25d: bool,
+    /// Directional solar/twilight hillshading on 2.5D terrain slopes.
+    pub terrain_lighting_25d: bool,
+    /// Real-time GPU directional shadow mapping on mountains & 3D objects.
+    pub terrain_shadows: bool,
+    /// Directional shadow map resolution in pixels (`1024`, `2048`, `4096`).
+    pub shadow_map_size: u32,
+    /// Deep-space telescope cubemap face resolution.
+    pub skybox_quality: crate::skybox::SpaceSkyboxQuality,
+    /// Global atmospheric cloud shell map resolution.
+    pub cloud_resolution: crate::astro::CloudMapResolution,
+    /// Coastal Euclidean Distance-to-Shore SDF wave refraction & surf breaking.
+    pub ocean_coastal_shoaling: bool,
+    /// Progressive stationary-camera idle high-res tile refinement.
+    pub idle_high_res: bool,
+    /// Additional quadtree leaf tile budget granted during idle refinement.
+    pub idle_extra_leaf_budget: usize,
+}
+
+impl Default for EarthRenderQuality {
+    fn default() -> Self {
+        Self::from_preset(EarthQualityPreset::High)
+    }
+}
+
+impl EarthRenderQuality {
+    /// Returns the canonical [`EarthRenderQuality`] profile for `preset`.
+    /// Passing [`EarthQualityPreset::Custom`] returns the `High` baseline profile.
+    pub const fn from_preset(preset: EarthQualityPreset) -> Self {
+        match preset {
+            EarthQualityPreset::Low => Self {
+                tile_grid: 13,
+                sse_threshold: 3.4,
+                max_tile_level: 16,
+                realistic_sky_25d: false,
+                terrain_lighting_25d: false,
+                terrain_shadows: false,
+                shadow_map_size: 1024,
+                skybox_quality: crate::skybox::SpaceSkyboxQuality::Low,
+                cloud_resolution: crate::astro::CloudMapResolution::Low,
+                ocean_coastal_shoaling: false,
+                idle_high_res: false,
+                idle_extra_leaf_budget: 64,
+            },
+            EarthQualityPreset::Medium => Self {
+                tile_grid: 17,
+                sse_threshold: 2.7,
+                max_tile_level: 17,
+                realistic_sky_25d: true,
+                terrain_lighting_25d: true,
+                terrain_shadows: false,
+                shadow_map_size: 1024,
+                skybox_quality: crate::skybox::SpaceSkyboxQuality::Medium,
+                cloud_resolution: crate::astro::CloudMapResolution::Medium,
+                ocean_coastal_shoaling: false,
+                idle_high_res: false,
+                idle_extra_leaf_budget: 128,
+            },
+            EarthQualityPreset::High | EarthQualityPreset::Custom => Self {
+                tile_grid: 25,
+                sse_threshold: 2.3,
+                max_tile_level: 18,
+                realistic_sky_25d: true,
+                terrain_lighting_25d: true,
+                terrain_shadows: true,
+                shadow_map_size: 2048,
+                skybox_quality: crate::skybox::SpaceSkyboxQuality::High,
+                cloud_resolution: crate::astro::CloudMapResolution::High,
+                ocean_coastal_shoaling: true,
+                idle_high_res: false,
+                idle_extra_leaf_budget: 192,
+            },
+            EarthQualityPreset::Ultra => Self {
+                tile_grid: 33,
+                sse_threshold: 1.65,
+                max_tile_level: 19,
+                realistic_sky_25d: true,
+                terrain_lighting_25d: true,
+                terrain_shadows: true,
+                shadow_map_size: 4096,
+                skybox_quality: crate::skybox::SpaceSkyboxQuality::Ultra,
+                cloud_resolution: crate::astro::CloudMapResolution::Ultra,
+                ocean_coastal_shoaling: true,
+                idle_high_res: true,
+                idle_extra_leaf_budget: 320,
+            },
+        }
+    }
+
+    /// Reads the live [`EarthRenderQuality`] profile from an [`EarthInput`].
+    #[inline]
+    pub fn from_input(input: &EarthInput) -> Self {
+        Self {
+            tile_grid: input.tile_grid,
+            sse_threshold: input.sse_threshold,
+            max_tile_level: input.max_tile_level,
+            realistic_sky_25d: input.local_atmosphere.realistic_sky,
+            terrain_lighting_25d: input.local_atmosphere.terrain_lighting,
+            terrain_shadows: input.local_atmosphere.terrain_shadows,
+            shadow_map_size: input.local_atmosphere.shadow_map_size,
+            skybox_quality: input.space.skybox_quality,
+            cloud_resolution: input.weather.cloud_resolution,
+            ocean_coastal_shoaling: input.ocean_waves.coastal_shoaling,
+            idle_high_res: input.idle_high_res.enabled,
+            idle_extra_leaf_budget: input.idle_high_res.extra_leaf_budget,
+        }
+    }
+
+    /// Writes every field of this quality profile onto `input` cleanly with safety clamping.
+    pub fn apply_to_input(&self, input: &mut EarthInput) {
+        input.tile_grid = self.tile_grid.clamp(5, 65);
+        input.sse_threshold = self.sse_threshold.clamp(0.5, 12.0);
+        input.max_tile_level = self.max_tile_level.clamp(4, 21);
+        input.local_atmosphere.realistic_sky = self.realistic_sky_25d;
+        input.local_atmosphere.night_stars_sync = self.realistic_sky_25d;
+        input.local_atmosphere.terrain_lighting = self.terrain_lighting_25d;
+        input.local_atmosphere.terrain_shadows = self.terrain_shadows;
+        input.local_atmosphere.shadow_map_size = self.shadow_map_size.clamp(512, 4096);
+        input.space.skybox_quality = self.skybox_quality;
+        input.weather.cloud_resolution = self.cloud_resolution;
+        input.ocean_waves.coastal_shoaling = self.ocean_coastal_shoaling;
+        input.idle_high_res.enabled = self.idle_high_res;
+        input.idle_high_res.extra_leaf_budget = self.idle_extra_leaf_budget.min(512);
+    }
+
+    /// Compares two quality profiles with `1e-3` tolerance on `sse_threshold`.
+    #[inline]
+    pub fn approx_eq(&self, other: &Self) -> bool {
+        self.tile_grid == other.tile_grid
+            && (self.sse_threshold - other.sse_threshold).abs() <= 1e-3
+            && self.max_tile_level == other.max_tile_level
+            && self.realistic_sky_25d == other.realistic_sky_25d
+            && self.terrain_lighting_25d == other.terrain_lighting_25d
+            && self.terrain_shadows == other.terrain_shadows
+            && self.shadow_map_size == other.shadow_map_size
+            && self.skybox_quality == other.skybox_quality
+            && self.cloud_resolution == other.cloud_resolution
+            && self.ocean_coastal_shoaling == other.ocean_coastal_shoaling
+            && self.idle_high_res == other.idle_high_res
+            && self.idle_extra_leaf_budget == other.idle_extra_leaf_budget
+    }
+
+    /// Detects whether this profile matches one of the four canonical presets (`Low`, `Medium`,
+    /// `High`, `Ultra`), returning [`EarthQualityPreset::Custom`] if any parameter diverges.
+    pub fn matching_preset(&self) -> EarthQualityPreset {
+        for preset in EarthQualityPreset::ALL_CANONICAL {
+            if self.approx_eq(&Self::from_preset(preset)) {
+                return preset;
+            }
+        }
+        EarthQualityPreset::Custom
     }
 }
 
@@ -1088,12 +1363,12 @@ impl EarthScene {
                 }
                 SurfaceMode::QuadtreeLod => {
                     let mut leaves = Vec::new();
-                    let horizon_cull = input.low_level_state().map_2d_morph < 0.15;
+                    let horizon_cull = input.low_level_state().map_2d_morph <= 1e-4;
                     let elev_on = input.elevation_enabled
                         && input.low_level_state().map_2d_morph < 0.99
                         && input.camera.altitude_m() <= 350_000.0;
                     let src_ro: &dyn TileSource = &*source;
-                    let raw_leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_elevation(
+                    let raw_leaves = crate::geodesy::traverse_quadtree_lod_frustum6_with_relief(
                         &input.camera,
                         input
                             .camera_up_ecef
@@ -1107,6 +1382,7 @@ impl EarthScene {
                         crate::geodesy::MAX_QUADTREE_LEAVES,
                         input.tile_projection,
                         crate::geodesy::IdleLodParams::inactive(),
+                        elev_on,
                         0.0,
                         |k| {
                             if !elev_on {
@@ -1446,7 +1722,7 @@ impl EarthScene {
                 .map(|(k, _)| k)
                 .collect()
             } else {
-                crate::geodesy::traverse_quadtree_lod_frustum6_with_elevation(
+                crate::geodesy::traverse_quadtree_lod_frustum6_with_relief(
                     &input.camera,
                     input
                         .camera_up_ecef
@@ -1456,10 +1732,11 @@ impl EarthScene {
                     input.sse_threshold,
                     input.max_tile_level,
                     input.tile_grid.max(2),
-                    low_state.map_2d_morph < 0.15,
+                    low_state.map_2d_morph <= 1e-4,
                     crate::geodesy::MAX_QUADTREE_LEAVES,
                     input.tile_projection,
                     crate::geodesy::IdleLodParams::inactive(),
+                    elev_on,
                     focus_elev,
                     |k| self.retained_builder.tile_average_altitude_m(k, elev_on, src_ro),
                 )

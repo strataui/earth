@@ -127,6 +127,9 @@ pub struct EarthViewState {
     live_modifiers: EarthModifiers,
     held_keys: HashMap<KeyCode, Instant>,
     last_emitted_cam: Option<EarthCameraState>,
+    pending_host_location:
+        Arc<std::sync::Mutex<Option<(strata_device::GeolocationInfo, Option<f64>, bool)>>>,
+    last_host_location: Option<strata_device::GeolocationInfo>,
 }
 
 impl EarthViewState {
@@ -201,6 +204,8 @@ impl EarthViewState {
             live_modifiers: EarthModifiers::default(),
             held_keys: HashMap::new(),
             last_emitted_cam: None,
+            pending_host_location: Arc::new(std::sync::Mutex::new(None)),
+            last_host_location: None,
         };
         st.sync_camera();
         st.last_camera_sync = None;
@@ -482,12 +487,33 @@ impl EarthViewState {
     }
 
     /// Advances smooth zoom/inertia damping, transitions, ocean/weather/satellite animations,
-    /// and label/plugin overlay projection updates for one frame tick.
+    /// async host geolocation centering, and label/plugin overlay projection updates for one frame tick.
     pub fn step_frame(&mut self, dt_s: f64) -> FrameOutcome {
-        let _tile_dirty = self.tile_ready.swap(false, Ordering::AcqRel);
+        let mut host_loc_dirty = false;
+        let pending_loc = self
+            .pending_host_location
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some((fix, default_range_m, smooth_fly)) = pending_loc {
+            if fix.is_available && fix.latitude.is_finite() && fix.longitude.is_finite() {
+                if smooth_fly {
+                    self.fly_to(fix.latitude, fix.longitude, default_range_m);
+                } else {
+                    let target_range = default_range_m.unwrap_or(self.orbit.range_m);
+                    let hdg = self.orbit.heading_deg;
+                    let tilt = self.orbit.tilt_deg;
+                    self.jump_to(fix.latitude, fix.longitude, target_range, hdg, tilt);
+                }
+                self.last_host_location = Some(fix);
+                host_loc_dirty = true;
+            }
+        }
+
+        let tile_dirty = self.tile_ready.swap(false, Ordering::AcqRel);
         let label_dirty = self.label_ready.swap(false, Ordering::AcqRel);
         let trans_dirty = self.viewport.step_transition(dt_s);
-        let _weather_dirty = self
+        let overlay_tick_dirty = self
             .viewport
             .step_dynamic_overlays(dt_s, !self.orbit.is_dragging());
 
@@ -497,14 +523,21 @@ impl EarthViewState {
             .orbit
             .step_damping(dt_s, is_2d, |lat, lon| vp_ref.sample_ground_elevation_m(lat, lon));
 
-        let camera_moving = self.camera_sync_pending || orbit_dirty || trans_dirty;
+        let camera_moving =
+            host_loc_dirty || self.camera_sync_pending || orbit_dirty || trans_dirty;
         if camera_moving {
             self.sync_camera();
         }
-        let _idle_refined = self.viewport.step_idle_refinement(
+        let idle_refined = self.viewport.step_idle_refinement(
             dt_s,
             camera_moving || self.orbit.is_dragging() || self.orbit.is_flying(),
         );
+        let canvas_dirty = host_loc_dirty
+            || tile_dirty
+            || trans_dirty
+            || overlay_tick_dirty
+            || orbit_dirty
+            || idle_refined;
 
         if self.viewport.labels_enabled()
             && self.orbit.range_m < 180_000.0
@@ -523,13 +556,18 @@ impl EarthViewState {
         let overlay_plugins_active = self.has_active_overlay_plugins();
         let obj_labels_active = self.viewport.has_labeled_objects();
 
-        if !toggled_labels
+        if !host_loc_dirty
+            && !toggled_labels
             && !label_dirty
             && !labels_enabled
             && !overlay_plugins_active
             && !obj_labels_active
         {
-            return FrameOutcome::Unchanged;
+            return if canvas_dirty {
+                FrameOutcome::RepaintCanvas3D
+            } else {
+                FrameOutcome::Unchanged
+            };
         }
 
         let (projected, new_sig) = self.project_and_hash_labels();
@@ -539,10 +577,12 @@ impl EarthViewState {
             self.last_label_sig = new_sig;
         }
 
-        if toggled_labels || label_dirty || sig_changed {
+        if host_loc_dirty || toggled_labels || label_dirty || sig_changed {
             self.last_label_refresh = Instant::now();
             self.notify_ui_changed();
             FrameOutcome::Dirty
+        } else if canvas_dirty {
+            FrameOutcome::RepaintCanvas3D
         } else {
             FrameOutcome::Unchanged
         }
@@ -1246,6 +1286,63 @@ impl EarthView {
         self.state.borrow().viewport.is_idle_high_res_active()
     }
 
+    /// Builder-style helper applying a unified [`crate::scene::EarthRenderQuality`] profile.
+    pub fn with_render_quality(self, quality: crate::scene::EarthRenderQuality) -> Self {
+        self.set_render_quality(quality);
+        self
+    }
+
+    /// Builder-style helper applying a canonical [`crate::scene::EarthQualityPreset`].
+    pub fn with_quality_preset(self, preset: crate::scene::EarthQualityPreset) -> Self {
+        self.set_quality_preset(preset);
+        self
+    }
+
+    /// Returns the active unified [`crate::scene::EarthRenderQuality`] snapshot.
+    pub fn render_quality(&self) -> crate::scene::EarthRenderQuality {
+        self.state.borrow().viewport.render_quality()
+    }
+
+    /// Returns the matching canonical [`crate::scene::EarthQualityPreset`] (or `Custom`).
+    pub fn quality_preset(&self) -> crate::scene::EarthQualityPreset {
+        self.state.borrow().viewport.quality_preset()
+    }
+
+    /// Applies a unified [`crate::scene::EarthRenderQuality`] profile live and notifies UI bindings.
+    pub fn set_render_quality(&self, quality: crate::scene::EarthRenderQuality) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_render_quality(quality);
+        st.notify_ui_changed();
+    }
+
+    /// Applies a canonical [`crate::scene::EarthQualityPreset`] live and notifies UI bindings.
+    pub fn set_quality_preset(&self, preset: crate::scene::EarthQualityPreset) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_quality_preset(preset);
+        st.notify_ui_changed();
+    }
+
+    /// Updates terrain tile subdivision grid density (`5..=65`) live.
+    pub fn set_tile_grid(&self, tile_grid: u32) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_tile_grid(tile_grid);
+        st.notify_ui_changed();
+    }
+
+    /// Updates quadtree SSE threshold (`0.5..=12.0` px) live.
+    pub fn set_sse_threshold(&self, sse_threshold: f64) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_sse_threshold(sse_threshold);
+        st.notify_ui_changed();
+    }
+
+    /// Updates maximum quadtree tile zoom level (`4..=21`) live.
+    pub fn set_max_tile_level(&self, max_tile_level: u8) {
+        let mut st = self.state.borrow_mut();
+        st.viewport.set_max_tile_level(max_tile_level);
+        st.notify_ui_changed();
+    }
+
     /// Installs a custom functional [`PrecipitationEvaluator`] controlling which 2D layers render.
     pub fn set_precipitation_evaluator(&self, evaluator: PrecipitationEvaluator) {
         self.state
@@ -1315,6 +1412,71 @@ impl EarthView {
             .borrow_mut()
             .jump_to(lat_deg, lon_deg, range_m, heading_deg, tilt_deg);
         self.emit_camera_change_if_needed();
+    }
+
+    /// Immediately centers the Earth camera over `(lat_deg, lon_deg)` at `range_m`
+    /// (preserving current range, heading, and tilt when `range_m` is `None`).
+    pub fn center_on_coordinates(&self, lat_deg: f64, lon_deg: f64, range_m: Option<f64>) {
+        if !lat_deg.is_finite() || !lon_deg.is_finite() {
+            return;
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            let target_range = range_m
+                .filter(|r| r.is_finite() && *r > 0.0)
+                .unwrap_or(st.orbit.range_m);
+            let hdg = st.orbit.heading_deg;
+            let tilt = st.orbit.tilt_deg;
+            st.jump_to(lat_deg, lon_deg, target_range, hdg, tilt);
+        }
+        self.emit_camera_change_if_needed();
+    }
+
+    /// Probes the host computer's OS geolocation/GPS asynchronously on a background worker thread
+    /// and immediately centers the Earth camera on the host coordinates once resolved during
+    /// [`Self::step_frame`], ensuring frame 0 never stalls.
+    pub fn center_on_host_location_async(
+        &self,
+        default_range_m: Option<f64>,
+        allow_ip_fallback: bool,
+    ) {
+        self.spawn_host_location_probe(default_range_m, allow_ip_fallback, false);
+    }
+
+    /// Probes the host computer's OS geolocation/GPS asynchronously and smoothly flies the camera
+    /// to the host coordinates once resolved during [`Self::step_frame`].
+    pub fn fly_to_host_location_async(
+        &self,
+        default_range_m: Option<f64>,
+        allow_ip_fallback: bool,
+    ) {
+        self.spawn_host_location_probe(default_range_m, allow_ip_fallback, true);
+    }
+
+    fn spawn_host_location_probe(
+        &self,
+        default_range_m: Option<f64>,
+        allow_ip_fallback: bool,
+        smooth_fly: bool,
+    ) {
+        let pending = Arc::clone(&self.state.borrow().pending_host_location);
+        let tile_ready = Arc::clone(&self.state.borrow().tile_ready);
+        strata_device::probe_os_geolocation_async(allow_ip_fallback, move |maybe_fix| {
+            if let Some(fix) = maybe_fix {
+                if fix.is_available {
+                    if let Ok(mut slot) = pending.lock() {
+                        *slot = Some((fix, default_range_m, smooth_fly));
+                    }
+                    tile_ready.store(true, Ordering::Release);
+                }
+            }
+        });
+    }
+
+    /// Returns the most recently resolved host OS geolocation fix applied by
+    /// [`Self::center_on_host_location_async`] or [`Self::fly_to_host_location_async`].
+    pub fn last_host_location(&self) -> Option<strata_device::GeolocationInfo> {
+        self.state.borrow().last_host_location.clone()
     }
 
     /// Applies a smooth exponential natural-log zoom step (`delta_ln < 0.0` zooms in;
@@ -1969,11 +2131,19 @@ mod tests {
             );
             st.orbit.jump_to(37.7749, -122.4194, 5_000.0, 0.0, 30.0);
             st.sync_camera();
+            st.viewport.sync_now();
         });
+        assert!(
+            matches!(
+                earth.step_frame(1.0 / 60.0),
+                FrameOutcome::Unchanged | FrameOutcome::RepaintCanvas3D
+            ),
+            "with labels and overlay plugins off, pure-3D jump does not require 2D HUD rebuilds"
+        );
         assert_eq!(
             earth.step_frame(1.0 / 60.0),
             FrameOutcome::Unchanged,
-            "with labels and overlay plugins off, pure-3D jump does not require 2D HUD rebuilds"
+            "once settled with labels off, steady-state tick is Unchanged"
         );
         earth.with_state_mut(|st| st.viewport.set_labels_enabled(true));
         assert_eq!(
@@ -2463,6 +2633,26 @@ mod tests {
         }
         assert!(total_checked_labels >= 20);
     }
+
+    #[test]
+    fn step_frame_returns_repaint_canvas3d_when_async_tile_ready_fires() {
+        let mut input = EarthInput::default();
+        input.elevation_enabled = false;
+        input.layers.labels = false;
+        let earth =
+            EarthView::new(&input, Box::new(MemoryTileSource::default())).without_default_plugins();
+        earth.with_state(|st| st.viewport.sync_now());
+        let _ = earth.step_frame(1.0 / 60.0);
+        assert_eq!(earth.step_frame(1.0 / 60.0), FrameOutcome::Unchanged);
+
+        earth.with_state(|st| {
+            st.tile_ready.store(true, std::sync::atomic::Ordering::Release);
+        });
+        assert_eq!(
+            earth.step_frame(1.0 / 60.0),
+            FrameOutcome::RepaintCanvas3D,
+            "async tile refinement ready must return RepaintCanvas3D even when 2D labels are off"
+        );
+        assert_eq!(earth.step_frame(1.0 / 60.0), FrameOutcome::Unchanged);
+    }
 }
-
-

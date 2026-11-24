@@ -1646,6 +1646,7 @@ version = "0.1.0"
 dependencies = [
  "strata-dom",
  "strata-primitives",
+ "strata-web-api",
 ]
 
 [[package]]
@@ -1662,6 +1663,7 @@ dependencies = [
  "flate2",
  "image",
  "libc",
+ "strata-device",
  "strata-layout",
  "strata-primitives",
  "strata-render",

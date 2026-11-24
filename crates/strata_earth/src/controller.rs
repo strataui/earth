@@ -551,7 +551,8 @@ impl EarthOrbitController {
             up_offset,
         ];
 
-        let near_m = (self.range_m * 0.002).clamp(0.5, 20_000.0);
+        let near_m = (up_offset.min(self.range_m).max(GROUND_CLEARANCE_M) * 0.004)
+            .clamp(0.35, 20_000.0);
         let cam = EarthCamera {
             focus: Geodetic::new(lat, self.lon_deg, focus_h),
             aim_offset_m: [0.0, 0.0, 0.0],
@@ -632,10 +633,21 @@ impl EarthOrbitController {
         ground_sampler: &F,
     ) -> bool {
         let mut adjusted = false;
+        let eye_dist = cam.eye_distance_m().max(MIN_RANGE_M);
         for _ in 0..2 {
             let placement = cam.placement_with_up(up_vec);
             let eye_geo = ecef_to_geodetic(placement.eye);
-            let terrain_h = ground_sampler(eye_geo.lat_deg, eye_geo.lon_deg).max(0.0);
+            let mut terrain_h = ground_sampler(eye_geo.lat_deg, eye_geo.lon_deg).max(0.0);
+            if eye_dist < 5_000.0 {
+                let fwd = placement.aim.sub(placement.eye);
+                let fwd_len = fwd.length();
+                if fwd_len > 1e-3 {
+                    let probe_d = (eye_dist * 0.12).clamp(4.0, 28.0);
+                    let probe_pt = placement.eye.add(fwd.scale(probe_d / fwd_len));
+                    let probe_geo = ecef_to_geodetic(probe_pt);
+                    terrain_h = terrain_h.max(ground_sampler(probe_geo.lat_deg, probe_geo.lon_deg).max(0.0));
+                }
+            }
             let min_eye_h = terrain_h + GROUND_CLEARANCE_M;
             if eye_geo.height_m < min_eye_h {
                 let lift = min_eye_h - eye_geo.height_m;
@@ -655,6 +667,10 @@ impl EarthOrbitController {
                 cam.eye_offset_m[2] = new_u;
                 adjusted = true;
             } else {
+                let actual_clearance = (eye_geo.height_m - terrain_h).max(GROUND_CLEARANCE_M);
+                if eye_dist < 25_000.0 {
+                    cam.near_m = cam.near_m.min((actual_clearance * 0.12).max(0.35));
+                }
                 break;
             }
         }
@@ -1014,7 +1030,8 @@ impl EarthOrbitController {
         self.active_transit = None;
         self.stop_momentum();
         let steps = (delta_y / 110.0).clamp(-3.5, 3.5);
-        let factor = (steps * 0.18).exp();
+        let zoom_rate = if self.is_2d_hint { 0.36 } else { 0.18 };
+        let factor = (steps * zoom_rate).exp();
         self.target_range_m = (self.target_range_m * factor).clamp(MIN_RANGE_M, MAX_RANGE_M);
         self.zoom_cursor_px = Some((x, y));
     }
@@ -1322,7 +1339,7 @@ impl EarthOrbitController {
             let dy = self.viewport_h * 0.5 - cy;
             let visible_m = 2.0 * old_range * (DEFAULT_FOV_Y_DEG.to_radians() * 0.5).tan();
             let m_per_px = visible_m / self.viewport_h.max(1.0);
-            let shift_scale = (1.0 - ratio).clamp(0.0, 0.5);
+            let shift_scale = (1.0 - ratio).clamp(0.0, 0.85);
             let deg_per_px = m_per_px / wgs84::A.to_radians();
             let d_lon = dx * deg_per_px * shift_scale;
             let d_lat = dy * deg_per_px * shift_scale;
@@ -1943,6 +1960,35 @@ mod tests {
             "resolved nadir camera up vector must rotate cleanly when dragging left/right, dot={dot_turned}"
         );
     }
+
+    #[test]
+    fn wheel_zoom_sensitivity_in_2d_tracks_slippy_zoom_responsively() {
+        let mut ctrl_3d = EarthOrbitController::new();
+        ctrl_3d.set_viewport_size(1280.0, 800.0);
+        ctrl_3d.set_is_2d_hint(false);
+        ctrl_3d.jump_to(37.7749, -122.4194, 500_000.0, 0.0, 0.0);
+
+        let mut ctrl_2d = ctrl_3d.clone();
+        ctrl_2d.set_is_2d_hint(true);
+        let z0 = ctrl_2d.zoom_2d();
+
+        ctrl_3d.handle_scroll(-110.0, 640.0, 400.0);
+        ctrl_2d.handle_scroll(-110.0, 640.0, 400.0);
+        for _ in 0..60 {
+            ctrl_3d.step_damping(1.0 / 60.0, false, |_, _| 0.0);
+            ctrl_2d.step_damping(1.0 / 60.0, true, |_, _| 0.0);
+        }
+
+        let dz_2d = ctrl_2d.zoom_2d() - z0;
+        assert!(
+            ctrl_2d.range_m < ctrl_3d.range_m * 0.88,
+            "2D scroll tick must zoom noticeably faster in range than 3D: 2D={} vs 3D={}",
+            ctrl_2d.range_m,
+            ctrl_3d.range_m
+        );
+        assert!(
+            dz_2d >= 0.45 && dz_2d <= 0.65,
+            "one 2D wheel tick should advance ~0.5 Slippy zoom level, got {dz_2d}"
+        );
+    }
 }
-
-

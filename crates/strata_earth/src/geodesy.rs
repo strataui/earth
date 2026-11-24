@@ -295,7 +295,10 @@ impl EarthCamera {
         };
         let altitude = self.altitude_m();
         let horizon = horizon_distance_m(altitude);
-        let clearance = altitude.min(self.eye_distance_m().max(2.0));
+        let height_above_focus = (altitude - self.focus.height_m.max(0.0))
+            .max(self.eye_offset_m[2])
+            .max(2.0);
+        let clearance = height_above_focus.min(self.eye_distance_m().max(2.0));
         let (near, _) = depth_range(clearance, horizon, self.near_m);
         let (_, far) = depth_range(altitude, horizon, self.near_m);
         CameraPlacement {
@@ -665,21 +668,21 @@ pub enum TileProjection {
 
 /// Converts normalized global Web Mercator Y (`0.0` north .. `1.0` south) into latitude in degrees.
 ///
-/// Polar world edges (`gy <= 0` or `gy >= 1`) close smoothly to `±89.9°` so the WGS84 globe has
-/// no open polar holes while all interior rows follow exact inverse Web Mercator latitude.
+/// Polar world edges (`gy <= 0` or `gy >= 1`) close smoothly to `±90.0°` so the WGS84 globe has
+/// no open polar holes or notch craters while interior rows follow exact inverse Web Mercator latitude.
 #[inline]
 pub fn mercator_gy_to_lat_deg(gy: f64) -> f64 {
     if gy <= 0.0 {
-        return 89.9;
+        return 90.0;
     }
     if gy >= 1.0 {
-        return -89.9;
+        return -90.0;
     }
     (std::f64::consts::PI * (1.0 - 2.0 * gy))
         .sinh()
         .atan()
         .to_degrees()
-        .clamp(-89.9, 89.9)
+        .clamp(-90.0, 90.0)
 }
 
 /// Returns the geographic bounds of `key` under Plate Carree (`EPSG:4326`) subdivision.
@@ -877,6 +880,40 @@ pub fn stabilized_surface_morph(
     }
 }
 
+/// Computes the effective horizontal parallel scale (`cos`) for flat/morphed surface projection.
+///
+/// - In pure 2.5D tangent plane (`map_2d <= 1e-4`) or canonical 2D map
+///   (`is_canonical_2d_morph(map_2d) && flat_t >= CANONICAL_2D_MORPH_THRESHOLD`), returns the
+///   uniform `cos_scale = lerp(cos(focus_lat), 1.0, map_2d)`.
+/// - Throughout curved 2D <-> 3D morph (`0.0 < map_2d < CANONICAL_2D_MORPH_THRESHOLD`), tapers
+///   every latitude smoothly by its true spherical parallel radius `cos(lat)` (`0.0` at ±90°,
+///   `~0.087` at 85°N) while `flat_t <= 0.85`, then unfolds continuously from `cos(lat)` to
+///   `cos_scale` across `0.85..CANONICAL_2D_MORPH_THRESHOLD` so neither the polar apex nor
+///   high-latitude rows (e.g. 85°N) flare sideways while the globe is still curved.
+#[inline]
+pub(crate) fn morphed_east_cos_scale(
+    lat_deg: f64,
+    focus_lat_deg: f64,
+    flat_t: f64,
+    map_2d: f64,
+) -> f64 {
+    let cos_focus = focus_lat_deg.to_radians().cos().abs().max(0.25);
+    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+    if map_2d <= 1e-4 || (is_canonical_2d_morph(map_2d) && flat_t >= CANONICAL_2D_MORPH_THRESHOLD) {
+        return cos_scale;
+    }
+    const LAT_SPREAD_START: f64 = 0.85;
+    let s = ((flat_t - LAT_SPREAD_START) / (CANONICAL_2D_MORPH_THRESHOLD - LAT_SPREAD_START))
+        .clamp(0.0, 1.0);
+    let spread = s * s * (3.0 - 2.0 * s);
+    let cos_lat = if lat_deg.abs() >= 89.999 {
+        0.0
+    } else {
+        lat_deg.to_radians().cos().abs()
+    };
+    cos_lat + (cos_scale - cos_lat) * spread
+}
+
 /// Projects `(lat_deg, lon_deg, height_m)` into world ECEF/morphed coordinates and computes the
 /// matching orthonormal local East-North-Up basis under `morph`.
 ///
@@ -900,12 +937,11 @@ pub fn project_morphed_point_and_frame(
     let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
     let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
     let focus_ecef = geodetic_to_ecef(focus_surface);
-    let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
-    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
+    let eff_cos = morphed_east_cos_scale(lat_deg, focus_surface.lat_deg, flat_t, map_2d);
 
     let dlon_deg = wrap_longitude(lon_deg - morph.focus.lon_deg);
     let dlat_deg = lat_deg - morph.focus.lat_deg;
-    let east_m = dlon_deg.to_radians() * wgs84::A * cos_scale;
+    let east_m = dlon_deg.to_radians() * wgs84::A * eff_cos;
     let north_m = dlat_deg.to_radians() * wgs84::A;
     let up_h = height_m * (1.0 - map_2d);
     let p_flat = focus_ecef
@@ -1578,6 +1614,48 @@ pub fn traverse_quadtree_lod_frustum6_with_elevation<F>(
     projection: TileProjection,
     idle_lod: IdleLodParams,
     focus_elevation_m: f64,
+    tile_avg_altitude_m: F,
+) -> Vec<TileKey>
+where
+    F: FnMut(TileKey) -> f64,
+{
+    traverse_quadtree_lod_frustum6_with_relief(
+        camera,
+        up_override,
+        viewport_width_px,
+        viewport_height_px,
+        sse_threshold_px,
+        max_level,
+        tile_grid,
+        horizon_cull,
+        max_leaves,
+        projection,
+        idle_lod,
+        true,
+        focus_elevation_m,
+        tile_avg_altitude_m,
+    )
+}
+
+/// Traverses the planetary quadtree with explicit control over grazing-pitch vertical terrain-relief
+/// SSE preservation (`terrain_relief_enabled`). When `true`, vertical heightmap relief projects
+/// proportional to `sin(incidence)` along the gaze corridor rather than suffering flat-imagery
+/// `cos(incidence)` grazing foreshortening.
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_quadtree_lod_frustum6_with_relief<F>(
+    camera: &EarthCamera,
+    up_override: Option<DVec3>,
+    viewport_width_px: f64,
+    viewport_height_px: f64,
+    sse_threshold_px: f64,
+    max_level: u8,
+    tile_grid: u32,
+    horizon_cull: bool,
+    max_leaves: usize,
+    projection: TileProjection,
+    idle_lod: IdleLodParams,
+    terrain_relief_enabled: bool,
+    focus_elevation_m: f64,
     mut tile_avg_altitude_m: F,
 ) -> Vec<TileKey>
 where
@@ -1628,6 +1706,15 @@ where
     };
     let center_bias = idle_lod.view_center_bias.clamp(0.0, 1.0);
 
+    let north_pole = DVec3::new(0.0, 0.0, wgs84::B);
+    let south_pole = DVec3::new(0.0, 0.0, -wgs84::B);
+    let north_pole_visible = !horizon_cull
+        || (!is_tile_horizon_culled(north_pole, wgs84::A * 0.15, eye)
+            && frustum.intersects_sphere(north_pole, wgs84::A * 0.30));
+    let south_pole_visible = !horizon_cull
+        || (!is_tile_horizon_culled(south_pole, wgs84::A * 0.15, eye)
+            && frustum.intersects_sphere(south_pole, wgs84::A * 0.30));
+
     while let Some(node) = heap.pop() {
         let key = node.key;
         if key.level < max_level && node.sse > sse_threshold_px {
@@ -1640,10 +1727,12 @@ where
                 let avg_alt_m = tile_avg_altitude_m(child);
                 let (center, radius) =
                     tile_bounding_sphere_projected_with_altitude(child, projection, avg_alt_m);
-                if horizon_cull && is_tile_horizon_culled(center, radius, eye) {
+                let keep_polar = (child.y == 0 && north_pole_visible)
+                    || (child.y + 1 == child.tiles_per_axis() && south_pole_visible);
+                if horizon_cull && !keep_polar && is_tile_horizon_culled(center, radius, eye) {
                     continue;
                 }
-                if horizon_cull && !frustum.intersects_sphere(center, radius * 1.15) {
+                if horizon_cull && !keep_polar && !frustum.intersects_sphere(center, radius * 1.15) {
                     continue;
                 }
                 let surface_r = (radius - 5_000.0).max(0.0);
@@ -1666,9 +1755,12 @@ where
                     viewport_height_px,
                     camera.fov_y_deg,
                 );
+                let gaze_cos = (to_center.dot(cam_forward) / center_dist).clamp(0.0, 1.0);
                 if eye_alt < 450_000.0 {
                     let surf_up = center.scale(1.0 / center.length().max(1.0));
-                    let cos_inc = (-to_center.dot(surf_up) / center_dist).clamp(0.16, 1.0);
+                    let cos_inc_raw = (-to_center.dot(surf_up) / center_dist).clamp(0.0, 1.0);
+                    let cos_inc = cos_inc_raw.max(0.16);
+                    let sin_inc = (1.0 - cos_inc_raw * cos_inc_raw).max(0.0).sqrt();
                     let mut foreshorten = cos_inc.sqrt().clamp(0.42, 1.0);
                     let dist_ratio = dist_to_eye / eye_alt;
                     let mut dist_falloff =
@@ -1676,21 +1768,38 @@ where
                     if idle_active {
                         // While idle, relax grazing foreshortening & distant-valley falloff on tiles
                         // directly in front of the view ray so mountains & vistas sharpen visibly.
-                        let gaze_cos = (to_center.dot(cam_forward) / center_dist).clamp(0.0, 1.0);
                         let gaze_w = gaze_cos.powf(3.0);
-                        let relax = 0.40 + 0.45 * gaze_w;
+                        let relax = 0.42 + 0.45 * gaze_w;
                         foreshorten += (1.0 - foreshorten) * relax;
-                        dist_falloff += (1.0 - dist_falloff) * (relax * 0.72);
+                        dist_falloff += (1.0 - dist_falloff) * (relax * 0.74);
                     }
-                    child_sse *= foreshorten * dist_falloff;
+                    let flat_imagery_factor = foreshorten * dist_falloff;
+
+                    let effective_factor = if terrain_relief_enabled {
+                        // Vertical terrain relief (ridges, peaks, cliffs) projects on screen
+                        // proportional to `sin(incidence)` — remaining near 1.0 along horizontal
+                        // and grazing sightlines even as flat imagery foreshortens by `cos(inc)`.
+                        // Protect vertical relief SSE along the gaze corridor while still tapering
+                        // gracefully with distance and altitude so peripheral tiles stay bounded.
+                        let gaze_corridor = 0.35 + 0.65 * gaze_cos.powf(2.0);
+                        let relief_dist_falloff =
+                            (1.0 / (1.0 + 0.035 * (dist_ratio - 4.0).max(0.0))).max(0.45);
+                        let low_alt_w = (1.0 - (eye_alt / 80_000.0)).clamp(0.25, 1.0);
+                        let relief_factor =
+                            sin_inc * gaze_corridor * relief_dist_falloff * low_alt_w;
+                        flat_imagery_factor.max(relief_factor)
+                    } else {
+                        flat_imagery_factor
+                    };
+                    child_sse *= effective_factor;
                 }
-                if eye_alt < 180.0 {
-                    let close_w = (1.0 - eye_alt / 180.0).clamp(0.0, 1.0);
-                    let prox_w = (1.0 - dist_to_eye / 280.0).clamp(0.0, 1.0);
-                    child_sse *= 1.0 + 1.75 * close_w * prox_w;
+                if eye_alt < 1_800.0 {
+                    let close_w = (1.0 - eye_alt / 1_800.0).clamp(0.0, 1.0);
+                    let prox_w = (1.0 - dist_to_eye / 2_400.0).clamp(0.0, 1.0);
+                    let gaze_boost = 0.70 + 0.55 * gaze_cos.powf(2.0);
+                    child_sse *= 1.0 + 1.85 * close_w * prox_w * gaze_boost;
                 }
                 if idle_active {
-                    let gaze_cos = (to_center.dot(cam_forward) / center_dist).clamp(0.0, 1.0);
                     let gaze_focus = gaze_cos.powf(4.0);
                     // Prioritize tiles directly near the camera gaze center before peripheral edges.
                     let boost_blend = (1.0 - center_bias) + center_bias * (0.28 + 0.72 * gaze_focus);
@@ -1722,10 +1831,9 @@ where
         }
     }
     while let Some(rem) = heap.pop() {
-        if leaves.len() < cap {
+        let is_polar = rem.key.y == 0 || rem.key.y + 1 == rem.key.tiles_per_axis();
+        if leaves.len() < cap || is_polar {
             leaves.push(rem.key);
-        } else {
-            break;
         }
     }
     leaves.sort();
@@ -1935,13 +2043,23 @@ pub fn traverse_quadtree_lod_frustum6_with_options(
     let frustum = Frustum6::from_camera(camera, viewport_width_px, viewport_height_px);
     let threshold = sse_threshold_px.max(0.5);
     let leaf_cap = max_leaves.max(16);
+    let north_pole = DVec3::new(0.0, 0.0, wgs84::B);
+    let south_pole = DVec3::new(0.0, 0.0, -wgs84::B);
+    let north_pole_visible = !horizon_cull
+        || (!is_tile_horizon_culled(north_pole, wgs84::A * 0.15, placement.eye)
+            && frustum.intersects_sphere(north_pole, wgs84::A * 0.30));
+    let south_pole_visible = !horizon_cull
+        || (!is_tile_horizon_culled(south_pole, wgs84::A * 0.15, placement.eye)
+            && frustum.intersects_sphere(south_pole, wgs84::A * 0.30));
 
     let eval_candidate = |key: TileKey| -> Option<LodCandidate> {
         let (center, radius) = tile_bounding_sphere(key);
-        if horizon_cull && is_tile_horizon_culled(center, radius, placement.eye) {
+        let keep_polar = (key.y == 0 && north_pole_visible)
+            || (key.y + 1 == key.tiles_per_axis() && south_pole_visible);
+        if horizon_cull && !keep_polar && is_tile_horizon_culled(center, radius, placement.eye) {
             return None;
         }
-        if horizon_cull && !frustum.intersects_sphere(center, radius * 1.15) {
+        if horizon_cull && !keep_polar && !frustum.intersects_sphere(center, radius * 1.15) {
             return None;
         }
         let dist_to_eye = (center.sub(placement.eye).length() - radius).max(1.0);
@@ -2183,8 +2301,6 @@ pub fn build_tile_local_rtc_mesh_morphed(
     let focus_surface = Geodetic::new(morph.focus.lat_deg, morph.focus.lon_deg, 0.0);
     let focus_frame = LocalFrame::at(focus_surface.lat_deg, focus_surface.lon_deg);
     let focus_ecef = geodetic_to_ecef(focus_surface);
-    let cos_focus = focus_surface.lat_deg.to_radians().cos().abs().max(0.25);
-    let cos_scale = cos_focus + (1.0 - cos_focus) * map_2d;
 
     let project_point = |lat: f64, lon: f64, height: f64| -> (DVec3, DVec3) {
         let p_curved = geodetic_to_ecef(Geodetic::new(lat, lon, height));
@@ -2194,7 +2310,8 @@ pub fn build_tile_local_rtc_mesh_morphed(
         }
         let dlon_deg = wrap_longitude(tile_mid_lon - morph.focus.lon_deg) + (lon - tile_mid_lon);
         let dlat_deg = lat - morph.focus.lat_deg;
-        let east_m = dlon_deg.to_radians() * wgs84::A * cos_scale;
+        let eff_cos = morphed_east_cos_scale(lat, focus_surface.lat_deg, flat_t, map_2d);
+        let east_m = dlon_deg.to_radians() * wgs84::A * eff_cos;
         let north_m = dlat_deg.to_radians() * wgs84::A;
         let up_h = height * (1.0 - map_2d);
         let p_flat = focus_ecef
@@ -2232,15 +2349,18 @@ pub fn build_tile_local_rtc_mesh_morphed(
                 let gy_top = (key.y as f64 + v_tex) / per_axis;
                 mercator_gy_to_lat_deg(gy_top)
             }
-            _ => (bounds.lat0 + (bounds.lat1 - bounds.lat0) * v).clamp(-89.9, 89.9),
+            _ => (bounds.lat0 + (bounds.lat1 - bounds.lat0) * v).clamp(-90.0, 90.0),
         };
+        let is_exact_pole = lat_row.abs() >= 89.999;
         lat_rows.push(lat_row);
         for col in 0..n {
             let u = col as f64 / (n - 1) as f64;
             let lon = bounds.lon0 + (bounds.lon1 - bounds.lon0) * u;
+            let sample_lon = if is_exact_pole { 0.0 } else { lon };
             let height = elevation
                 .map(|elev_grid| {
-                    let (tu, tv) = if morph.projection == TileProjection::WebMercator
+                    let (tu, tv) = if !is_exact_pole
+                        && morph.projection == TileProjection::WebMercator
                         && face == 0
                         && key.level >= elevation_tile.level
                     {
@@ -2250,7 +2370,7 @@ pub fn build_tile_local_rtc_mesh_morphed(
                         let dy = (key.y - (elevation_tile.y << dl)) as f64;
                         (((dx + u) / scale) as f32, ((dy + v_tex) / scale) as f32)
                     } else {
-                        crate::scene::uv_in_tile(elevation_tile, lat_row, lon)
+                        crate::scene::uv_in_tile(elevation_tile, lat_row, sample_lon)
                     };
                     elev_grid.sample_bilinear(tu, tv) as f64
                 })
@@ -2273,6 +2393,7 @@ pub fn build_tile_local_rtc_mesh_morphed(
         let lon_span_rad = (bounds.lon1 - bounds.lon0).to_radians().abs().max(1e-9);
         for row in 0..n {
             let lat_row = lat_rows[row];
+            let is_exact_pole = lat_row.abs() >= 89.999;
             let cos_lat = lat_row.to_radians().cos().abs().max(0.1);
             let r0 = row.saturating_sub(1);
             let r1 = (row + 1).min(n - 1);
@@ -2280,6 +2401,10 @@ pub fn build_tile_local_rtc_mesh_morphed(
             for col in 0..n {
                 let idx = row * n + col;
                 let radial = radials[idx];
+                if is_exact_pole {
+                    normals.push(radial.as_f32());
+                    continue;
+                }
                 let c0 = col.saturating_sub(1);
                 let c1 = (col + 1).min(n - 1);
                 let de_m = (((c1 - c0) as f64 / (n - 1) as f64) * lon_span_rad * wgs84::A * cos_lat)

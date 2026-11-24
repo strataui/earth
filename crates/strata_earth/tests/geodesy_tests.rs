@@ -937,6 +937,466 @@ fn full_3d_globe_view_covers_entire_visible_hemisphere() {
     );
 }
 
+#[test]
+fn close_ground_oblique_view_selects_high_detail_without_idle_hires() {
+    use strata_earth::{EarthInput, EarthOrbitController, EarthViewMode, MAX_QUADTREE_LEAVES};
+
+    let mut orbit = EarthOrbitController::new();
+    orbit.jump_to(37.7680, -122.5180, 330.0, 250.0, 68.0);
+    orbit.set_viewport_size(1440.0, 900.0);
+    let (cam, up_opt) = orbit.to_camera_and_up(false, 0.0);
+    let mut input = EarthInput::globe();
+    input.camera = cam;
+    input.camera_up_ecef = up_opt;
+    input.view_mode = EarthViewMode::Mode3D;
+    input.viewport.width = 1440.0;
+    input.viewport.height = 900.0;
+    assert!(!input.idle_high_res.enabled);
+
+    let up_v = up_opt.map(|u| strata_render::camera64::DVec3::new(u[0], u[1], u[2]));
+    let leaves = strata_earth::traverse_quadtree_lod_frustum6_projected_with_up(
+        &input.camera,
+        up_v,
+        1440.0,
+        900.0,
+        input.sse_threshold,
+        input.max_tile_level,
+        input.tile_grid.max(2),
+        true,
+        MAX_QUADTREE_LEAVES,
+        input.tile_projection,
+    );
+    let max_lvl = leaves.iter().map(|k| k.level).max().unwrap_or(0);
+    assert!(
+        max_lvl >= 17,
+        "EarthInput::globe at 330m oblique view must reach z>=17 even with Idle Hi-Res Off (got max z={max_lvl})"
+    );
+}
+
+#[test]
+fn polar_tiles_close_cleanly_at_exact_poles_without_notch_or_nan_normals() {
+    use strata_earth::{
+        build_tile_local_rtc_mesh_morphed, mercator_gy_to_lat_deg, tile_bounds_mercator,
+        SurfaceMorphParams, TileElevation, TileKey, TileProjection,
+    };
+
+    assert_eq!(mercator_gy_to_lat_deg(0.0), 90.0);
+    assert_eq!(mercator_gy_to_lat_deg(1.0), -90.0);
+
+    let key = TileKey::new(1, 0, 0);
+    let bounds = tile_bounds_mercator(key);
+    assert!((bounds.lat1 - 90.0).abs() < 1e-9);
+
+    let elev = TileElevation {
+        width: 4,
+        height: 4,
+        heights_m: (0..16).map(|i| 100.0 + (i as f32) * 5.0).collect(),
+    };
+    let grid = 9u32;
+    let mesh = build_tile_local_rtc_mesh_morphed(
+        key,
+        bounds,
+        grid,
+        Some(&elev),
+        key,
+        true,
+        500.0,
+        1,
+        0,
+        SurfaceMorphParams::default(),
+    );
+
+    let n = grid as usize;
+    let top_row_start = (n - 1) * n;
+    let first_pole_pos = mesh.vertices[top_row_start].pos_u;
+    for col in 0..n {
+        let v = mesh.vertices[top_row_start + col];
+        for k in 0..3 {
+            assert!(
+                (v.pos_u[k] - first_pole_pos[k]).abs() < 1e-2,
+                "North Pole row vertices must converge to single apex without hole/notch"
+            );
+            assert!(v.norm_v[k].is_finite(), "North Pole normal must be finite");
+        }
+        assert!(
+            v.norm_v[2] > 0.999,
+            "North Pole apex normal must point along +Z, got {:?}",
+            v.norm_v
+        );
+    }
+    let approx_world_z = mesh.center_ecef[2] + first_pole_pos[2] as f64;
+    let expected_polar_r = 6_356_752.314_2 + 107.5;
+    assert!(
+        (approx_world_z - expected_polar_r).abs() < 25.0,
+        "expected closed polar apex near WGS84 polar radius + pole elev, got z={approx_world_z}"
+    );
+    let _ = TileProjection::WebMercator;
+}
+
+#[test]
+fn morph_2d_to_3d_transition_preserves_closed_north_pole_cap_and_polar_tiles() {
+    use strata_earth::{
+        build_tile_local_rtc_mesh_morphed, stabilized_surface_morph, tile_bounds_mercator,
+        traverse_quadtree_lod_frustum6_with_elevation, EarthCamera, EarthInput, EarthViewMode,
+        EarthViewport, Geodetic, IdleLodParams, MemoryTileSource, TileKey, TileProjection,
+        CANONICAL_2D_MORPH_THRESHOLD, MAX_QUADTREE_LEAVES,
+    };
+
+    // Mid-latitude high-altitude globe camera where North Pole sits on the visible upper limb
+    let cam = EarthCamera {
+        focus: Geodetic::new(35.0, 10.0, 0.0),
+        eye_offset_m: [0.0, 0.0, 12_000_000.0],
+        aim_offset_m: [0.0, 0.0, 0.0],
+        ..EarthCamera::default()
+    };
+
+    // 1. Across every morph step from 2D -> 3D (0.995 down to 0.0), y == 0 polar row tiles must
+    //    fully span [-180°, +180°] with lat1 == 90.0° and zero dropped wedges.
+    for &morph_t in &[0.995f64, 0.85, 0.55, 0.35, 0.12, 0.04, 0.01, 0.0] {
+        let horizon_cull = morph_t <= 1e-4;
+        let leaves = traverse_quadtree_lod_frustum6_with_elevation(
+            &cam,
+            None,
+            1280.0,
+            720.0,
+            2.0,
+            6,
+            17,
+            horizon_cull,
+            MAX_QUADTREE_LEAVES,
+            TileProjection::WebMercator,
+            IdleLodParams::inactive(),
+            0.0,
+            |_| 0.0,
+        );
+        let mut polar_intervals: Vec<(f64, f64)> = leaves
+            .iter()
+            .filter(|k| k.y == 0)
+            .map(|&k| {
+                let b = tile_bounds_mercator(k);
+                assert!(
+                    (b.lat1 - 90.0).abs() < 1e-9,
+                    "polar tile {:?} at morph={} must close to 90°",
+                    k,
+                    morph_t
+                );
+                (b.lon0, b.lon1)
+            })
+            .collect();
+        polar_intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(
+            !polar_intervals.is_empty(),
+            "morph={morph_t} must emit y == 0 polar cap tiles"
+        );
+        assert!(
+            (polar_intervals[0].0 - (-180.0)).abs() < 1e-6,
+            "morph={morph_t} north polar ring must start at -180°, got {:?}",
+            polar_intervals
+        );
+        let mut covered_lon = polar_intervals[0].1;
+        for &(lon0, lon1) in &polar_intervals[1..] {
+            assert!(
+                lon0 <= covered_lon + 1e-6,
+                "morph={morph_t} north polar ring has longitude gap between {covered_lon} and {lon0}"
+            );
+            covered_lon = covered_lon.max(lon1);
+        }
+        assert!(
+            (covered_lon - 180.0).abs() < 1e-6,
+            "morph={morph_t} north polar ring must cover all the way to +180°, got {covered_lon}"
+        );
+    }
+
+    // 2. Across the curved globe morph range (0.0..=0.85, including the ~180ms mid-morph ~0.78),
+    //    every y == 0 tile's north edge must converge to a single watertight north-pole apex
+    //    across all longitudes (no curved horizontal collar or cap hole).
+    for &morph_t in &[0.0f64, 0.02, 0.15, 0.35, 0.55, 0.70, 0.78, 0.85] {
+        let morph = stabilized_surface_morph(
+            cam.focus,
+            morph_t,
+            morph_t,
+            TileProjection::WebMercator,
+        );
+        let grid = 9usize;
+        let mut ref_apex: Option<[f64; 3]> = None;
+        for x in 0..4u32 {
+            let key = TileKey::new(2, x, 0);
+            let bounds = tile_bounds_mercator(key);
+            let mesh = build_tile_local_rtc_mesh_morphed(
+                key,
+                bounds,
+                grid as u32,
+                None,
+                key,
+                true,
+                500.0,
+                1,
+                0,
+                morph,
+            );
+            let top_row = (grid - 1) * grid;
+            for col in 0..grid {
+                let v = mesh.vertices[top_row + col];
+                let world = [
+                    mesh.center_ecef[0] + v.pos_u[0] as f64,
+                    mesh.center_ecef[1] + v.pos_u[1] as f64,
+                    mesh.center_ecef[2] + v.pos_u[2] as f64,
+                ];
+                if let Some(apex) = ref_apex {
+                    let dx = world[0] - apex[0];
+                    let dy = world[1] - apex[1];
+                    let dz = world[2] - apex[2];
+                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                    assert!(
+                        dist < 2.0,
+                        "morph={morph_t} tile {:?} col={col} polar apex diverged by {dist}m (open cap cutout)",
+                        key
+                    );
+                } else {
+                    ref_apex = Some(world);
+                }
+            }
+        }
+    }
+
+    // Once nearly flat (0.95), the polar row smoothly begins opening toward the 2D top edge.
+    {
+        let morph = stabilized_surface_morph(cam.focus, 0.95, 0.95, TileProjection::WebMercator);
+        let key = TileKey::new(2, 0, 0);
+        let bounds = tile_bounds_mercator(key);
+        let grid = 9usize;
+        let mesh = build_tile_local_rtc_mesh_morphed(
+            key,
+            bounds,
+            grid as u32,
+            None,
+            key,
+            true,
+            500.0,
+            1,
+            0,
+            morph,
+        );
+        let top_row = (grid - 1) * grid;
+        let v0 = mesh.vertices[top_row];
+        let v1 = mesh.vertices[top_row + grid - 1];
+        let span = ((v1.pos_u[0] - v0.pos_u[0]) as f64)
+            .hypot((v1.pos_u[1] - v0.pos_u[1]) as f64)
+            .hypot((v1.pos_u[2] - v0.pos_u[2]) as f64);
+        assert!(
+            span > 1_000.0,
+            "morph=0.95 polar top edge must smoothly begin opening toward 2D map width, got {span}m"
+        );
+    }
+
+    // 2b. High-latitude rows south of the exact pole (e.g. 85°N) must taper smoothly by cos(lat)
+    //     rather than flaring sideways to full equatorial/focus width at ~100ms (flat_t ≈ 0.874)
+    //     or mid-morph (0.78, 0.85), and must match project_morphed_point_and_frame exactly.
+    use strata_earth::{project_morphed_point_and_frame, PatchBounds};
+    use strata_render::camera64::DVec3;
+    let eq_span_90deg = 90.0_f64.to_radians() * 6_378_137.0;
+    for &(morph_t, max_ratio) in &[(0.78f64, 0.12f64), (0.85f64, 0.12f64), (0.874f64, 0.22f64)] {
+        let morph = stabilized_surface_morph(
+            Geodetic::new(20.0, 0.0, 0.0),
+            morph_t,
+            morph_t,
+            TileProjection::Geographic4326,
+        );
+        let (p_west, _) = project_morphed_point_and_frame(85.0, -45.0, 0.0, morph);
+        let (p_east, _) = project_morphed_point_and_frame(85.0, 45.0, 0.0, morph);
+        let span_85n = p_east.sub(p_west).length();
+        let ratio = span_85n / eq_span_90deg;
+        assert!(
+            ratio < max_ratio,
+            "morph={morph_t} 85°N 90°-lon span flared to {ratio:.3}x equatorial width (max {max_ratio:.3}x)"
+        );
+
+        // Mesh vertices on a Geographic4326 tile with lat0=80..lat1=90 must match project_morphed_point_and_frame.
+        let key = TileKey::new(2, 2, 0);
+        let bounds = PatchBounds {
+            lat0: 80.0,
+            lat1: 90.0,
+            lon0: 0.0,
+            lon1: 90.0,
+        };
+        let grid = 5usize; // row 2 -> lat = 85.0, col 4 -> lon = 90.0
+        let mesh = build_tile_local_rtc_mesh_morphed(
+            key,
+            bounds,
+            grid as u32,
+            None,
+            key,
+            false,
+            0.0,
+            1,
+            0,
+            morph,
+        );
+        let v = mesh.vertices[2 * grid + 4];
+        let mesh_world = DVec3::new(
+            mesh.center_ecef[0] + v.pos_u[0] as f64,
+            mesh.center_ecef[1] + v.pos_u[1] as f64,
+            mesh.center_ecef[2] + v.pos_u[2] as f64,
+        );
+        let (proj_world, _) = project_morphed_point_and_frame(85.0, 90.0, 0.0, morph);
+        let err_m = mesh_world.sub(proj_world).length();
+        assert!(
+            err_m < 1.0,
+            "morph={morph_t} mesh vs project_morphed_point_and_frame drifted by {err_m}m at 85°N"
+        );
+    }
+
+    // 3. Switching EarthViewport from Mode2D back to Mode3D must drop view_morph below
+    //    CANONICAL_2D_MORPH_THRESHOLD on the very first 120Hz transition step so the worker
+    //    immediately switches off 2D-culled tiles and emits full polar globe tiles.
+    let mut input = EarthInput::globe();
+    input.viewport.width = 1280.0;
+    input.viewport.height = 720.0;
+    input.view_mode = EarthViewMode::Mode2D;
+    input.view_morph = 1.0;
+    let mut vp = EarthViewport::new(&input, Box::new(MemoryTileSource::default()));
+    vp.set_view_mode(EarthViewMode::Mode3D);
+    let stepped = vp.step_transition(1.0 / 120.0);
+    assert!(stepped);
+    assert!(
+        (vp.input().view_morph as f64) < CANONICAL_2D_MORPH_THRESHOLD,
+        "first 2D -> 3D transition step must immediately cross CANONICAL_2D_MORPH_THRESHOLD, got {}",
+        vp.input().view_morph
+    );
+}
+
+#[test]
+fn grazing_pitch_preserves_terrain_relief_lod_and_oblique_mesh_fidelity() {
+    use strata_earth::{
+        traverse_quadtree_lod_frustum6_with_relief, EarthInput, EarthOrbitController, EarthViewMode,
+        IdleLodParams, MemoryTileSource, RetainedTerrainBuilder, TileProjection,
+        MAX_QUADTREE_LEAVES,
+    };
+    use strata_render::camera64::DVec3;
+
+    // Near-ground grazing/horizontal view (~480 m altitude, 82° pitch looking toward mountain horizon).
+    let mut orbit = EarthOrbitController::new();
+    orbit.jump_to(46.5197, 7.9821, 3_500.0, 45.0, 82.0);
+    orbit.set_viewport_size(1440.0, 900.0);
+    let (cam, up_opt) = orbit.to_camera_and_up(false, 0.0);
+    let up_v = up_opt.map(|u| DVec3::new(u[0], u[1], u[2]));
+    let placement = cam.placement_with_up(up_v);
+    let eye = placement.eye;
+    let cam_fwd = placement.aim.sub(eye).normalize();
+
+    let flat_leaves = traverse_quadtree_lod_frustum6_with_relief(
+        &cam,
+        up_v,
+        1440.0,
+        900.0,
+        2.3,
+        18,
+        17,
+        true,
+        MAX_QUADTREE_LEAVES,
+        TileProjection::WebMercator,
+        IdleLodParams::inactive(),
+        false,
+        0.0,
+        |_| 0.0,
+    );
+    let relief_leaves = traverse_quadtree_lod_frustum6_with_relief(
+        &cam,
+        up_v,
+        1440.0,
+        900.0,
+        2.3,
+        18,
+        17,
+        true,
+        MAX_QUADTREE_LEAVES,
+        TileProjection::WebMercator,
+        IdleLodParams::inactive(),
+        true,
+        0.0,
+        |_| 0.0,
+    );
+
+    let gaze_corridor_avg_lvl = |leaves: &[TileKey]| -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for &k in leaves {
+            let b = strata_earth::tile_bounds_mercator(k);
+            let c = geodetic_to_ecef(Geodetic::new(
+                0.5 * (b.lat0 + b.lat1),
+                0.5 * (b.lon0 + b.lon1),
+                0.0,
+            ));
+            let to_c = c.sub(eye);
+            let dist = to_c.length().max(1.0);
+            let gaze = to_c.dot(cam_fwd) / dist;
+            if dist > 2_000.0 && gaze > 0.85 {
+                sum += k.level as f64;
+                count += 1;
+            }
+        }
+        assert!(count > 0, "expected grazing gaze-corridor tiles beyond 2km");
+        sum / count as f64
+    };
+    let max_lvl = |leaves: &[TileKey]| -> u8 { leaves.iter().map(|k| k.level).max().unwrap_or(0) };
+
+    let flat_gaze_avg = gaze_corridor_avg_lvl(&flat_leaves);
+    let relief_gaze_avg = gaze_corridor_avg_lvl(&relief_leaves);
+    let flat_max = max_lvl(&flat_leaves);
+    let relief_max = max_lvl(&relief_leaves);
+    assert!(
+        relief_gaze_avg > flat_gaze_avg + 0.8 && relief_max >= flat_max,
+        "grazing-pitch vertical terrain-relief SSE must select significantly higher LOD along the gaze corridor than flat-imagery foreshortening (flat_gaze_avg={flat_gaze_avg:.2}, relief_gaze_avg={relief_gaze_avg:.2}, flat_max={flat_max}, relief_max={relief_max})"
+    );
+
+    // Pitch-aware mesh grid resolution: oblique gaze-corridor tiles with elevation enabled should
+    // subdivide up to 33x33 even above 420m altitude, whereas a nadir view at the same altitude
+    // stays at base_grid.
+    let mut oblique_input = EarthInput::globe();
+    oblique_input.camera = cam.clone();
+    oblique_input.camera_up_ecef = up_opt;
+    oblique_input.view_mode = EarthViewMode::Mode3D;
+    oblique_input.elevation_enabled = true;
+    oblique_input.tile_grid = 17;
+    let mut source = MemoryTileSource::default();
+    let mut builder = RetainedTerrainBuilder::new();
+    let (oblique_frame, _) = builder.build_frame(&oblique_input, &mut source, 1, true);
+    let oblique_max_verts = oblique_frame
+        .meshes
+        .iter()
+        .map(|m| m.vertices.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        oblique_max_verts >= 33 * 33,
+        "grazing-pitch terrain silhouette tiles along gaze corridor must upgrade mesh grid >= 33x33, got max {oblique_max_verts} verts"
+    );
+
+    let mut nadir_orbit = EarthOrbitController::new();
+    nadir_orbit.jump_to(46.5197, 7.9821, 2_000.0, 0.0, 0.0);
+    nadir_orbit.set_viewport_size(1440.0, 900.0);
+    let (nadir_cam, nadir_up) = nadir_orbit.to_camera_and_up(false, 0.0);
+    let mut nadir_input = EarthInput::globe();
+    nadir_input.camera = nadir_cam;
+    nadir_input.camera_up_ecef = nadir_up;
+    nadir_input.view_mode = EarthViewMode::Mode3D;
+    nadir_input.elevation_enabled = true;
+    nadir_input.tile_grid = 17;
+    let mut nadir_builder = RetainedTerrainBuilder::new();
+    let (nadir_frame, _) = nadir_builder.build_frame(&nadir_input, &mut source, 1, true);
+    let nadir_max_verts = nadir_frame
+        .meshes
+        .iter()
+        .map(|m| m.vertices.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        nadir_max_verts < 33 * 33,
+        "nadir view above 420m should stay at base_grid without oblique 33x33 expansion, got max {nadir_max_verts} verts"
+    );
+}
+
+
 
 
 

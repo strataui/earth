@@ -631,3 +631,47 @@ fn close_ground_below_50m_sharpened_lod_and_runtime_set_seamless_25d_toggle() {
     assert!(f_re_enabled.camera.local_25d_blend > 0.95);
 }
 
+#[test]
+fn ocean_pan_zoom_determinism_and_mountain_close_ground_near_plane_clamping() {
+    // 1. Over Hawaii coastal water at 130m..600m range: coastal SDF keeps stable 128x128 2048m tier
+    let mut input = input_at(21.27, -157.83, 130.0);
+    input.ocean_waves = OceanWavesConfig::enabled().with_coastal_shoaling(true);
+    let mut vp = EarthViewport::new(&input, Box::new(MemoryTileSource::default()));
+    vp.sync_now();
+    let f0 = vp.retained_scene().snapshot_terrain().expect("close coastal ocean");
+    let oc0 = f0.ocean.as_ref().expect("ocean active at 130m");
+    assert!(
+        oc0.world_origin_merc_m[0].abs() > 1_000_000.0
+            && oc0.world_origin_merc_m[1].abs() > 1_000_000.0,
+        "world_origin_merc_m must encode global Mercator metres for invariant wave phase"
+    );
+    assert!(oc0.east_scale > 0.85 && oc0.east_scale < 1.0);
+    assert_eq!(oc0.sdf_half_span_m, 2_048.0);
+    if let Some(ref sdf) = oc0.coastal_sdf {
+        assert_eq!(sdf.width, 128);
+        assert_eq!(sdf.height, 128);
+    }
+
+    // Zooming from 130m -> 600m keeps exact same 2048m SDF tier without re-rasterizing or resizing
+    let mut cam600 = input.camera;
+    cam600.eye_offset_m = [0.0, 0.0, 600.0];
+    vp.update_camera(&cam600, 1280.0, 720.0);
+    let f1 = vp.retained_scene().snapshot_terrain().expect("600m coastal ocean");
+    let oc1 = f1.ocean.as_ref().expect("ocean at 600m");
+    assert_eq!(oc1.sdf_half_span_m, 2_048.0);
+
+    // 2. Oblique mountain close-up at 2500m elevation must keep near plane tight (<= 3.0m)
+    let mut ctrl = strata_earth::EarthOrbitController::new();
+    ctrl.jump_to(45.83, 6.86, 1_000.0, 0.0, 82.0);
+    let (cam, up_opt) = ctrl.to_camera_and_up_clamped(false, |_, _| 2_500.0);
+    let placement = cam.placement_with_up(up_opt.map(|[x, y, z]| {
+        strata_render::camera64::DVec3::new(x, y, z)
+    }));
+    assert!(
+        placement.near_m <= 3.0,
+        "high-elevation tilted camera near ground must keep near_m tight (got {})",
+        placement.near_m
+    );
+}
+
+

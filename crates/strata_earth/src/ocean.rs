@@ -485,29 +485,45 @@ impl EarthPlugin for OceanWavesPlugin {
             ctx.low_level.map_2d_morph as f64,
             ctx.input.tile_projection,
         );
-        // Quantize ocean RTE origin to ~0.05 deg cells (~5 km) so wave spatial phase never drifts
-        // during panning and stays well inside f32 precision across 3D, 2.5D, and 2D morphs.
+        // Quantize ocean RTE origin to ~0.05 deg cells (~5.5 km) while passing exact conformal world
+        // Mercator coordinates so GPU wave phases & noise never jump across origin cells or zoom.
         let q_lat = (focus.lat_deg * 20.0).round() / 20.0;
         let q_lon = wrap_longitude((focus.lon_deg * 20.0).round() / 20.0);
         let (origin_ecef, frame) =
             crate::geodesy::project_morphed_point_and_frame(q_lat, q_lon, 0.0, morph);
-        let cos_lat = q_lat.to_radians().cos().abs().max(0.20);
+        let q_lat_rad = q_lat.clamp(-84.9, 84.9).to_radians();
+        let q_lon_rad = q_lon.to_radians();
+        let wx_origin_m = wgs84::A * q_lon_rad;
+        let wy_origin_m =
+            wgs84::A * (std::f64::consts::FRAC_PI_4 + q_lat_rad * 0.5).tan().ln();
+        let cos_focus = morph.focus.lat_deg.to_radians().cos().abs().max(0.25);
+        let cos_scale_25d = cos_focus + (1.0 - cos_focus) * morph.map_2d_morph.clamp(0.0, 1.0);
+        let cos_lat = q_lat_rad.cos().abs().max(0.20);
+        let east_scale = ((1.0 - flat_t) * cos_lat + flat_t * cos_scale_25d) as f32;
 
         let dist_to_focus = ctx.input.camera.eye_distance_m().max(alt_m);
         let shoaling_range_m = cfg.shoaling_range_m.clamp(40.0, 2_000.0);
 
         let mut coastal_sdf = None;
-        let mut sdf_half_span_m = (dist_to_focus * 2.2).clamp(600.0, 18_000.0) as f32;
+        let raw_span = dist_to_focus * 2.4;
+        let mut sdf_half_span_m = if raw_span <= 2_048.0 {
+            2_048.0f32
+        } else if raw_span <= 6_144.0 {
+            6_144.0f32
+        } else {
+            16_384.0f32
+        };
         let mut sdf_center_en_m = [0.0f32, 0.0f32];
 
         // Opt-in coastal shoreline SDF texture (zero CPU cost when `coastal_shoaling == false`!).
         if cfg.coastal_shoaling && alt_m < 45_000.0 {
             let res = COASTAL_SDF_RES as usize;
-            // Quantize SDF window center & span so scrolling smoothly reuses cached SDF without rebuilding every frame.
-            let span_q = ((sdf_half_span_m.ln() * 4.0).round() / 4.0).exp().clamp(600.0, 18_000.0);
+            // Coarse world-locked SDF tiers prevent zoom/pan shoreline popping across a bay/coastline.
+            let span_q = sdf_half_span_m;
             let step_deg_lat = ((span_q as f64 * 0.25) / wgs84::A).to_degrees().max(1e-4);
-            let step_deg_lon = (step_deg_lat / cos_lat).max(1e-4);
             let c_lat = (focus.lat_deg / step_deg_lat).round() * step_deg_lat;
+            let c_cos = c_lat.to_radians().cos().abs().max(0.20);
+            let step_deg_lon = (step_deg_lat / c_cos).max(1e-4);
             let c_lon = wrap_longitude((focus.lon_deg / step_deg_lon).round() * step_deg_lon);
 
             let sig = {
@@ -611,12 +627,12 @@ impl EarthPlugin for OceanWavesPlugin {
                 sdf_center_en_m = [rel_e as f32, rel_c.dot(frame.north) as f32];
                 sdf_half_span_m = self.cached_sdf_half_span_m;
                 coastal_sdf = self.cached_sdf_tex.clone();
-            } else {
-                // Confirmed 100% inland within the SDF patch -> skip GPU ocean shading cleanly.
-                return None;
             }
-        } else {
-            // Fast 5-point inland rejection check when coastal SDF is off (saves fragment work over Denver/Sahara).
+        }
+
+        if coastal_sdf.is_none() {
+            // Fast 5-point inland rejection check when coastal SDF is off or local focus is on a
+            // coastal hill looking out at the sea (saves fragment work over Denver/Sahara).
             // Use >= 0.28 deg span (>1.5 texels of the 2048x1024 global land mask) plus loaded imagery
             // so coastal beaches, bays (SF Bay), and narrow straits (Bosphorus) are never misclassified as inland.
             let span_deg = ((dist_to_focus * 2.5) / wgs84::A)
@@ -680,6 +696,9 @@ impl EarthPlugin for OceanWavesPlugin {
             sdf_half_span_m,
             sdf_center_en_m,
             coastal_sdf,
+            world_origin_merc_m: [wx_origin_m, wy_origin_m],
+            origin_lat_rad: q_lat_rad as f32,
+            east_scale,
         })
     }
 

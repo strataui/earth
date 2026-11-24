@@ -213,6 +213,11 @@ fn earth_viewport_non_blocking_camera_update_and_ancestor_fallback() {
 fn earth_scene_build_retained_fast_path_1000_frames_quadtree_and_flat() {
     // 1. Synchronous EarthScene::build_retained fast path in QuadtreeLod.
     let mut input = quadtree_input(37.7749, -122.4194, 15_000.0);
+    // Keep the 1,000-frame synchronous geometry-stability benchmark independent of async
+    // background cloud/skybox/satellite worker completions when STRATA_EARTH_OFFLINE is unset.
+    input.layers.clouds = false;
+    input.space.stars_visible = false;
+    input.space.satellites_visible = false;
     let leaves = traverse_quadtree_lod_frustum6(
         &input.camera,
         1440.0,
@@ -831,5 +836,214 @@ fn frame_zero_bootstrap_populates_root_tile_and_procedural_skybox_synchronously(
         .expect("build_retained after Frame-0 bootstrap must publish full LOD frame");
     assert!(upgraded.instances.len() >= 1);
 }
+
+#[test]
+fn earth_quality_preset_matrix_roundtrip_and_custom_detection() {
+    use strata_earth::{
+        CloudMapResolution, EarthInput, EarthQualityPreset, EarthRenderQuality, SpaceSkyboxQuality,
+    };
+
+    // 1. Canonical preset cycling, parsing, and display labels
+    assert_eq!(EarthQualityPreset::Low.next_canonical(), EarthQualityPreset::Medium);
+    assert_eq!(EarthQualityPreset::Medium.next_canonical(), EarthQualityPreset::High);
+    assert_eq!(EarthQualityPreset::High.next_canonical(), EarthQualityPreset::Ultra);
+    assert_eq!(EarthQualityPreset::Ultra.next_canonical(), EarthQualityPreset::Low);
+    assert_eq!(EarthQualityPreset::Custom.next_canonical(), EarthQualityPreset::Low);
+
+    assert_eq!(EarthQualityPreset::from_str_loose("LOW"), Some(EarthQualityPreset::Low));
+    assert_eq!(EarthQualityPreset::from_str_loose("med"), Some(EarthQualityPreset::Medium));
+    assert_eq!(EarthQualityPreset::from_str_loose("high"), Some(EarthQualityPreset::High));
+    assert_eq!(EarthQualityPreset::from_str_loose("Ultra"), Some(EarthQualityPreset::Ultra));
+    assert_eq!(EarthQualityPreset::from_str_loose("custom"), Some(EarthQualityPreset::Custom));
+    assert_eq!(EarthQualityPreset::from_str_loose("unknown"), None);
+
+    // 2. Every canonical preset round-trips cleanly through EarthInput
+    for preset in EarthQualityPreset::ALL_CANONICAL {
+        let q = EarthRenderQuality::from_preset(preset);
+        assert_eq!(q.matching_preset(), preset);
+
+        let input = EarthInput::globe().with_quality_preset(preset);
+        assert_eq!(input.quality_preset(), preset);
+        assert_eq!(input.render_quality(), q);
+    }
+
+    // 3. Tolerance check on sse_threshold (<= 1e-3 still matches; > 1e-3 becomes Custom)
+    let mut near = EarthRenderQuality::from_preset(EarthQualityPreset::High);
+    near.sse_threshold += 5e-4;
+    assert_eq!(near.matching_preset(), EarthQualityPreset::High);
+    near.sse_threshold += 2e-3;
+    assert_eq!(near.matching_preset(), EarthQualityPreset::Custom);
+
+    // 4. Exhaustive single-field mutation test: mutating ANY of the 12 quality fields yields Custom
+    let base = EarthRenderQuality::from_preset(EarthQualityPreset::High);
+    let mutations: [(&str, fn(&mut EarthRenderQuality)); 12] = [
+        ("tile_grid", |q| q.tile_grid = 21),
+        ("sse_threshold", |q| q.sse_threshold = 2.0),
+        ("max_tile_level", |q| q.max_tile_level = 17),
+        ("realistic_sky_25d", |q| q.realistic_sky_25d = false),
+        ("terrain_lighting_25d", |q| q.terrain_lighting_25d = false),
+        ("terrain_shadows", |q| q.terrain_shadows = false),
+        ("shadow_map_size", |q| q.shadow_map_size = 1024),
+        ("skybox_quality", |q| q.skybox_quality = SpaceSkyboxQuality::Low),
+        ("cloud_resolution", |q| q.cloud_resolution = CloudMapResolution::Low),
+        ("ocean_coastal_shoaling", |q| q.ocean_coastal_shoaling = false),
+        ("idle_high_res", |q| q.idle_high_res = true),
+        ("idle_extra_leaf_budget", |q| q.idle_extra_leaf_budget = 256),
+    ];
+    for (field, mutate) in mutations {
+        let mut q = base;
+        mutate(&mut q);
+        assert_eq!(
+            q.matching_preset(),
+            EarthQualityPreset::Custom,
+            "Mutating `{field}` must immediately report EarthQualityPreset::Custom"
+        );
+    }
+}
+
+#[test]
+fn earth_viewport_live_quality_preset_and_individual_setter_custom_tracking() {
+    use strata_earth::{
+        CloudMapResolution, EarthInput, EarthQualityPreset, EarthRenderQuality, EarthViewport,
+        MemoryTileSource, SpaceSkyboxQuality,
+    };
+
+    let input = EarthInput::globe().with_quality_preset(EarthQualityPreset::High);
+    let mut vp = EarthViewport::new(&input, Box::new(MemoryTileSource::new()));
+
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::High);
+    assert_eq!(vp.tile_grid(), 25);
+    assert!((vp.sse_threshold() - 2.3).abs() < 1e-6);
+    assert_eq!(vp.max_tile_level(), 18);
+
+    // Cycle Ultra -> Low -> Medium -> High live
+    vp.set_quality_preset(EarthQualityPreset::Ultra);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Ultra);
+    assert_eq!(vp.tile_grid(), 33);
+    assert_eq!(vp.local_atmosphere_config().shadow_map_size, 4096);
+    assert_eq!(vp.space_config().skybox_quality, SpaceSkyboxQuality::Ultra);
+    assert_eq!(vp.weather_config().cloud_resolution, CloudMapResolution::Ultra);
+    assert!(vp.idle_high_res_config().enabled);
+
+    vp.set_quality_preset(EarthQualityPreset::Low);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Low);
+    assert_eq!(vp.tile_grid(), 13);
+    assert!(!vp.local_atmosphere_config().terrain_shadows);
+    assert!(!vp.local_atmosphere_config().realistic_sky);
+    assert!(!vp.ocean_waves_config().coastal_shoaling);
+
+    vp.set_quality_preset(EarthQualityPreset::High);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::High);
+
+    // Individual setters automatically diverge into Custom and recover when reverted
+    vp.set_idle_high_res_enabled(true);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Custom);
+    vp.set_idle_high_res_enabled(false);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::High);
+
+    let mut atmo = vp.local_atmosphere_config().clone();
+    atmo.terrain_shadows = false;
+    vp.set_local_atmosphere_config(atmo);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Custom);
+
+    let mut custom_q = EarthRenderQuality::from_preset(EarthQualityPreset::Medium);
+    custom_q.tile_grid = 29;
+    vp.set_render_quality(custom_q);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Custom);
+    assert_eq!(vp.tile_grid(), 29);
+
+    vp.set_tile_grid(17);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Medium);
+
+    vp.set_sse_threshold(1.9);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Custom);
+    vp.set_sse_threshold(2.7);
+    assert_eq!(vp.quality_preset(), EarthQualityPreset::Medium);
+}
+
+#[cfg(feature = "widget")]
+#[test]
+fn earth_view_live_quality_preset_and_custom_detection() {
+    use strata_earth::{EarthInput, EarthQualityPreset, EarthView, MemoryTileSource};
+
+    let input = EarthInput::globe().with_quality_preset(EarthQualityPreset::High);
+    let view = EarthView::new(&input, Box::new(MemoryTileSource::new()));
+    assert_eq!(view.quality_preset(), EarthQualityPreset::High);
+
+    view.set_quality_preset(EarthQualityPreset::Ultra);
+    assert_eq!(view.quality_preset(), EarthQualityPreset::Ultra);
+    assert_eq!(view.render_quality().shadow_map_size, 4096);
+
+    view.set_idle_high_res_enabled(false);
+    assert_eq!(view.quality_preset(), EarthQualityPreset::Custom);
+
+    view.set_quality_preset(EarthQualityPreset::Medium);
+    assert_eq!(view.quality_preset(), EarthQualityPreset::Medium);
+}
+
+#[test]
+fn earth_viewport_center_on_coordinates_updates_camera_focus_and_range() {
+    use strata_earth::{EarthInput, EarthViewport, MemoryTileSource};
+
+    let input = EarthInput::globe();
+    let mut vp = EarthViewport::new(&input, Box::new(MemoryTileSource::new()));
+    vp.center_on_coordinates(37.7749, -122.4194, Some(22_000.0));
+    let cam = vp.input().camera;
+    assert!((cam.focus.lat_deg - 37.7749).abs() < 1e-6);
+    assert!((cam.focus.lon_deg - (-122.4194)).abs() < 1e-6);
+    let [ex, ey, ez] = cam.eye_offset_m;
+    let dist = (ex * ex + ey * ey + ez * ez).sqrt();
+    assert!((dist - 22_000.0).abs() < 1e-3);
+}
+
+#[cfg(feature = "widget")]
+#[test]
+fn earth_view_center_on_host_location_async_centers_without_blocking_frame_zero() {
+    use strata_device::{DeviceMockController, GeolocationSource};
+    use strata_earth::{EarthInput, EarthView, MemoryTileSource};
+
+    let mock = DeviceMockController::new();
+    mock.reset_to_defaults();
+    mock.set_coordinates(41.0082, 28.9784, Some(40.0), 8.0);
+
+    let input = EarthInput::globe();
+    let view = EarthView::new(&input, Box::new(MemoryTileSource::new()));
+
+    // Direct coordinate centering
+    view.center_on_coordinates(35.6762, 139.6503, Some(60_000.0));
+    let cam0 = view.camera_state();
+    assert!((cam0.lat_deg - 35.6762).abs() < 1e-5);
+    assert!((cam0.lon_deg - 139.6503).abs() < 1e-5);
+
+    // Non-blocking startup host location probe centers camera when resolved during step_frame
+    let t0 = std::time::Instant::now();
+    view.center_on_host_location_async(Some(25_000.0), false);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(50),
+        "center_on_host_location_async must never block startup frame 0"
+    );
+
+    let mut resolved = false;
+    for _ in 0..80 {
+        let _ = view.step_frame(1.0 / 60.0);
+        if let Some(fix) = view.last_host_location() {
+            assert_eq!(fix.source, GeolocationSource::MockOverride);
+            assert!((fix.latitude - 41.0082).abs() < 1e-5);
+            assert!((fix.longitude - 28.9784).abs() < 1e-5);
+            resolved = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(resolved, "Async host location fix must resolve and apply in step_frame");
+
+    let cam1 = view.camera_state();
+    assert!((cam1.lat_deg - 41.0082).abs() < 1e-4);
+    assert!((cam1.lon_deg - 28.9784).abs() < 1e-4);
+    assert!((cam1.range_m - 25_000.0).abs() < 10.0);
+
+    mock.reset_to_defaults();
+}
+
 
 

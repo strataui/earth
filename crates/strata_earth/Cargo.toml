@@ -18,13 +18,14 @@ path = "src/lib.rs"
 
 [features]
 default = []
-widget = ["dep:strata-ui"]
+widget = ["dep:strata-ui", "dep:strata-device"]
 
 [dependencies]
 strata-primitives = { workspace = true }
 strata-style = { workspace = true }
 strata-layout = { workspace = true }
 strata-render = { workspace = true }
+strata-device = { workspace = true, optional = true }
 strata-ui = { workspace = true, optional = true }
 flate2 = "1.0"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }

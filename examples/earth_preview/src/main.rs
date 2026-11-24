@@ -11,11 +11,19 @@ use strata::WindowConfig;
 use strata::{launch_with_frame, AppFrameInfo, FrameOutcome};
 use strata_earth::{
     AtmosphereSample, BaseWeatherConfig, Color, EarthDefaultTileSource, EarthGeometry, EarthInput,
-    EarthMaterial, EarthObject, EarthOrbitController, EarthView, EarthViewMode, GeoPosition,
-    LocalAtmosphereConfig, LocalFrame, OceanWavesConfig, PrecipitationConfig, PrecipitationMode,
-    SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig, WeatherSnapshot,
-    WindVector, LOCAL_TRANSITION_RANGE_M,
+    EarthMaterial, EarthObject, EarthOrbitController, EarthQualityPreset, EarthView, EarthViewMode,
+    GeoPosition, LocalAtmosphereConfig, LocalFrame, OceanWavesConfig, PrecipitationConfig,
+    PrecipitationMode, SpaceEnvironmentConfig, SunDirectionMode, TileProviderPreset, WeatherConfig,
+    WeatherSnapshot, WindVector, LOCAL_TRANSITION_RANGE_M,
 };
+
+fn resolve_initial_quality_preset() -> EarthQualityPreset {
+    std::env::var("STRATA_EARTH_QUALITY")
+        .ok()
+        .and_then(|v| EarthQualityPreset::from_str_loose(&v))
+        .filter(|&p| p != EarthQualityPreset::Custom)
+        .unwrap_or(EarthQualityPreset::High)
+}
 
 /// Example-local continuous exponential zoom rate (natural-log range units per second) for `K` / `L`.
 const PREVIEW_KEY_ZOOM_LN_PER_SEC: f64 = 1.95;
@@ -388,6 +396,7 @@ fn main() -> Result<(), String> {
     input.local_atmosphere = LocalAtmosphereConfig::realistic();
     input.base_weather = BaseWeatherConfig::default().enabled().with_wind(7.0, 90.0);
     input.weather = WeatherConfig::default();
+    input.set_quality_preset(resolve_initial_quality_preset());
 
     let mut initial_sun_mode = SunDemoMode::SystemClock;
     let mut initial_wind_preset = WindPreset::BreezeEast;
@@ -515,6 +524,11 @@ fn main() -> Result<(), String> {
     }
 
     let earth = EarthView::with_orbit(&input, Box::new(source), orbit);
+    if std::env::var_os("STRATA_EARTH_CENTER_ON_HOST").is_some()
+        && std::env::var_os("STRATA_EARTH_DEMO_PRESET").is_none()
+    {
+        earth.center_on_host_location_async(Some(45_000.0), true);
+    }
     let held_zoom = Rc::new(RefCell::new(PreviewHeldZoom::default()));
     wire_preview_zoom_keys(&earth, &held_zoom);
 
@@ -582,22 +596,36 @@ fn main() -> Result<(), String> {
     let fly_idx_for_view = Rc::clone(&fly_target_idx);
 
     let build_root = move || -> View {
-        let (is_2d, at_local_25d, is_flying, sp, la, elev_on, labels_on, w, precip, idle_hi_res_on) =
-            earth_for_view.with_state(|st| {
-                let inp = st.viewport.input();
-                (
-                    st.viewport.view_mode() == EarthViewMode::Mode2D,
-                    st.orbit.range_m < LOCAL_TRANSITION_RANGE_M,
-                    st.orbit.is_flying(),
-                    inp.space.clone(),
-                    inp.local_atmosphere.clone(),
-                    inp.elevation_enabled,
-                    inp.layers.labels,
-                    inp.weather.clone(),
-                    inp.precipitation.clone(),
-                    inp.idle_high_res.enabled,
-                )
-            });
+        let (
+            is_2d,
+            at_local_25d,
+            is_flying,
+            sp,
+            la,
+            elev_on,
+            labels_on,
+            w,
+            precip,
+            idle_hi_res_on,
+            cur_quality,
+            ocean_cfg_live,
+        ) = earth_for_view.with_state(|st| {
+            let inp = st.viewport.input();
+            (
+                st.viewport.view_mode() == EarthViewMode::Mode2D,
+                st.orbit.range_m < LOCAL_TRANSITION_RANGE_M,
+                st.orbit.is_flying(),
+                inp.space.clone(),
+                inp.local_atmosphere.clone(),
+                inp.elevation_enabled,
+                inp.layers.labels,
+                inp.weather.clone(),
+                inp.precipitation.clone(),
+                inp.idle_high_res.enabled,
+                st.viewport.quality_preset(),
+                inp.ocean_waves.clone(),
+            )
+        });
         let cur_place_on = click_place_on.get();
         let cur_placed_count = placed_count.get();
         let cur_ray_status = last_ray_status.get();
@@ -605,10 +633,27 @@ fn main() -> Result<(), String> {
         let cur_preset = *preset_for_view.borrow();
         let cur_temp_preset = *temp_for_view.borrow();
         let cur_wind_preset = *wind_for_view.borrow();
-        let cur_ocean_preset = *ocean_for_view.borrow();
+        let cur_ocean_preset = if !ocean_cfg_live.enabled {
+            OceanPreset::Off
+        } else if ocean_cfg_live.coastal_shoaling {
+            OceanPreset::CoastalSurf
+        } else {
+            OceanPreset::OpenSea
+        };
+        *ocean_for_view.borrow_mut() = cur_ocean_preset;
         let (cur_fps, cur_ms) = *fps_for_view.borrow();
         let cur_atmo_status = atmo_for_view.borrow().clone();
         let next_landmark = FLY_LANDMARKS[*fly_idx_for_view.borrow() % FLY_LANDMARKS.len()];
+
+        let e_qual = earth_for_view.clone();
+        let btn_quality = control_btn(
+            format!("Quality: {}", cur_quality.label()),
+            cur_quality == EarthQualityPreset::Ultra || cur_quality == EarthQualityPreset::Custom,
+            move |_| {
+                let next = e_qual.quality_preset().next_canonical();
+                e_qual.set_quality_preset(next);
+            },
+        );
 
         let e1 = earth_for_view.clone();
         let btn_mode = control_btn(
@@ -661,6 +706,12 @@ fn main() -> Result<(), String> {
                 e_fly.fly_to(lat, lon, None);
             },
         );
+
+        let e_loc = earth_for_view.clone();
+        let loc_active = earth_for_view.last_host_location().is_some();
+        let btn_locate = control_btn("Locate Me".to_string(), loc_active, move |_| {
+            e_loc.fly_to_host_location_async(Some(18_000.0), true);
+        });
 
         let place_toggle_sig = click_place_on.clone();
         let btn_place = control_btn(
@@ -1052,10 +1103,12 @@ fn main() -> Result<(), String> {
                     data-earth-controls="true"
                     class="absolute top-3 right-3 z-20 flex flex-wrap justify-end gap-1.5 max-w-[520px] p-2 rounded-xl bg-neutral-950/85 border border-neutral-800/85"
                 >
+                    {btn_quality}
                     {btn_mode}
                     {btn_provider}
                     {btn_view}
                     {btn_fly}
+                    {btn_locate}
                     {btn_place}
                     {btn_clear}
                     {btn_sky_25d}
@@ -1350,5 +1403,62 @@ mod tests {
         let p = cam.placement_with_up(up_opt.map(|u| DVec3::new(u[0], u[1], u[2])));
         let eye_geo = ecef_to_geodetic(p.eye);
         assert!(eye_geo.height_m >= 4_200.0 + 24.5);
+    }
+
+    #[test]
+    fn quality_preset_hud_cycling_and_custom_divergence_reflection() {
+        use strata_earth::{EarthQualityPreset, SpaceSkyboxQuality};
+
+        let input = EarthInput::globe().with_quality_preset(EarthQualityPreset::High);
+        let earth = EarthView::new(&input, Box::new(EarthDefaultTileSource::offline_basemap()));
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::High);
+
+        // Cycle High -> Ultra -> Low -> Medium -> High via next_canonical()
+        let seq = [
+            EarthQualityPreset::Ultra,
+            EarthQualityPreset::Low,
+            EarthQualityPreset::Medium,
+            EarthQualityPreset::High,
+        ];
+        for expected in seq {
+            let next = earth.quality_preset().next_canonical();
+            assert_eq!(next, expected);
+            earth.set_quality_preset(next);
+            assert_eq!(earth.quality_preset(), expected);
+        }
+
+        // 1. Toggle 2.5D Sky off -> immediately reports Custom
+        let mut la = earth.local_atmosphere_config();
+        la.realistic_sky = false;
+        earth.set_local_atmosphere_config(la);
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::Custom);
+
+        // Snap back via canonical preset
+        earth.set_quality_preset(EarthQualityPreset::High);
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::High);
+
+        // 2. Toggle Shadows off -> Custom
+        let mut la2 = earth.local_atmosphere_config();
+        la2.terrain_shadows = false;
+        earth.set_local_atmosphere_config(la2);
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::Custom);
+
+        earth.set_quality_preset(EarthQualityPreset::High);
+
+        // 3. Change Skybox resolution -> Custom
+        let mut sp = earth.space_config();
+        sp.skybox_quality = SpaceSkyboxQuality::Low;
+        earth.set_space_config(sp);
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::Custom);
+
+        earth.set_quality_preset(EarthQualityPreset::High);
+
+        // 4. Toggle Idle Hi-Res -> Custom, then next_canonical() snaps cleanly back to Low
+        earth.set_idle_high_res_enabled(true);
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::Custom);
+        let snapped = earth.quality_preset().next_canonical();
+        assert_eq!(snapped, EarthQualityPreset::Low);
+        earth.set_quality_preset(snapped);
+        assert_eq!(earth.quality_preset(), EarthQualityPreset::Low);
     }
 }

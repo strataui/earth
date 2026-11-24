@@ -2,10 +2,10 @@
 
 use crate::astro::{build_environment_assets_with_skybox, GlobalCloudMapStore};
 use crate::geodesy::{
-    build_tile_local_rtc_mesh_morphed, is_canonical_2d_morph, level_for_altitude,
+    build_tile_local_rtc_mesh_morphed, geodetic_to_ecef, is_canonical_2d_morph, level_for_altitude,
     retained_camera_uniforms_for_morph, screen_to_ray_for_morph, stabilized_surface_morph,
     tile_bounding_sphere, tile_bounds, tile_bounds_mercator, traverse_quadtree_lod_2d_flat,
-    traverse_quadtree_lod_frustum6_with_elevation, wgs84, EarthCamera, Frustum6, Geodetic,
+    traverse_quadtree_lod_frustum6_with_relief, wgs84, EarthCamera, Frustum6, Geodetic,
     LocalFrame, PatchBounds, SurfaceMorphParams, TileKey, TileProjection,
     CANONICAL_2D_MORPH_THRESHOLD, MAX_QUADTREE_LEAVES,
 };
@@ -632,7 +632,6 @@ impl RetainedTerrainBuilder {
         }
         let morph_flat_t = ll.local_25d_blend.max(ll.map_2d_morph).clamp(0.0, 1.0);
         let lighting_25d = (ll.local_25d_blend * (1.0 - ll.map_2d_morph)).clamp(0.0, 1.0);
-        let in_2d_hide = map_t > 0.05;
         let mut bg = sky_gradient(input.daylight);
         if map_t > 1e-4 {
             let k = (1.0 - map_t as f32).clamp(0.0, 1.0);
@@ -651,10 +650,27 @@ impl RetainedTerrainBuilder {
         }
         let sun_color = [1.0, 0.97, 0.92];
         let ambient_color = [0.16, 0.19, 0.24];
-        let up_override = if in_2d_hide {
+        let up_override = if is_canonical_2d_morph(map_t) {
             None
         } else {
-            input.camera_up_ecef.map(|u| DVec3::new(u[0], u[1], u[2]))
+            input.camera_up_ecef.map(|u| {
+                let u0 = DVec3::new(u[0], u[1], u[2]);
+                if map_t > 1e-4 {
+                    let target_north = LocalFrame::at(cam.focus.lat_deg, cam.focus.lon_deg).north;
+                    let blended = DVec3::new(
+                        u0.x + (target_north.x - u0.x) * map_t,
+                        u0.y + (target_north.y - u0.y) * map_t,
+                        u0.z + (target_north.z - u0.z) * map_t,
+                    );
+                    if blended.length() > 1e-6 {
+                        blended.normalize()
+                    } else {
+                        target_north
+                    }
+                } else {
+                    u0
+                }
+            })
         };
         let morph = stabilized_morph_params(
             cam.focus,
@@ -1655,29 +1671,58 @@ impl RetainedTerrainBuilder {
         (Some(env), sat_elements)
     }
 
-fn close_ground_leaf_grid(
-    base_grid: u32,
-    is_flat_2d: bool,
-    eye_alt_m: f64,
-    focus_lat_deg: f64,
-    focus_lon_deg: f64,
-    bounds: PatchBounds,
-) -> u32 {
-    if is_flat_2d || eye_alt_m >= 160.0 {
-        return base_grid;
+    #[allow(clippy::too_many_arguments)]
+    fn close_ground_leaf_grid(
+        base_grid: u32,
+        is_flat_2d: bool,
+        elevation_enabled: bool,
+        eye_alt_m: f64,
+        eye_ecef: DVec3,
+        cam_forward: DVec3,
+        focus_lat_deg: f64,
+        focus_lon_deg: f64,
+        bounds: PatchBounds,
+    ) -> u32 {
+        if is_flat_2d {
+            return base_grid;
+        }
+        let mut target_grid = base_grid;
+        if eye_alt_m < 420.0 {
+            let clamped_lat = focus_lat_deg.clamp(bounds.lat0, bounds.lat1);
+            let clamped_lon = focus_lon_deg.clamp(bounds.lon0, bounds.lon1);
+            let dlat_m = (clamped_lat - focus_lat_deg) * 111_320.0;
+            let dlon_m = crate::geodesy::wrap_longitude(clamped_lon - focus_lon_deg)
+                * 111_320.0
+                * focus_lat_deg.to_radians().cos().abs().max(0.15);
+            let dist_m = dlat_m.hypot(dlon_m);
+            if eye_alt_m < 95.0 && dist_m < 380.0 {
+                target_grid = target_grid.max(33);
+            } else if dist_m < 780.0 {
+                target_grid = target_grid.max(25);
+            }
+        }
+        if elevation_enabled && (eye_alt_m < 420.0 || (base_grid >= 17 && eye_alt_m < 18_000.0)) {
+            let mid_lat = 0.5 * (bounds.lat0 + bounds.lat1);
+            let mid_lon = 0.5 * (bounds.lon0 + bounds.lon1);
+            let tile_center = geodetic_to_ecef(Geodetic::new(mid_lat, mid_lon, 0.0));
+            let to_tile = tile_center.sub(eye_ecef);
+            let dist = to_tile.length().max(1.0);
+            let surf_up = tile_center.scale(1.0 / tile_center.length().max(1.0));
+            let cos_inc = (-to_tile.dot(surf_up) / dist).clamp(0.0, 1.0);
+            let sin_inc = (1.0 - cos_inc * cos_inc).max(0.0).sqrt();
+            let gaze_cos = (to_tile.dot(cam_forward) / dist).clamp(0.0, 1.0);
+            // Oblique/grazing terrain silhouettes along the gaze corridor need dense DEM vertex
+            // sampling to keep ridges and slopes crisp; steep nadir views stay at `base_grid`.
+            let near_horizon_cap = (eye_alt_m * 12.0).clamp(2_400.0, 18_000.0);
+            let mid_horizon_cap = (eye_alt_m * 20.0).clamp(3_500.0, 32_000.0);
+            if sin_inc > 0.78 && gaze_cos > 0.85 && dist < near_horizon_cap {
+                target_grid = target_grid.max(33);
+            } else if sin_inc > 0.55 && gaze_cos > 0.72 && dist < mid_horizon_cap {
+                target_grid = target_grid.max(25);
+            }
+        }
+        target_grid
     }
-    let clamped_lat = focus_lat_deg.clamp(bounds.lat0, bounds.lat1);
-    let clamped_lon = focus_lon_deg.clamp(bounds.lon0, bounds.lon1);
-    let dlat_m = (clamped_lat - focus_lat_deg) * 111_320.0;
-    let dlon_m = crate::geodesy::wrap_longitude(clamped_lon - focus_lon_deg)
-        * 111_320.0
-        * focus_lat_deg.to_radians().cos().abs().max(0.15);
-    if dlat_m.hypot(dlon_m) < 420.0 {
-        base_grid.max(if eye_alt_m < 60.0 { 33 } else { 25 })
-    } else {
-        base_grid
-    }
-}
 
     #[allow(clippy::too_many_arguments)]
     fn emit_tile_instance(
@@ -1828,7 +1873,7 @@ fn close_ground_leaf_grid(
                 .and_then(|s| s.peek_cached_imagery(root))
                 .or_else(|| crate::basemap::embedded_base_tile(root));
             let (texture_id, texture_revision, tint) = if let Some(img) = root_img {
-                let tid = 0xE47F_0001u64;
+                let tid = 0xFFFF_E47F_0000_0001u64;
                 textures.push(Arc::new(RetainedTileTexture {
                     id: tid,
                     revision: 1,
@@ -1852,7 +1897,7 @@ fn close_ground_leaf_grid(
             };
 
             let root_unlit =
-                is_canonical_2d_morph(ll.map_2d_morph as f64) || ll.map_2d_morph >= 0.95;
+                is_canonical_2d_morph(ll.map_2d_morph as f64) || ll.map_2d_morph >= 0.99;
             instances.push(RetainedTileInstance {
                 key: key_id,
                 mesh_revision: 1,
@@ -1985,8 +2030,8 @@ fn close_ground_leaf_grid(
                     input.tile_projection,
                 );
                 let morph_sig = mesh_morph_signature(morph);
-                let horizon_cull = ll.map_2d_morph <= 0.05;
-                let up_override = if ll.map_2d_morph > 0.05 {
+                let horizon_cull = ll.map_2d_morph <= 1e-4;
+                let up_override = if ll.map_2d_morph > 1e-4 {
                     None
                 } else {
                     input.camera_up_ecef.map(|u| DVec3::new(u[0], u[1], u[2]))
@@ -2021,7 +2066,7 @@ fn close_ground_leaf_grid(
                     )
                 } else {
                     let src_ro: &dyn TileSource = &*source;
-                    traverse_quadtree_lod_frustum6_with_elevation(
+                    traverse_quadtree_lod_frustum6_with_relief(
                         &input.camera,
                         up_override,
                         input.viewport.width.max(1.0) as f64,
@@ -2033,6 +2078,7 @@ fn close_ground_leaf_grid(
                         MAX_QUADTREE_LEAVES,
                         input.tile_projection,
                         idle_lod,
+                        eff_elev_enabled,
                         if eff_elev_enabled {
                             ground_elev_focus
                         } else {
@@ -2044,6 +2090,9 @@ fn close_ground_leaf_grid(
                     .map(|k| (k, 0))
                     .collect()
                 };
+                let cam_placement = input.camera.placement_with_up(up_override);
+                let cam_eye_ecef = cam_placement.eye;
+                let cam_forward_ecef = cam_placement.aim.sub(cam_placement.eye).normalize();
                 let focus_east = LocalFrame::at(morph.focus.lat_deg, morph.focus.lon_deg).east;
                 let world_circ = 2.0 * std::f64::consts::PI * wgs84::A;
                 let mut leaf_flags: Vec<(bool, bool)> = vec![(false, eff_elev_enabled); leaf_items.len()];
@@ -2370,7 +2419,7 @@ fn close_ground_leaf_grid(
                                     anc_bounds,
                                     leaf_want_night,
                                     leaf_elev_enabled,
-                                    is_flat_2d || ll.map_2d_morph >= 0.95,
+                                    is_flat_2d || ll.map_2d_morph >= 0.99,
                                     fallback_tint,
                                     source,
                                     input.max_tile_level,
@@ -2390,13 +2439,16 @@ fn close_ground_leaf_grid(
                         TileProjection::WebMercator => tile_bounds_mercator(leaf),
                         TileProjection::Geographic4326 => tile_bounds(leaf),
                     };
-                    let is_tile_2d_unlit = is_flat_2d || ll.map_2d_morph >= 0.95;
+                    let is_tile_2d_unlit = is_flat_2d || ll.map_2d_morph >= 0.99;
                     let eye_alt_m =
                         (input.camera.altitude_m() - ground_elev_focus.max(0.0)).max(1.0);
                     let leaf_grid = Self::close_ground_leaf_grid(
                         grid,
                         is_flat_2d,
+                        eff_elev_enabled,
                         eye_alt_m,
+                        cam_eye_ecef,
+                        cam_forward_ecef,
                         input.camera.focus.lat_deg,
                         input.camera.focus.lon_deg,
                         bounds,
@@ -2552,10 +2604,18 @@ fn close_ground_leaf_grid(
                     let eye_alt_m =
                         (input.camera.altitude_m() - ground_elev_focus.max(0.0)).max(1.0);
                     let patch_grid = if effective_mode == SurfaceMode::FlatPatches {
+                        let up_ov = input
+                            .camera_up_ecef
+                            .map(|u| DVec3::new(u[0], u[1], u[2]));
+                        let placement = input.camera.placement_with_up(up_ov);
+                        let forward = placement.aim.sub(placement.eye).normalize();
                         Self::close_ground_leaf_grid(
                             grid,
                             ll.map_2d_morph >= 0.95,
+                            patch_elev_enabled,
                             eye_alt_m,
+                            placement.eye,
+                            forward,
                             input.camera.focus.lat_deg,
                             input.camera.focus.lon_deg,
                             bounds,
@@ -2589,7 +2649,7 @@ fn close_ground_leaf_grid(
                         bounds,
                         patch_want_night,
                         patch_elev_enabled,
-                        ll.map_2d_morph >= 0.95,
+                        ll.map_2d_morph >= 0.99,
                         fallback_tint,
                         source,
                         input.max_tile_level,
@@ -3736,6 +3796,11 @@ impl EarthViewport {
         let (frame, _) =
             RetainedTerrainBuilder::build_frame_zero_bootstrap(&self.input, None, &self.plugins);
         self.retained.update_terrain_preserving_camera(frame);
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
         true
     }
 
@@ -4551,8 +4616,15 @@ impl EarthViewport {
             self.linear_morph = (self.linear_morph - step).max(self.target_morph);
         }
         let t = self.linear_morph.clamp(0.0, 1.0);
-        // Cubic Hermite ease-in-out
-        self.input.view_morph = t * t * (3.0 - 2.0 * t);
+        // Cubic Hermite ease-in-out. When stepping from 2D -> 3D (`target_morph == 0.0`),
+        // immediately drop below `CANONICAL_2D_MORPH_THRESHOLD` on the first step so the
+        // worker synchronously flushes full polar-cap globe tiles instead of lingering in
+        // canonical 2D tile culling for the first 1-2 frames.
+        let mut eased = t * t * (3.0 - 2.0 * t);
+        if self.target_morph < 0.5 && self.linear_morph < 1.0 - 1e-5 {
+            eased = eased.min((CANONICAL_2D_MORPH_THRESHOLD - 1e-3) as f32);
+        }
+        self.input.view_morph = eased;
         let next_canon = Self::is_input_canonical_2d(&self.input);
         if prev_canon != next_canon {
             if !self.stopped.load(Ordering::Relaxed) {
@@ -4701,6 +4773,150 @@ impl EarthViewport {
         let mut cfg = self.input.idle_high_res;
         cfg.enabled = enabled;
         self.set_idle_high_res_config(cfg);
+    }
+
+    /// Returns the live unified [`crate::scene::EarthRenderQuality`] profile extracted from this viewport.
+    #[inline]
+    pub fn render_quality(&self) -> crate::scene::EarthRenderQuality {
+        crate::scene::EarthRenderQuality::from_input(&self.input)
+    }
+
+    /// Returns the matching canonical [`crate::scene::EarthQualityPreset`] (or `Custom` if diverged).
+    #[inline]
+    pub fn quality_preset(&self) -> crate::scene::EarthQualityPreset {
+        self.render_quality().matching_preset()
+    }
+
+    /// Applies a unified [`crate::scene::EarthRenderQuality`] profile live on this viewport,
+    /// refreshing camera uniforms, shadows, ocean/sky state, and waking the background worker
+    /// only when mesh/asset parameters changed.
+    pub fn set_render_quality(&mut self, quality: crate::scene::EarthRenderQuality) {
+        let prev = self.render_quality();
+        let prev_night_tiles = self.input.local_atmosphere.night_stars_sync
+            && self.input.local_atmosphere.terrain_lighting;
+        let next_night_tiles = quality.realistic_sky_25d && quality.terrain_lighting_25d;
+        let idle_changed = prev.idle_high_res != quality.idle_high_res
+            || prev.idle_extra_leaf_budget != quality.idle_extra_leaf_budget;
+        let was_refined = self.idle_stage != 0;
+
+        let need_worker = prev.tile_grid != quality.tile_grid
+            || (prev.sse_threshold - quality.sse_threshold).abs() > 1e-4
+            || prev.max_tile_level != quality.max_tile_level
+            || prev.skybox_quality != quality.skybox_quality
+            || prev.cloud_resolution != quality.cloud_resolution
+            || prev_night_tiles != next_night_tiles
+            || (!prev.ocean_coastal_shoaling && quality.ocean_coastal_shoaling)
+            || (!quality.idle_high_res && was_refined);
+
+        quality.apply_to_input(&mut self.input);
+
+        if idle_changed {
+            self.idle_elapsed_s = 0.0;
+            self.idle_stage = 0;
+        }
+
+        self.publish_camera_and_overlays();
+        if need_worker && !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Applies one of the canonical [`crate::scene::EarthQualityPreset`] profiles live.
+    pub fn set_quality_preset(&mut self, preset: crate::scene::EarthQualityPreset) {
+        self.set_render_quality(crate::scene::EarthRenderQuality::from_preset(preset));
+    }
+
+    /// Returns the active terrain tile subdivision grid density.
+    #[inline]
+    pub fn tile_grid(&self) -> u32 {
+        self.input.tile_grid
+    }
+
+    /// Updates terrain mesh tile subdivision density (`5..=65`) and triggers a background rebuild.
+    pub fn set_tile_grid(&mut self, tile_grid: u32) {
+        let clamped = tile_grid.clamp(5, 65);
+        if self.input.tile_grid == clamped {
+            return;
+        }
+        self.input.tile_grid = clamped;
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Returns the active quadtree SSE threshold in pixels.
+    #[inline]
+    pub fn sse_threshold(&self) -> f64 {
+        self.input.sse_threshold
+    }
+
+    /// Updates quadtree SSE threshold (`0.5..=12.0` px) and triggers a background LOD refresh.
+    pub fn set_sse_threshold(&mut self, sse_threshold: f64) {
+        let clamped = sse_threshold.clamp(0.5, 12.0);
+        if (self.input.sse_threshold - clamped).abs() <= 1e-6 {
+            return;
+        }
+        self.input.sse_threshold = clamped;
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Returns the active maximum quadtree tile zoom level.
+    #[inline]
+    pub fn max_tile_level(&self) -> u8 {
+        self.input.max_tile_level
+    }
+
+    /// Updates maximum quadtree tile zoom level (`4..=21`) and triggers a background LOD refresh.
+    pub fn set_max_tile_level(&mut self, max_tile_level: u8) {
+        let clamped = max_tile_level.clamp(4, 21);
+        if self.input.max_tile_level == clamped {
+            return;
+        }
+        self.input.max_tile_level = clamped;
+        if !self.stopped.load(Ordering::Relaxed) {
+            let idle_f = self.idle_refinement_factor();
+            self.worker
+                .request_update_with_idle(self.input.clone(), idle_f);
+        }
+    }
+
+    /// Immediately centers the viewport camera focus over `(lat_deg, lon_deg)` at `range_m`
+    /// (preserving the current camera range when `None`).
+    pub fn center_on_coordinates(&mut self, lat_deg: f64, lon_deg: f64, range_m: Option<f64>) {
+        if !lat_deg.is_finite() || !lon_deg.is_finite() {
+            return;
+        }
+        let mut cam = self.input.camera;
+        cam.focus = crate::geodesy::Geodetic::new(
+            crate::geodesy::clamp_latitude(lat_deg),
+            crate::geodesy::wrap_longitude(lon_deg),
+            0.0,
+        );
+        if let Some(r) = range_m.filter(|v| v.is_finite() && *v > 0.0) {
+            let target = r.clamp(
+                crate::controller::MIN_RANGE_M,
+                crate::controller::MAX_RANGE_M,
+            );
+            let [ex, ey, ez] = cam.eye_offset_m;
+            let norm = (ex * ex + ey * ey + ez * ez).sqrt();
+            if norm > 1e-3 {
+                let s = target / norm;
+                cam.eye_offset_m = [ex * s, ey * s, ez * s];
+            } else {
+                cam.eye_offset_m = [0.0, 0.0, target];
+            }
+        }
+        let vw = self.input.viewport.width.max(1.0) as f64;
+        let vh = self.input.viewport.height.max(1.0) as f64;
+        self.update_camera_with_up(&cam, None, vw, vh);
     }
 
     /// Returns the current progressive idle refinement weight (`0.0` moving/off, `0.5` stage 1, `1.0` stage 2).

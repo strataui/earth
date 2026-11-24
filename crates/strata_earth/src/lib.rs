@@ -84,7 +84,8 @@ pub use geodesy::{
     tile_bounding_sphere_projected_with_altitude, tile_bounds, tile_bounds_mercator,
     traverse_quadtree_lod, traverse_quadtree_lod_2d_flat, traverse_quadtree_lod_frustum6,
     traverse_quadtree_lod_frustum6_projected, traverse_quadtree_lod_frustum6_projected_with_up,
-    traverse_quadtree_lod_frustum6_with_elevation, unproject_morphed_surface_lat_lon,
+    traverse_quadtree_lod_frustum6_with_elevation, traverse_quadtree_lod_frustum6_with_relief,
+    unproject_morphed_surface_lat_lon,
     wrap_longitude, AltitudeMode, CameraPlacement, EarthCamera, Frustum6, GeoPosition, Geodetic,
     IdleLodParams, LocalFrame, RteEyeUniforms, SurfaceMorphParams, TileKey, TileProjection,
     TileTextureResolution, CANONICAL_2D_MORPH_THRESHOLD, GLOBE_ALTITUDE_M, MAX_QUADTREE_LEAVES,
@@ -120,9 +121,10 @@ pub use scene::{
     parse_overpass_buildings, requested_tile, sky_gradient, surrounding_patches, surrounding_tiles,
     terrain_skirt_triangle_count, terrain_triangle_count, terrain_triangle_count_with_skirts,
     tile_patch_span_deg, BuildingFootprint, BuildingSource, EarthInput, EarthLowLevelState,
-    EarthScene, EarthViewMode, FrameStats, IdleHighResConfig, LayerToggles, LocalAtmosphereConfig,
-    MemoryBuildingSource, NetworkBuildingSource, OceanWavesConfig, PatchBounds, PatchFrame,
-    SpaceEnvironmentConfig, SunDirectionMode, SurfaceMode,
+    EarthQualityPreset, EarthRenderQuality, EarthScene, EarthViewMode, FrameStats,
+    IdleHighResConfig, LayerToggles, LocalAtmosphereConfig, MemoryBuildingSource,
+    NetworkBuildingSource, OceanWavesConfig, PatchBounds, PatchFrame, SpaceEnvironmentConfig,
+    SunDirectionMode, SurfaceMode,
 };
 pub use scene::{horizontal_fov_deg, vertical_fov_deg};
 pub use tiles::{

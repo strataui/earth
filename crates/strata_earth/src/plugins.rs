@@ -1027,7 +1027,8 @@ impl EarthPlugin for CelestialPlugin {
         let la = &ctx.input.local_atmosphere;
         let ll = ctx.low_level;
         let flat_t = ll.local_25d_blend.max(ll.map_2d_morph).clamp(0.0, 1.0);
-        let in_2d_hide = ll.map_2d_morph > 0.05;
+        let morph_fade = 1.0 - smoothstep_f32(0.0, 0.85, ll.map_2d_morph);
+        let vis_2d_ok = morph_fade > 0.005;
         let space_factor = 1.0 - smoothstep_f32(0.0, 0.85, flat_t);
         let (sun_dir, moon_dir, unix_utc_s) = ctx.input.resolved_celestial_state();
         camera.sun_dir = sun_dir;
@@ -1042,56 +1043,39 @@ impl EarthPlugin for CelestialPlugin {
         camera.ecef_from_icrf = crate::astro::icrf_to_ecef_matrix(unix_utc_s);
         let si = self.sun_intensity.max(0.0);
         camera.sun_color = [si, 0.97 * si, 0.92 * si];
-        camera.day_night_strength = if sp.day_night_lighting && !in_2d_hide {
-            sp.shadow_contrast.clamp(0.0, 1.0) * space_factor
+        camera.day_night_strength = if sp.day_night_lighting && vis_2d_ok {
+            sp.shadow_contrast.clamp(0.0, 1.0) * space_factor * morph_fade
         } else {
             0.0
         };
-        camera.sun_visible = ctx.input.layers.celestial && sp.sun_visible && !in_2d_hide;
+        camera.sun_visible = ctx.input.layers.celestial && sp.sun_visible && vis_2d_ok;
         camera.sun_angular_radius_rad = sp.sun_angular_radius_rad.max(1e-4);
-        camera.moon_visible = ctx.input.layers.celestial && sp.moon_visible && !in_2d_hide;
+        camera.moon_visible = ctx.input.layers.celestial && sp.moon_visible && vis_2d_ok;
         camera.moon_angular_radius_rad = sp.moon_angular_radius_rad.max(1e-4);
-        camera.stars_visible = sp.stars_visible && !in_2d_hide;
-        camera.stars_intensity = if in_2d_hide {
-            0.0
-        } else {
-            sp.stars_intensity.max(0.0)
-        };
-        camera.skybox_intensity = if in_2d_hide {
-            0.0
-        } else {
-            sp.skybox_intensity.max(0.0)
-        };
+        camera.stars_visible = sp.stars_visible && vis_2d_ok;
+        camera.stars_intensity = sp.stars_intensity.max(0.0) * morph_fade;
+        camera.skybox_intensity = sp.skybox_intensity.max(0.0) * morph_fade;
 
         // Optional realistic 2.5D atmosphere, night stars, directional terrain lighting & mountain shadows.
-        camera.realistic_25d_sky = if la.realistic_sky && !in_2d_hide {
-            1.0
+        camera.realistic_25d_sky = if la.realistic_sky { morph_fade } else { 0.0 };
+        camera.night_stars_25d = if la.night_stars_sync && sp.stars_visible {
+            morph_fade
         } else {
             0.0
         };
-        camera.night_stars_25d = if la.night_stars_sync && sp.stars_visible && !in_2d_hide {
-            1.0
+        camera.terrain_25d_lighting = if la.terrain_lighting { morph_fade } else { 0.0 };
+        camera.terrain_25d_shadows = if la.terrain_shadows && la.terrain_lighting {
+            la.shadow_strength.clamp(0.0, 1.0) * morph_fade
         } else {
             0.0
         };
-        camera.terrain_25d_lighting = if la.terrain_lighting && !in_2d_hide {
-            1.0
-        } else {
-            0.0
-        };
-        camera.terrain_25d_shadows =
-            if la.terrain_shadows && la.terrain_lighting && !in_2d_hide {
-                la.shadow_strength.clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
         camera.shadow_map_size = la.shadow_map_size.clamp(512, 4096);
 
-        if la.sync_with_weather && !in_2d_hide {
+        if la.sync_with_weather && vis_2d_ok {
             let (dark, cov, haze) = resolve_weather_optics(ctx);
-            camera.weather_darkness = dark;
-            camera.weather_cloud_cover = cov;
-            camera.weather_haze = haze;
+            camera.weather_darkness = dark * morph_fade;
+            camera.weather_cloud_cover = cov * morph_fade;
+            camera.weather_haze = haze * morph_fade;
         } else {
             camera.weather_darkness = 0.0;
             camera.weather_cloud_cover = 0.0;
@@ -1145,8 +1129,8 @@ impl CityLightsPlugin {
             .local_25d_blend
             .max(ctx.low_level.map_2d_morph)
             .clamp(0.0, 1.0);
-        let in_2d_hide = ctx.low_level.map_2d_morph > 0.05;
-        if !self.enabled || !sp.day_night_lighting || !sp.city_lights || in_2d_hide {
+        let morph_fade = 1.0 - smoothstep_f32(0.0, 0.85, ctx.low_level.map_2d_morph);
+        if !self.enabled || !sp.day_night_lighting || !sp.city_lights || morph_fade <= 0.005 {
             return 0.0;
         }
         let space_factor = 1.0 - smoothstep_f32(0.0, 0.85, flat_t);
@@ -1158,6 +1142,7 @@ impl CityLightsPlugin {
         sp.city_lights_intensity.max(0.0)
             * self.intensity_scale.max(0.0)
             * space_factor.max(allow_25d_night)
+            * morph_fade
     }
 }
 
@@ -1194,8 +1179,7 @@ impl EarthPlugin for CityLightsPlugin {
             && ctx.input.space.day_night_lighting
             && ctx.input.space.city_lights
             && ctx.input.layers.terrain
-            && ctx.input.view_mode != crate::scene::EarthViewMode::Mode2D
-            && ll.map_2d_morph <= 0.05
+            && ll.map_2d_morph < 0.90
             && (ll.local_25d_blend < 0.70 || allow_25d_night);
         ctx.want_night_tiles = active;
     }
@@ -1279,19 +1263,19 @@ impl EarthPlugin for WeatherPlugin {
         ctx: &EarthPluginFrameContext<'_>,
         camera: &mut RetainedCameraUniforms,
     ) {
-        let in_2d_hide = ctx.input.view_mode == crate::scene::EarthViewMode::Mode2D
-            || ctx.low_level.map_2d_morph > 0.05;
+        let morph_fade = 1.0 - smoothstep_f32(0.0, 0.85, ctx.low_level.map_2d_morph);
         let space_factor = (1.0 - ctx.low_level.local_25d_blend).clamp(0.0, 1.0);
         let cloud_alt_fade = smoothstep_f32(450_000.0, 2_000_000.0, ctx.altitude_m as f32);
         let w = &ctx.input.weather;
-        let cloud_on = self.enabled && w.global_cloud_map && ctx.input.layers.clouds && !in_2d_hide;
+        let cloud_on =
+            self.enabled && w.global_cloud_map && ctx.input.layers.clouds && morph_fade > 0.005;
         let base_cloud_op = if cloud_on {
             w.global_cloud_opacity.clamp(0.0, 1.0)
         } else {
             0.0
         };
 
-        let (cloud_dark, cover_boost) = if in_2d_hide || !cloud_on {
+        let (cloud_dark, cover_boost) = if !cloud_on {
             (0.0, 0.0)
         } else if let Some(ovr) = w.cloud_darkness_override {
             let d = ovr.clamp(0.0, 1.0);
@@ -1310,20 +1294,21 @@ impl EarthPlugin for WeatherPlugin {
         } else {
             0.0
         };
-        camera.cloud_layer_opacity = base_cloud_op * space_factor * cloud_alt_fade;
-        camera.local_cloud_opacity = local_op * (1.0 - cloud_alt_fade);
+        camera.cloud_layer_opacity = base_cloud_op * space_factor * cloud_alt_fade * morph_fade;
+        camera.local_cloud_opacity = local_op * (1.0 - cloud_alt_fade) * morph_fade;
         camera.cloud_lon_offset_rad = (w.global_cloud_spin_rad_s * eff_t) as f32;
         camera.time_s = eff_t as f32;
 
         // Tint clouds smoothly from sunlit white [1.0, 1.0, 1.0] to moody storm slate [0.42, 0.46, 0.54].
+        let eff_cloud_dark = cloud_dark * morph_fade;
         camera.cloud_tint_rgb = [
-            1.0 - 0.58 * cloud_dark,
-            1.0 - 0.54 * cloud_dark,
-            1.0 - 0.46 * cloud_dark,
+            1.0 - 0.58 * eff_cloud_dark,
+            1.0 - 0.54 * eff_cloud_dark,
+            1.0 - 0.46 * eff_cloud_dark,
         ];
-        camera.cloud_25d_cover_boost = cover_boost;
-        if w.cloud_darkness_override.is_some() && !in_2d_hide {
-            camera.weather_darkness = camera.weather_darkness.max(cloud_dark);
+        camera.cloud_25d_cover_boost = cover_boost * morph_fade;
+        if w.cloud_darkness_override.is_some() && morph_fade > 0.005 {
+            camera.weather_darkness = camera.weather_darkness.max(eff_cloud_dark);
         }
     }
 

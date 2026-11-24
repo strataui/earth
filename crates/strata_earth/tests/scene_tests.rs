@@ -1590,7 +1590,9 @@ fn test_above_ground_cloud_ceiling_optics_gpu_buildings_graticule_object_labels_
         cam_sea.weather_darkness
     );
 
-    // 2. Verify GPU buildings and graticule dynamic meshes in RetainedTerrainBuilder
+    // 2. Verify GPU buildings and graticule dynamic meshes in RetainedTerrainBuilder.
+    // At low-altitude 2.5D (1.2 km), global macro graticule lines are intentionally suppressed
+    // while 3D buildings are emitted; in 2D map mode and 3D globe regime, graticule is emitted too.
     let mut b_input = viewpoint(1_200.0);
     b_input.layers.buildings = true;
     b_input.layers.graticule = true;
@@ -1605,11 +1607,41 @@ fn test_above_ground_cloud_ceiling_optics_gpu_buildings_graticule_object_labels_
     let mut tile_src = MemoryTileSource::new();
     let mut builder = RetainedTerrainBuilder::new();
     builder.set_building_source(Some(Box::new(b_source)));
-    let (frame, _) = builder.build_frame(&b_input, &mut tile_src, 1, true);
+    let (frame_25d, _) = builder.build_frame(&b_input, &mut tile_src, 1, true);
     assert!(
-        frame.dynamic_meshes.len() >= 2,
-        "RetainedTerrainBuilder must emit GPU dynamic meshes for both buildings and graticule (got {})",
-        frame.dynamic_meshes.len()
+        frame_25d.dynamic_meshes.iter().any(|m| !m.unlit),
+        "RetainedTerrainBuilder must emit GPU dynamic mesh for buildings in 2.5D (got {})",
+        frame_25d.dynamic_meshes.len()
+    );
+
+    // In 2D mode (map_2d_morph == 1.0), both buildings and graticule dynamic meshes are emitted.
+    let mut b_input_2d = b_input.clone();
+    b_input_2d.view_mode = strata_earth::EarthViewMode::Mode2D;
+    b_input_2d.view_morph = 1.0;
+    let (frame_2d, _) = builder.build_frame(&b_input_2d, &mut tile_src, 2, true);
+    assert!(
+        frame_2d.dynamic_meshes.len() >= 2
+            && frame_2d.dynamic_meshes.iter().any(|m| !m.unlit)
+            && frame_2d.dynamic_meshes.iter().any(|m| m.unlit),
+        "RetainedTerrainBuilder must emit GPU dynamic meshes for both buildings and graticule in Mode2D (got {})",
+        frame_2d.dynamic_meshes.len()
+    );
+
+    // In 3D globe altitude (> 250 km), graticule dynamic mesh is emitted and respects layers.graticule.
+    let mut globe_input = viewpoint(1_500_000.0);
+    globe_input.layers.graticule = true;
+    globe_input.graticule_step_deg = 15.0;
+    let (frame_3d, _) = builder.build_frame(&globe_input, &mut tile_src, 3, true);
+    assert!(
+        frame_3d.dynamic_meshes.iter().any(|m| m.unlit),
+        "RetainedTerrainBuilder must emit GPU graticule dynamic mesh in 3D globe view (got {})",
+        frame_3d.dynamic_meshes.len()
+    );
+    globe_input.layers.graticule = false;
+    let (frame_3d_no_grat, _) = builder.build_frame(&globe_input, &mut tile_src, 4, true);
+    assert!(
+        frame_3d_no_grat.dynamic_meshes.len() < frame_3d.dynamic_meshes.len(),
+        "Disabling layers.graticule must remove the graticule dynamic mesh"
     );
 
     // 3. Verify EarthViewport object label projection and layer toggles

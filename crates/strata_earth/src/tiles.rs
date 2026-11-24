@@ -3567,7 +3567,7 @@ impl Drop for NetworkTileSource {
 
 impl TileSource for NetworkTileSource {
     fn begin_frame(&mut self, focus: Geodetic, altitude_m: f64) {
-        const MAX_SYNC_DISK_DECODES_PER_FRAME: usize = 8;
+        const MAX_SYNC_DISK_DECODES_PER_FRAME: usize = 24;
         self.sync_disk_budget = MAX_SYNC_DISK_DECODES_PER_FRAME;
         if let Ok(mut guard) = self.queue.0.lock() {
             guard.generation = guard.generation.wrapping_add(1).max(1);
