@@ -3,3 +3,6 @@
 *.swp
 *.bak
 .DS_Store
+
+# Local sibling-repo development patches (never commit)
+.cargo/config.toml

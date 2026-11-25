@@ -1636,7 +1636,6 @@ dependencies = [
  "accesskit",
  "strata-dom",
  "strata-layout",
- "strata-primitives",
  "uuid",
 ]
 
@@ -1684,7 +1683,6 @@ name = "strata-js"
 version = "0.1.0"
 dependencies = [
  "regex",
- "strata-web-api",
 ]
 
 [[package]]
@@ -1712,7 +1710,6 @@ dependencies = [
  "pollster",
  "strata-dom",
  "strata-gpu-path",
- "strata-js",
  "strata-layout",
  "strata-macro",
  "strata-primitives",
@@ -2629,3 +2626,11 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "strata-devtools"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "strata-hot-reload"
+version = "0.1.0"

@@ -19,9 +19,12 @@ categories = ["graphics", "rendering", "science"]
 
 [workspace.dependencies]
 strata-earth = { path = "crates/strata_earth", version = "0.1.2" }
-strata-primitives = { version = "0.1.0", path = "../strata/crates/core/strata_primitives" }
-strata-style = { version = "0.1.0", path = "../strata/crates/core/strata_style" }
-strata-layout = { version = "0.1.0", path = "../strata/crates/core/strata_layout" }
-strata-render = { version = "0.1.0", path = "../strata/crates/render/strata_render" }
-strata-device = { version = "0.1.0", path = "../strata/crates/runtime/strata_device" }
-strata-ui = { version = "0.1.0", path = "../strata/crates/strata" }
+strata-primitives = "0.1.0"
+strata-style = "0.1.0"
+strata-layout = "0.1.0"
+strata-render = "0.1.2"
+strata-device = "0.1.0"
+strata-ui = "0.1.4"
+
+[profile.dev]
+opt-level = 1
