@@ -1631,7 +1631,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strata-a11y"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "accesskit",
  "strata-dom",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "strata-device"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "strata-dom",
  "strata-primitives",
@@ -1650,14 +1650,14 @@ dependencies = [
 
 [[package]]
 name = "strata-dom"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "strata-primitives",
 ]
 
 [[package]]
 name = "strata-earth"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "flate2",
  "image",
@@ -1680,14 +1680,14 @@ dependencies = [
 
 [[package]]
 name = "strata-js"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "strata-layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "strata-primitives",
  "strata-style",
@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "strata-macro"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "strata-primitives"
@@ -1703,7 +1703,7 @@ version = "0.1.0"
 
 [[package]]
 name = "strata-render"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bytemuck",
  "miniz_oxide 0.8.9",
@@ -1727,14 +1727,14 @@ dependencies = [
 
 [[package]]
 name = "strata-style"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "strata-primitives",
 ]
 
 [[package]]
 name = "strata-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "strata-ui-platform"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cairo-rs",
  "gtk",
@@ -1780,7 +1780,7 @@ version = "0.1.0"
 
 [[package]]
 name = "strata-web-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "brotli",
  "flate2",
@@ -2629,8 +2629,8 @@ dependencies = [
 
 [[patch.unused]]
 name = "strata-devtools"
-version = "0.1.0"
+version = "0.1.1"
 
 [[patch.unused]]
 name = "strata-hot-reload"
-version = "0.1.0"
+version = "0.1.1"
